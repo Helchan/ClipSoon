@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QKeySequence
 from PySide6.QtWidgets import QFrame, QMenu, QStyleOptionViewItem
 
@@ -132,6 +132,13 @@ def test_copied_image_file_uses_detail_image_preview(qtbot, tmp_path: Path) -> N
     assert panel.info_detail_label.text() == "路径"
     assert panel.info_detail_value.text() == str(path)
     assert panel.list.itemDelegate().sizeHint(QStyleOptionViewItem(), panel.model.index(0)).height() == 52
+
+
+def test_list_item_content_has_equal_top_and_bottom_padding() -> None:
+    row = QRect(4, 1, 500, 50)
+    content = ClipDelegate._thumbnail_rect(row)
+
+    assert content.top() - row.top() == row.bottom() - content.bottom()
 
 
 def test_filter_tabs_cycle_forward_and_backward(qtbot) -> None:

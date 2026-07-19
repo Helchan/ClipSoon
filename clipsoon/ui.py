@@ -220,11 +220,11 @@ class ClipDelegate(QStyledItemDelegate):
             painter.setBrush(QColor("#5B6CFF") if selected else _hover_color(self.dark_theme))
             painter.drawRoundedRect(rect, 5, 5)
 
-        thumb_rect = QRect(rect.left() + 8, rect.top() + 5, 36, 36)
+        thumb_rect = self._thumbnail_rect(rect)
         self._paint_thumbnail(painter, thumb_rect, item, selected)
         text_left = thumb_rect.right() + 13
         text_right = rect.right() - 10
-        title_rect = QRect(text_left, rect.top() + 5, text_right - text_left, 36)
+        title_rect = QRect(text_left, thumb_rect.top(), text_right - text_left, thumb_rect.height())
         foreground = QColor("#FFFFFF") if selected else option.palette.color(QPalette.ColorRole.Text)
 
         title_font = QFont(option.font)
@@ -234,8 +234,15 @@ class ClipDelegate(QStyledItemDelegate):
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter, _elide(painter, item.title, title_rect.width()))
         if item.pinned:
             painter.setPen(foreground)
-            painter.drawText(QRect(rect.right() - 26, rect.top() + 10, 16, 18), Qt.AlignmentFlag.AlignCenter, "◆")
+            pin_rect = QRect(rect.right() - 26, rect.center().y() - 9, 16, 18)
+            painter.drawText(pin_rect, Qt.AlignmentFlag.AlignCenter, "◆")
         painter.restore()
+
+    @staticmethod
+    def _thumbnail_rect(row_rect: QRect) -> QRect:
+        size = 36
+        top = row_rect.top() + (row_rect.height() - size) // 2
+        return QRect(row_rect.left() + 8, top, size, size)
 
     def _paint_thumbnail(self, painter: QPainter, rect: QRect, item: ClipItem, selected: bool) -> None:
         painter.setPen(Qt.PenStyle.NoPen)
