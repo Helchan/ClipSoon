@@ -4,7 +4,7 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtCore import QItemSelectionModel, QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QKeySequence
 from PySide6.QtWidgets import QDialog, QFrame, QMenu, QStyleOptionViewItem
 
@@ -110,8 +110,22 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
         dialog.retention,
         dialog.delay,
         dialog.theme,
+        dialog.selection_memory,
     ]
     assert len({control.width() for control in controls}) == 1
+
+
+def test_selection_memory_setting_is_an_optional_three_second_default(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+
+    assert not dialog.remember_selection.isChecked()
+    assert dialog.selection_memory.value() == 3
+    assert not dialog.selection_memory.isEnabled()
+    dialog.remember_selection.setChecked(True)
+    assert dialog.selection_memory.isEnabled()
+    assert dialog.values()["remember_selection"] is True
+    assert dialog.values()["selection_memory_seconds"] == 3
 
 
 def test_open_data_directory_closes_settings_before_emitting(qtbot, monkeypatch) -> None:
@@ -134,6 +148,75 @@ def test_panel_footer_places_version_after_hide_hint(qtbot) -> None:
     qtbot.addWidget(panel)
 
     assert panel.version_label.text() == f"↑↓ 选择  |  ↵ 发送  |  Esc 隐藏  |  v{__version__}"
+
+
+def test_panel_defaults_to_first_item_each_time_it_is_shown(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("first", "first", 3), clip("second", "second", 2), clip("third", "third", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    panel.list.setCurrentIndex(panel.model.index(2))
+    panel.hide()
+
+    panel.show_panel()
+
+    assert panel.list.currentIndex().row() == 0
+    assert {index.row() for index in panel.list.selectionModel().selectedRows()} == {0}
+
+
+def test_panel_restores_multi_selection_by_id_before_memory_expires(qtbot) -> None:
+    now = [100.0]
+    settings = AppSettings(remember_selection=True, selection_memory_seconds=3)
+    panel = ClipPanel(lambda: settings, selection_clock=lambda: now[0])
+    qtbot.addWidget(panel)
+    original = [clip("first", "first", 3), clip("second", "second", 2), clip("third", "third", 1)]
+    panel.set_items(original)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    selection = panel.list.selectionModel()
+    selection.select(
+        panel.model.index(1),
+        QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    selection.select(
+        panel.model.index(2),
+        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    selection.setCurrentIndex(panel.model.index(2), QItemSelectionModel.SelectionFlag.NoUpdate)
+    panel.hide()
+
+    panel.set_items([clip("new", "new", 4), *original])
+    now[0] += 2.5
+    panel.show_panel()
+
+    assert {item.id for item in panel._selected_items()} == {"second", "third"}
+    assert panel.model.item_at(panel.list.currentIndex().row()).id == "third"
+
+    panel.hide()
+    now[0] += 3.1
+    panel.show_panel()
+    assert panel.list.currentIndex().row() == 0
+    assert {item.id for item in panel._selected_items()} == {"new"}
+
+
+def test_missing_remembered_items_fall_back_to_first_result(qtbot) -> None:
+    now = [50.0]
+    settings = AppSettings(remember_selection=True, selection_memory_seconds=3)
+    panel = ClipPanel(lambda: settings, selection_clock=lambda: now[0])
+    qtbot.addWidget(panel)
+    panel.set_items([clip("first", "first", 2), clip("removed", "removed", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    panel.list.setCurrentIndex(panel.model.index(1))
+    panel.hide()
+    panel.set_items([clip("replacement", "replacement", 3)])
+    now[0] += 1
+
+    panel.show_panel()
+
+    assert panel.model.item_at(panel.list.currentIndex().row()).id == "replacement"
+    assert panel._remembered_item_ids == ()
 
 
 def test_macos_accessibility_prompt_only_when_not_granted(qtbot, monkeypatch) -> None:

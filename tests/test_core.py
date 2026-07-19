@@ -76,10 +76,18 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
     observed: list[AppSettings] = []
     settings = ObservableSettings(store)
     unsubscribe = settings.subscribe(observed.append)
-    value = settings.update(hotkey="double:shift", max_history_items=1, paste_delay_ms=9_999)
+    value = settings.update(
+        hotkey="double:shift",
+        max_history_items=1,
+        paste_delay_ms=9_999,
+        remember_selection=True,
+        selection_memory_seconds=999,
+    )
     assert value.hotkey == "double:shift"
     assert value.max_history_items == 50
     assert value.paste_delay_ms == 2_000
+    assert value.remember_selection
+    assert value.selection_memory_seconds == 300
     assert store.load() == value
     assert observed == [value]
     unsubscribe()
@@ -102,6 +110,8 @@ def test_hotkey_validation() -> None:
     assert not valid_hotkey("double:space")
     assert not valid_hotkey("no-prefix")
     assert AppSettings(double_tap_interval_ms="bad").validated().double_tap_interval_ms == 180
+    assert AppSettings().selection_memory_seconds == 3
+    assert AppSettings(selection_memory_seconds=0).validated().selection_memory_seconds == 1
 
 
 def test_search_contract_exact_prefix_substring_subsequence_and_rejection() -> None:

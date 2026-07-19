@@ -149,6 +149,8 @@ class AppSettings:
     paste_after_selection: bool = True
     hide_on_deactivate: bool = True
     capture_enabled: bool = True
+    remember_selection: bool = False
+    selection_memory_seconds: int = 3
     theme: str = "system"
 
     def validated(self) -> AppSettings:
@@ -161,6 +163,8 @@ class AppSettings:
             paste_after_selection=bool(self.paste_after_selection),
             hide_on_deactivate=bool(self.hide_on_deactivate),
             capture_enabled=bool(self.capture_enabled),
+            remember_selection=bool(self.remember_selection),
+            selection_memory_seconds=_clamp(self.selection_memory_seconds, 1, 300),
             theme=self.theme if self.theme in {"system", "light", "dark"} else "system",
         )
 

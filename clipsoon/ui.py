@@ -764,19 +764,28 @@ class SettingsDialog(QDialog):
         self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
         add_row(history_form, 3, "外观", self.theme)
 
+        self.selection_memory = _spin(settings.selection_memory_seconds, 1, 300, " 秒")
+        self.selection_memory.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.selection_memory.setEnabled(settings.remember_selection)
+        add_row(history_form, 4, "记忆时长", self.selection_memory)
+
         self.capture = QCheckBox("记录新的剪贴板内容")
         self.capture.setChecked(settings.capture_enabled)
         self.paste = QCheckBox("选择后自动粘贴到原应用")
         self.paste.setChecked(settings.paste_after_selection)
         self.hide = QCheckBox("面板失去焦点时自动隐藏")
         self.hide.setChecked(settings.hide_on_deactivate)
+        self.remember_selection = QCheckBox("记住上次选中状态")
+        self.remember_selection.setChecked(settings.remember_selection)
+        self.remember_selection.toggled.connect(self.selection_memory.setEnabled)
         behavior_options = QGridLayout()
         behavior_options.setContentsMargins(118, 3, 0, 0)
         behavior_options.setHorizontalSpacing(18)
         behavior_options.setVerticalSpacing(6)
         behavior_options.addWidget(self.capture, 0, 0)
         behavior_options.addWidget(self.paste, 0, 1)
-        behavior_options.addWidget(self.hide, 1, 0, 1, 2)
+        behavior_options.addWidget(self.hide, 1, 0)
+        behavior_options.addWidget(self.remember_selection, 1, 1)
         history_layout.addLayout(behavior_options)
         layout.addWidget(history_section)
 
@@ -852,6 +861,8 @@ class SettingsDialog(QDialog):
             "capture_enabled": self.capture.isChecked(),
             "paste_after_selection": self.paste.isChecked(),
             "hide_on_deactivate": self.hide.isChecked(),
+            "remember_selection": self.remember_selection.isChecked(),
+            "selection_memory_seconds": self.selection_memory.value(),
         }
 
     def _validate_accept(self) -> None:
@@ -881,14 +892,23 @@ class ClipPanel(QWidget):
     clear_requested = Signal()
     accessibility_requested = Signal()
 
-    def __init__(self, settings: Callable[[], AppSettings]) -> None:
+    def __init__(
+        self,
+        settings: Callable[[], AppSettings],
+        *,
+        selection_clock: Callable[[], float] = time.time,
+    ) -> None:
         super().__init__()
         self._settings = settings
+        self._selection_clock = selection_clock
         self._items: list[ClipItem] = []
         self._engine = SearchEngine()
         self._kind: ClipKind | None = None
         self._keep_open = False
         self._selection_anchor = 0
+        self._remembered_item_ids: tuple[str, ...] = ()
+        self._remembered_current_id: str | None = None
+        self._selection_hidden_at: float | None = None
         self._filter_buttons: list[tuple[QToolButton, ClipKind | None]] = []
         self._filter_index = 0
         self.setObjectName("panelWindow")
@@ -1096,11 +1116,90 @@ class ClipPanel(QWidget):
         y = geometry.top() + max(34, int(geometry.height() * 0.13))
         self.move(x, y)
         self.search.clear()
+        self._select_for_show()
         self.show()
         self.raise_()
         self.activateWindow()
         self.search.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
         return (time.perf_counter() - started) * 1_000
+
+    def hideEvent(self, event) -> None:
+        if self._settings().remember_selection:
+            self._capture_selection_memory()
+        else:
+            self._clear_selection_memory()
+        super().hideEvent(event)
+
+    def _select_for_show(self) -> None:
+        selection_model = self.list.selectionModel()
+        count = self.model.rowCount()
+        if not count:
+            selection_model.clearSelection()
+            selection_model.setCurrentIndex(QModelIndex(), QItemSelectionModel.SelectionFlag.NoUpdate)
+            self._show_detail(-1)
+            return
+
+        settings = self._settings()
+        restore = settings.remember_selection and self._selection_memory_is_valid(settings)
+        rows_by_id = {
+            item.id: row
+            for row in range(count)
+            if (item := self.model.item_at(row)) is not None
+        }
+        selected_rows = (
+            [
+                rows_by_id[item_id]
+                for item_id in self._remembered_item_ids
+                if item_id in rows_by_id
+            ]
+            if restore
+            else []
+        )
+        if not selected_rows:
+            selected_rows = [0]
+            if restore:
+                self._clear_selection_memory()
+
+        selection_model.clearSelection()
+        for row in selected_rows:
+            selection_model.select(
+                self.model.index(row),
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+            )
+        current_row = rows_by_id.get(self._remembered_current_id, selected_rows[0]) if restore else 0
+        current = self.model.index(current_row)
+        selection_model.setCurrentIndex(current, QItemSelectionModel.SelectionFlag.NoUpdate)
+        self._selection_anchor = current_row
+        self._show_detail(current_row)
+        self.list.scrollTo(
+            current,
+            QAbstractItemView.ScrollHint.EnsureVisible
+            if restore
+            else QAbstractItemView.ScrollHint.PositionAtTop,
+        )
+
+    def _selection_memory_is_valid(self, settings: AppSettings) -> bool:
+        if self._selection_hidden_at is None or not self._remembered_item_ids:
+            return False
+        elapsed = self._selection_clock() - self._selection_hidden_at
+        if 0 <= elapsed <= settings.selection_memory_seconds:
+            return True
+        self._clear_selection_memory()
+        return False
+
+    def _capture_selection_memory(self) -> None:
+        rows = sorted(index.row() for index in self.list.selectionModel().selectedRows())
+        self._remembered_item_ids = tuple(
+            item.id for row in rows if (item := self.model.item_at(row)) is not None
+        )
+        current = self.model.item_at(self.list.currentIndex().row())
+        self._remembered_current_id = current.id if current is not None else None
+        self._selection_hidden_at = self._selection_clock() if self._remembered_item_ids else None
+
+    def _clear_selection_memory(self) -> None:
+        self._remembered_item_ids = ()
+        self._remembered_current_id = None
+        self._selection_hidden_at = None
 
     def apply_theme(self) -> None:
         dark = self._settings().theme == "dark" or (
