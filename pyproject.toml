@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipsoon"
+version = "0.1.0"
+description = "A fast, private, Spotlight-style clipboard history for macOS and Windows"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "platformdirs>=4.2,<5",
+  "pynput>=1.7.7,<2",
+  "PySide6-Essentials>=6.7,<7",
+  "pyobjc-framework-ApplicationServices>=10.3,<13; sys_platform == 'darwin'",
+  "pyobjc-framework-Cocoa>=10.3,<13; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "coverage[toml]>=7.6,<8",
+  "pytest>=8.3,<9",
+  "pytest-qt>=4.4,<5",
+  "ruff>=0.9,<1",
+]
+package = [
+  "pyinstaller>=6.11,<7",
+]
+
+[project.scripts]
+clipsoon = "clipsoon.app:main"
+
+[tool.setuptools.packages.find]
+include = ["clipsoon*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+qt_api = "pyside6"
+
+[tool.coverage.run]
+branch = true
+source = ["clipsoon"]
+omit = ["clipsoon/ui.py", "clipsoon/app.py", "clipsoon/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 75
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
