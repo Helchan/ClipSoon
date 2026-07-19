@@ -775,7 +775,9 @@ class SettingsDialog(QDialog):
         self.paste.setChecked(settings.paste_after_selection)
         self.hide = QCheckBox("面板失去焦点时自动隐藏")
         self.hide.setChecked(settings.hide_on_deactivate)
-        self.remember_selection = QCheckBox("记住上次选中状态")
+        # Keep the persisted ``remember_selection`` key for upgrade compatibility,
+        # while the user-facing feature now restores the complete panel state.
+        self.remember_selection = QCheckBox("记住上次状态")
         self.remember_selection.setChecked(settings.remember_selection)
         self.remember_selection.toggled.connect(self.selection_memory.setEnabled)
         behavior_options = QGridLayout()
@@ -906,6 +908,8 @@ class ClipPanel(QWidget):
         self._kind: ClipKind | None = None
         self._keep_open = False
         self._selection_anchor = 0
+        self._remembered_search_text = ""
+        self._remembered_kind: ClipKind | None = None
         self._remembered_item_ids: tuple[str, ...] = ()
         self._remembered_current_id: str | None = None
         self._selection_hidden_at: float | None = None
@@ -1119,8 +1123,17 @@ class ClipPanel(QWidget):
         x = geometry.left() + (geometry.width() - width) // 2
         y = geometry.top() + max(34, int(geometry.height() * 0.13))
         self.move(x, y)
-        self.search.clear()
-        self._select_for_show()
+        settings = self._settings()
+        restore_state = settings.remember_selection and self._selection_memory_is_valid(settings)
+        target_kind = self._remembered_kind if restore_state else None
+        search_text = self._remembered_search_text if restore_state else ""
+        kind_changed = self._kind is not target_kind
+        self._set_filter_kind(target_kind)
+        if self.search.text() != search_text:
+            self.search.setText(search_text)
+        elif kind_changed:
+            self._refresh_results()
+        self._select_for_show(restore=restore_state)
         self._selection_hide_prepared = False
         self.show()
         self.raise_()
@@ -1147,7 +1160,7 @@ class ClipPanel(QWidget):
         else:
             self._clear_selection_memory()
 
-    def _select_for_show(self) -> None:
+    def _select_for_show(self, *, restore: bool | None = None) -> None:
         selection_model = self.list.selectionModel()
         count = self.model.rowCount()
         if not count:
@@ -1156,8 +1169,9 @@ class ClipPanel(QWidget):
             self._show_detail(-1)
             return
 
-        settings = self._settings()
-        restore = settings.remember_selection and self._selection_memory_is_valid(settings)
+        if restore is None:
+            settings = self._settings()
+            restore = settings.remember_selection and self._selection_memory_is_valid(settings)
         rows_by_id = {
             item.id: row
             for row in range(count)
@@ -1196,7 +1210,7 @@ class ClipPanel(QWidget):
         )
 
     def _selection_memory_is_valid(self, settings: AppSettings) -> bool:
-        if self._selection_hidden_at is None or not self._remembered_item_ids:
+        if self._selection_hidden_at is None:
             return False
         elapsed = self._selection_clock() - self._selection_hidden_at
         if 0 <= elapsed <= settings.selection_memory_seconds:
@@ -1206,20 +1220,23 @@ class ClipPanel(QWidget):
 
     def _capture_selection_memory(self) -> None:
         settings = self._settings()
+        self._remembered_search_text = self.search.text()
+        self._remembered_kind = self._kind
         rows = sorted(index.row() for index in self.list.selectionModel().selectedRows())
         self._remembered_item_ids = tuple(
             item.id for row in rows if (item := self.model.item_at(row)) is not None
         )
         current = self.model.item_at(self.list.currentIndex().row())
         self._remembered_current_id = current.id if current is not None else None
-        self._selection_hidden_at = self._selection_clock() if self._remembered_item_ids else None
-        if self._selection_hidden_at is not None:
-            self._selection_memory_timer.start(settings.selection_memory_seconds * 1_000)
-        else:
-            self._selection_memory_timer.stop()
+        # A query with no matches is still meaningful state, so the snapshot is
+        # timestamped even when there is no selected item.
+        self._selection_hidden_at = self._selection_clock()
+        self._selection_memory_timer.start(settings.selection_memory_seconds * 1_000)
 
     def _clear_selection_memory(self) -> None:
         self._selection_memory_timer.stop()
+        self._remembered_search_text = ""
+        self._remembered_kind = None
         self._remembered_item_ids = ()
         self._remembered_current_id = None
         self._selection_hidden_at = None
@@ -1227,7 +1244,12 @@ class ClipPanel(QWidget):
     def _expire_selection_memory(self) -> None:
         self._clear_selection_memory()
         if not self.isVisible():
-            self._select_for_show()
+            self._set_filter_kind(None)
+            if self.search.text():
+                self.search.clear()
+            elif self._kind is None:
+                self._refresh_results()
+            self._select_for_show(restore=False)
 
     def apply_theme(self) -> None:
         dark = self._settings().theme == "dark" or (
@@ -1296,12 +1318,17 @@ class ClipPanel(QWidget):
         self._keep_open = value
 
     def _filter(self, kind: ClipKind | None, active: QToolButton) -> None:
+        del active
+        self._set_filter_kind(kind)
+        self._refresh_results()
+
+    def _set_filter_kind(self, kind: ClipKind | None) -> None:
         for index, (button, _button_kind) in enumerate(self._filter_buttons):
-            button.setChecked(button is active)
-            if button is active:
+            active = _button_kind is kind
+            button.setChecked(active)
+            if active:
                 self._filter_index = index
         self._kind = kind
-        self._refresh_results()
 
     def _cycle_filter(self, direction: int) -> None:
         self._filter_index = (self._filter_index + direction) % len(self._filter_buttons)

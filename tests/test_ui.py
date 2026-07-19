@@ -115,10 +115,11 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
     assert len({control.width() for control in controls}) == 1
 
 
-def test_selection_memory_setting_is_an_optional_three_second_default(qtbot) -> None:
+def test_state_memory_setting_is_an_optional_three_second_default(qtbot) -> None:
     dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
     qtbot.addWidget(dialog)
 
+    assert dialog.remember_selection.text() == "记住上次状态"
     assert not dialog.remember_selection.isChecked()
     assert dialog.selection_memory.value() == 3
     assert not dialog.selection_memory.isEnabled()
@@ -200,6 +201,93 @@ def test_panel_restores_multi_selection_by_id_before_memory_expires(qtbot) -> No
     assert {item.id for item in panel._selected_items()} == {"new"}
 
 
+def test_panel_restores_filter_search_and_selection_before_state_memory_expires(qtbot) -> None:
+    now = [100.0]
+    settings = AppSettings(remember_selection=True, selection_memory_seconds=3)
+    panel = ClipPanel(lambda: settings, selection_clock=lambda: now[0])
+    qtbot.addWidget(panel)
+    file_item = ClipItem(
+        "file",
+        ClipKind.FILES,
+        "alpha file",
+        4,
+        4,
+        files=("/tmp/alpha-file.txt",),
+    )
+    panel.set_items([file_item, clip("alpha", "alpha", 3), clip("alphabet", "alphabet", 2)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    qtbot.mouseClick(panel._filter_buttons[3][0], Qt.MouseButton.LeftButton)
+    panel.search.setText("alp")
+    panel.hide()
+
+    now[0] += 2.5
+    panel.show_panel()
+
+    assert panel._kind is ClipKind.FILES
+    assert panel._filter_buttons[3][0].isChecked()
+    assert panel.search.text() == "alp"
+    assert panel.model.rowCount() == 1
+    assert panel.model.item_at(panel.list.currentIndex().row()).id == "file"
+
+
+def test_state_memory_preserves_a_search_with_no_results(qtbot) -> None:
+    now = [100.0]
+    settings = AppSettings(remember_selection=True, selection_memory_seconds=3)
+    panel = ClipPanel(lambda: settings, selection_clock=lambda: now[0])
+    qtbot.addWidget(panel)
+    panel.set_items([clip("alpha", "alpha", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    panel.search.setText("no matches")
+    assert panel.model.rowCount() == 0
+    panel.hide()
+
+    now[0] += 1
+    panel.show_panel()
+
+    assert panel.search.text() == "no matches"
+    assert panel.model.rowCount() == 0
+    assert not panel.list.currentIndex().isValid()
+
+
+def test_expired_state_memory_clears_search_and_selects_global_first(qtbot) -> None:
+    now = [100.0]
+    settings = AppSettings(remember_selection=True, selection_memory_seconds=3)
+    panel = ClipPanel(lambda: settings, selection_clock=lambda: now[0])
+    qtbot.addWidget(panel)
+    panel.set_items([clip("alpha", "alpha", 3), clip("other", "other", 2)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    qtbot.mouseClick(panel._filter_buttons[1][0], Qt.MouseButton.LeftButton)
+    panel.search.setText("other")
+    panel.hide()
+
+    now[0] += 3.1
+    panel.show_panel()
+
+    assert panel._kind is None
+    assert panel._filter_buttons[0][0].isChecked()
+    assert panel.search.text() == ""
+    assert panel.model.rowCount() == 2
+    assert panel.model.item_at(panel.list.currentIndex().row()).id == "alpha"
+
+
+def test_disabled_state_memory_never_restores_search(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("alpha", "alpha", 2), clip("other", "other", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    panel.search.setText("other")
+    panel.hide()
+
+    panel.show_panel()
+
+    assert panel.search.text() == ""
+    assert panel.model.item_at(panel.list.currentIndex().row()).id == "alpha"
+
+
 def test_missing_remembered_items_fall_back_to_first_result(qtbot) -> None:
     now = [50.0]
     settings = AppSettings(remember_selection=True, selection_memory_seconds=3)
@@ -226,16 +314,51 @@ def test_hidden_selection_memory_is_actively_cleared_when_timer_expires(qtbot) -
     panel.set_items([clip("first", "first", 2), clip("second", "second", 1)])
     panel.show_panel()
     qtbot.waitExposed(panel)
-    panel.list.setCurrentIndex(panel.model.index(1))
+    qtbot.mouseClick(panel._filter_buttons[1][0], Qt.MouseButton.LeftButton)
+    panel.search.setText("second")
+    panel.list.setCurrentIndex(panel.model.index(0))
 
     panel.hide()
+    assert panel._remembered_search_text == "second"
+    assert panel._remembered_kind is ClipKind.TEXT
     assert panel._remembered_item_ids == ("second",)
     qtbot.waitUntil(lambda: panel._remembered_item_ids == (), timeout=1_500)
+    assert panel._remembered_search_text == ""
+    assert panel._remembered_kind is None
+    assert panel._kind is None
+    assert panel._filter_buttons[0][0].isChecked()
+    assert panel.search.text() == ""
     assert panel.list.currentIndex().row() == 0
     panel.show_panel()
 
     assert panel.list.currentIndex().row() == 0
     assert {item.id for item in panel._selected_items()} == {"first"}
+
+
+def test_default_three_second_state_memory_with_real_qt_interactions(qtbot) -> None:
+    settings = AppSettings(remember_selection=True, selection_memory_seconds=3)
+    panel = ClipPanel(lambda: settings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("first", "first", 3), clip("second", "second", 2), clip("other", "other", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    qtbot.mouseClick(panel._filter_buttons[1][0], Qt.MouseButton.LeftButton)
+    panel.search.setText("second")
+    panel.hide_panel()
+
+    qtbot.wait(500)
+    panel.show_panel()
+    assert panel._kind is ClipKind.TEXT
+    assert panel._filter_buttons[1][0].isChecked()
+    assert panel.search.text() == "second"
+    assert panel.model.item_at(panel.list.currentIndex().row()).id == "second"
+
+    panel.hide_panel()
+    qtbot.waitUntil(lambda: panel._selection_hidden_at is None, timeout=3_500)
+    assert panel._kind is None
+    assert panel._filter_buttons[0][0].isChecked()
+    assert panel.search.text() == ""
+    assert panel.model.item_at(panel.list.currentIndex().row()).id == "first"
 
 
 def test_focus_loss_hide_starts_memory_once_and_expires_to_first_item(qtbot) -> None:
