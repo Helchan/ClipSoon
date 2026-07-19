@@ -42,6 +42,34 @@ def test_panel_search_keyboard_send_and_escape(qtbot) -> None:
     assert not panel.isVisible()
 
 
+def test_status_is_empty_when_idle_and_transient_messages_clear(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+
+    assert panel.status.text() == ""
+    panel.set_status("已删除 1 条", timeout_ms=20)
+    assert panel.status.text() == "已删除 1 条"
+    qtbot.waitUntil(lambda: panel.status.text() == "", timeout=500)
+
+
+def test_new_status_restarts_timer_and_permission_warning_persists(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+
+    panel.set_status("旧消息", timeout_ms=20)
+    qtbot.wait(10)
+    panel.set_status("新消息", timeout_ms=80)
+    qtbot.wait(25)
+    assert panel.status.text() == "新消息"
+    qtbot.waitUntil(lambda: panel.status.text() == "", timeout=500)
+
+    panel.set_accessibility_warning()
+    qtbot.wait(30)
+    assert panel.has_accessibility_warning()
+    panel.clear_status()
+    assert panel.status.text() == ""
+
+
 def test_settings_and_custom_hotkey_validation(qtbot) -> None:
     dialog = SettingsDialog(AppSettings(hotkey="combo:ctrl+shift+v"))
     qtbot.addWidget(dialog)

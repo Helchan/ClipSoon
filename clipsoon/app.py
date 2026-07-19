@@ -101,7 +101,7 @@ class ClipSoonApplication(QObject):
             PlatformBridge.accessibility_permission_status() is True
             and self.panel.has_accessibility_warning()
         ):
-            self.panel.set_status("准备就绪")
+            self.panel.clear_status()
         self.target = PlatformBridge.capture_target()
         elapsed = self.panel.show_panel()
         LOGGER.info("Panel visible in %.1f ms; target=%s", elapsed, self.target.name if self.target else "none")

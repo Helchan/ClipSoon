@@ -136,6 +136,7 @@ _TEXT_FILE_SUFFIXES = {
 _TEXT_FILE_NAMES = {"dockerfile", "license", "makefile", "readme"}
 _TEXT_FILE_PREVIEW_BYTES = 4 * 1024
 _TEXT_FILE_PREVIEW_CHARS = 220
+_STATUS_TIMEOUT_MS = 4_000
 
 
 class ClipListModel(QAbstractListModel):
@@ -703,11 +704,14 @@ class ClipPanel(QWidget):
         root.addLayout(content, 1)
 
         footer = QHBoxLayout()
-        self.status = QLabel("准备就绪")
+        self.status = QLabel("")
         self.status.setObjectName("muted")
         self.status.setTextFormat(Qt.TextFormat.RichText)
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
         self.status.linkActivated.connect(lambda _link: self.accessibility_requested.emit())
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self.clear_status)
         hints = QLabel("↑↓ 选择    ↵ 发送    Esc 隐藏")
         hints.setObjectName("muted")
         footer.addWidget(self.status)
@@ -723,10 +727,18 @@ class ClipPanel(QWidget):
         self._engine.replace(self._items)
         self._refresh_results()
 
-    def set_status(self, text: str) -> None:
+    def set_status(self, text: str, timeout_ms: int = _STATUS_TIMEOUT_MS) -> None:
+        self._status_timer.stop()
         self.status.setText(text)
+        if text and timeout_ms > 0:
+            self._status_timer.start(timeout_ms)
+
+    def clear_status(self) -> None:
+        self._status_timer.stop()
+        self.status.clear()
 
     def set_accessibility_warning(self) -> None:
+        self._status_timer.stop()
         self.status.setText(
             '需要授予 ClipSoon 辅助功能权限 · <a href="accessibility">打开系统设置</a>'
         )
