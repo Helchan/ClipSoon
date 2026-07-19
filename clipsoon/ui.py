@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import locale
 import logging
 import sys
 import time
@@ -98,6 +99,43 @@ _IMAGE_FILE_SUFFIXES = {
     ".xbm",
     ".xpm",
 }
+_TEXT_FILE_SUFFIXES = {
+    ".bat",
+    ".c",
+    ".cfg",
+    ".cmd",
+    ".conf",
+    ".cpp",
+    ".css",
+    ".csv",
+    ".go",
+    ".h",
+    ".hpp",
+    ".html",
+    ".ini",
+    ".java",
+    ".js",
+    ".json",
+    ".log",
+    ".md",
+    ".mjs",
+    ".properties",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+_TEXT_FILE_NAMES = {"dockerfile", "license", "makefile", "readme"}
+_TEXT_FILE_PREVIEW_BYTES = 64 * 1024
+_TEXT_FILE_PREVIEW_CHARS = 2_048
 
 
 class ClipListModel(QAbstractListModel):
@@ -566,7 +604,7 @@ class ClipPanel(QWidget):
         filters_by_kind = (
             ("全部", None),
             ("文本", ClipKind.TEXT),
-            ("图片", ClipKind.IMAGE),
+            ("截图", ClipKind.IMAGE),
             ("文件", ClipKind.FILES),
         )
         for label, kind in filters_by_kind:
@@ -619,9 +657,16 @@ class ClipPanel(QWidget):
         self.image_preview = ImagePreview()
         self.file_preview = QLabel()
         self.file_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.file_text_preview = QPlainTextEdit()
+        self.file_text_preview.setReadOnly(True)
+        self.file_text_preview.setFrameShape(QFrame.Shape.NoFrame)
+        self.file_text_preview.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.file_text_preview.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.file_text_preview.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.preview_stack.addWidget(self.text_preview)
         self.preview_stack.addWidget(self.image_preview)
         self.preview_stack.addWidget(self.file_preview)
+        self.preview_stack.addWidget(self.file_text_preview)
         detail_layout.addWidget(self.preview_stack, 1)
         information_title = QLabel("信息")
         information_title.setObjectName("informationTitle")
@@ -809,9 +854,15 @@ class ClipPanel(QWidget):
             self.image_preview.set_path(image_path)
             self.preview_stack.setCurrentWidget(self.image_preview)
         elif item.kind is ClipKind.FILES:
-            icon = QFileIconProvider().icon(QFileInfo(item.files[0])) if item.files else QIcon()
-            self.file_preview.setPixmap(icon.pixmap(160, 160))
-            self.preview_stack.setCurrentWidget(self.file_preview)
+            file_text = _read_text_file_preview(item.files)
+            if file_text is not None:
+                self.file_text_preview.setPlainText(file_text)
+                self.file_text_preview.moveCursor(self.file_text_preview.textCursor().MoveOperation.Start)
+                self.preview_stack.setCurrentWidget(self.file_text_preview)
+            else:
+                icon = QFileIconProvider().icon(QFileInfo(item.files[0])) if item.files else QIcon()
+                self.file_preview.setPixmap(icon.pixmap(160, 160))
+                self.preview_stack.setCurrentWidget(self.file_preview)
         else:
             self.text_preview.setPlainText(item.text)
             self.preview_stack.setCurrentWidget(self.text_preview)
@@ -962,6 +1013,57 @@ def _single_image_file_path(files: Sequence[str]) -> str:
         return ""
     path = files[0]
     return path if Path(path).suffix.casefold() in _IMAGE_FILE_SUFFIXES else ""
+
+
+def _read_text_file_preview(files: Sequence[str]) -> str | None:
+    if len(files) != 1:
+        return None
+    path = Path(files[0])
+    if not path.is_file():
+        return None
+    known_text = (
+        path.suffix.casefold() in _TEXT_FILE_SUFFIXES
+        or path.name.casefold() in _TEXT_FILE_NAMES
+        or (path.name.startswith(".") and not path.suffix)
+    )
+    try:
+        with path.open("rb") as source:
+            payload = source.read(_TEXT_FILE_PREVIEW_BYTES + 1)
+    except OSError:
+        return None
+    truncated = len(payload) > _TEXT_FILE_PREVIEW_BYTES
+    payload = payload[:_TEXT_FILE_PREVIEW_BYTES]
+    if not payload:
+        return ""
+    utf16 = payload.startswith((b"\xff\xfe", b"\xfe\xff"))
+    if b"\x00" in payload and not utf16:
+        return None
+    allowed_controls = {8, 9, 10, 12, 13}
+    control_count = sum(byte < 32 and byte not in allowed_controls for byte in payload)
+    if control_count / len(payload) > 0.02:
+        return None
+    encodings = ["utf-16"] if utf16 else ["utf-8-sig", locale.getpreferredencoding(False), "gb18030"]
+    text = None
+    for encoding in dict.fromkeys(encodings):
+        try:
+            text = payload.decode(encoding)
+            break
+        except UnicodeDecodeError as error:
+            if truncated and error.end == len(payload):
+                text = payload[: error.start].decode(encoding)
+                break
+        except LookupError:
+            continue
+    if text is None:
+        return None
+    if not known_text:
+        printable = sum(character.isprintable() or character in "\n\r\t" for character in text)
+        if printable / max(1, len(text)) < 0.9:
+            return None
+    if len(text) > _TEXT_FILE_PREVIEW_CHARS:
+        text = text[:_TEXT_FILE_PREVIEW_CHARS]
+        truncated = True
+    return text + ("\n…" if truncated else "")
 
 
 def _compact_menu(menu: QMenu) -> None:

@@ -167,6 +167,45 @@ def test_filter_tabs_cycle_forward_and_backward(qtbot) -> None:
     assert panel._kind is ClipKind.FILES
 
 
+def test_image_filter_tab_is_named_screenshot(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+
+    assert panel._filter_buttons[2][0].text() == "截图"
+
+
+def test_text_file_uses_bounded_read_only_preview(qtbot, tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text("# ClipSoon\n\n" + "预览内容\n" * 10_000, encoding="utf-8")
+    item = ClipItem("markdown", ClipKind.FILES, "markdown", 1, 1, files=(str(path),))
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+
+    panel.set_items([item])
+
+    preview = panel.file_text_preview.toPlainText()
+    assert panel.preview_stack.currentWidget() is panel.file_text_preview
+    assert preview.startswith("# ClipSoon\n\n预览内容")
+    assert preview.endswith("\n…")
+    assert len(preview) <= 2_050
+    assert panel.file_text_preview.isReadOnly()
+    assert panel.file_text_preview.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert panel.info_type_value.text() == "文件"
+    assert panel.info_detail_value.text() == str(path)
+
+
+def test_binary_file_keeps_file_icon_preview(qtbot, tmp_path: Path) -> None:
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"\x00\x01\x02\xff" * 32)
+    item = ClipItem("binary", ClipKind.FILES, "binary", 1, 1, files=(str(path),))
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+
+    panel.set_items([item])
+
+    assert panel.preview_stack.currentWidget() is panel.file_preview
+
+
 def test_extended_keyboard_selection_and_batch_delete_signal(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
