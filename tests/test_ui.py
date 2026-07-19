@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QKeySequence
 from PySide6.QtWidgets import QFrame, QMenu, QStyleOptionViewItem
 
@@ -129,7 +130,7 @@ def test_file_row_paints_with_qfileinfo(qtbot, tmp_path: Path) -> None:
     assert not pixmap.isNull()
 
 
-def test_copied_image_file_uses_image_thumbnail(tmp_path: Path) -> None:
+def test_copied_image_file_uses_image_thumbnail(qtbot, tmp_path: Path) -> None:
     path = tmp_path / "copied-image.png"
     image = QImage(12, 8, QImage.Format.Format_RGB32)
     image.fill(QColor("#e23b4f"))
@@ -138,7 +139,12 @@ def test_copied_image_file_uses_image_thumbnail(tmp_path: Path) -> None:
     delegate = ClipDelegate()
     thumbnail = delegate._file_image_thumbnail((str(path),), image.size())
 
-    assert not thumbnail.isNull()
+    assert thumbnail.isNull()
+    qtbot.waitUntil(
+        lambda: not delegate._file_image_thumbnail((str(path),), image.size()).isNull(),
+        timeout=1_000,
+    )
+    thumbnail = delegate._file_image_thumbnail((str(path),), image.size())
     assert thumbnail.toImage().pixelColor(0, 0) == QColor("#e23b4f")
     assert delegate._file_image_thumbnail((str(path), str(path)), image.size()).isNull()
 
@@ -155,11 +161,63 @@ def test_copied_image_file_uses_detail_image_preview(qtbot, tmp_path: Path) -> N
     panel.set_items([item])
 
     assert panel.preview_stack.currentWidget() is panel.image_preview
+    assert panel.image_preview.text() == "正在加载预览…"
+    qtbot.waitUntil(
+        lambda: panel.image_preview.pixmap() is not None and not panel.image_preview.pixmap().isNull(),
+        timeout=1_000,
+    )
     assert not panel.image_preview.pixmap().isNull()
     assert panel.info_type_value.text() == "文件"
     assert panel.info_detail_label.text() == "路径"
     assert panel.info_detail_value.text() == str(path)
     assert panel.list.itemDelegate().sizeHint(QStyleOptionViewItem(), panel.model.index(0)).height() == 52
+
+
+def test_large_image_decode_does_not_block_selection(qtbot, tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "large.jpg"
+    path.write_bytes(b"image placeholder")
+
+    def slow_decode(_path: str, bounds, _keep_aspect: bool) -> QImage:
+        time.sleep(0.2)
+        image = QImage(bounds, QImage.Format.Format_RGB32)
+        image.fill(QColor("#3d8bea"))
+        return image
+
+    monkeypatch.setattr(ui_module, "_read_scaled_image", slow_decode)
+    delegate = ClipDelegate()
+    thumbnail_started = time.perf_counter()
+    thumbnail = delegate._file_image_thumbnail((str(path),), QSize(72, 72))
+    thumbnail_elapsed = time.perf_counter() - thumbnail_started
+    assert thumbnail.isNull()
+    assert thumbnail_elapsed < 0.02
+
+    readme = tmp_path / "README.md"
+    readme.write_text("preview", encoding="utf-8")
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items(
+        [
+            ClipItem("text-file", ClipKind.FILES, "text-file", 1, 2, files=(str(readme),)),
+            ClipItem("large-image", ClipKind.FILES, "large-image", 1, 1, files=(str(path),)),
+        ]
+    )
+
+    started = time.perf_counter()
+    panel.list.setCurrentIndex(panel.model.index(1))
+    elapsed = time.perf_counter() - started
+
+    assert panel.list.currentIndex().row() == 1
+    assert panel.preview_stack.currentWidget() is panel.image_preview
+    assert panel.image_preview.text() == "正在加载预览…"
+    assert elapsed < 0.02
+    qtbot.waitUntil(
+        lambda: panel.image_preview.pixmap() is not None and not panel.image_preview.pixmap().isNull(),
+        timeout=1_000,
+    )
+    qtbot.waitUntil(
+        lambda: not delegate._file_image_thumbnail((str(path),), QSize(72, 72)).isNull(),
+        timeout=1_000,
+    )
 
 
 def test_list_item_content_has_equal_top_and_bottom_padding() -> None:

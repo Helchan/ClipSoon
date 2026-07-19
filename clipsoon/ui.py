@@ -18,8 +18,10 @@ from PySide6.QtCore import (
     QModelIndex,
     QObject,
     QRect,
+    QRunnable,
     QSize,
     Qt,
+    QThreadPool,
     QTimer,
     Signal,
 )
@@ -29,6 +31,7 @@ from PySide6.QtGui import (
     QCursor,
     QFont,
     QIcon,
+    QImage,
     QImageReader,
     QKeyEvent,
     QKeySequence,
@@ -215,12 +218,62 @@ class ClipListView(QListView):
         self.hover_index_changed.emit(QModelIndex())
 
 
+ImageLoadKey = tuple[str, int, int, bool]
+
+
+class _ImageLoadSignals(QObject):
+    finished = Signal(object, object)
+
+
+class _ImageLoadTask(QRunnable):
+    def __init__(self, key: ImageLoadKey) -> None:
+        super().__init__()
+        self.key = key
+        self.signals = _ImageLoadSignals()
+
+    def run(self) -> None:
+        path, width, height, keep_aspect = self.key
+        image = _read_scaled_image(path, QSize(width, height), keep_aspect)
+        self.signals.finished.emit(self.key, image)
+
+
+class _ScaledImageLoader(QObject):
+    image_ready = Signal(object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._cache: dict[ImageLoadKey, QImage] = {}
+        self._tasks: dict[ImageLoadKey, _ImageLoadTask] = {}
+
+    @staticmethod
+    def key(path: str, size: QSize, keep_aspect: bool) -> ImageLoadKey:
+        return path, max(1, size.width()), max(1, size.height()), keep_aspect
+
+    def request(self, path: str, size: QSize, *, keep_aspect: bool) -> QImage | None:
+        key = self.key(path, size, keep_aspect)
+        if key in self._cache:
+            return self._cache[key]
+        if key not in self._tasks:
+            task = _ImageLoadTask(key)
+            task.signals.finished.connect(self._complete)
+            self._tasks[key] = task
+            QThreadPool.globalInstance().start(task)
+        return None
+
+    def _complete(self, key: ImageLoadKey, image: QImage) -> None:
+        self._tasks.pop(key, None)
+        self._cache[key] = image
+        self.image_ready.emit(key)
+
+
 class ClipDelegate(QStyledItemDelegate):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._thumbnails: dict[str, QPixmap] = {}
+        self._thumbnails: dict[ImageLoadKey, QPixmap] = {}
         self._file_icons: dict[str, QPixmap] = {}
         self._file_icon_provider = QFileIconProvider()
+        self._image_loader = _ScaledImageLoader(self)
+        self._image_loader.image_ready.connect(self._image_loaded)
         self.hovered_row = -1
         self.dark_theme = False
 
@@ -293,15 +346,18 @@ class ClipDelegate(QStyledItemDelegate):
                 painter.drawPixmap(rect, pixmap, pixmap.rect())
                 return
         elif item.kind is ClipKind.FILES and item.files:
-            pixmap = self._file_image_thumbnail(item.files, rect.size() * 2)
-            if not pixmap.isNull():
-                painter.drawPixmap(rect, pixmap, pixmap.rect())
-                return
-            pixmap = self._file_thumbnail(item.files[0])
-            if not pixmap.isNull():
-                target = self._centered_file_icon_rect(rect)
-                painter.drawPixmap(target, pixmap, pixmap.rect())
-                return
+            image_path = _single_image_file_path(item.files)
+            if image_path:
+                pixmap = self._image_thumbnail(image_path, rect.size() * 2)
+                if not pixmap.isNull():
+                    painter.drawPixmap(rect, pixmap, pixmap.rect())
+                    return
+            else:
+                pixmap = self._file_thumbnail(item.files[0])
+                if not pixmap.isNull():
+                    target = self._centered_file_icon_rect(rect)
+                    painter.drawPixmap(target, pixmap, pixmap.rect())
+                    return
         color = QColor("#FFFFFF") if selected else QColor("#5664E8")
         painter.setPen(color)
         font = painter.font()
@@ -316,17 +372,24 @@ class ClipDelegate(QStyledItemDelegate):
         return container.adjusted(inset, inset, -inset, -inset)
 
     def _image_thumbnail(self, path: str, size: QSize) -> QPixmap:
-        if path not in self._thumbnails:
-            reader = QImageReader(path)
-            reader.setAutoTransform(True)
-            reader.setScaledSize(size)
-            image = reader.read()
-            self._thumbnails[path] = QPixmap.fromImage(image).scaled(
+        if not path:
+            return QPixmap()
+        key = self._image_loader.key(path, size, False)
+        if key not in self._thumbnails:
+            image = self._image_loader.request(path, size, keep_aspect=False)
+            if image is None:
+                return QPixmap()
+            self._thumbnails[key] = QPixmap.fromImage(image).scaled(
                 size,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-        return self._thumbnails[path]
+        return self._thumbnails[key]
+
+    def _image_loaded(self, _key: ImageLoadKey) -> None:
+        view = self.parent()
+        if isinstance(view, QListView):
+            view.viewport().update()
 
     def _file_image_thumbnail(self, files: Sequence[str], size: QSize) -> QPixmap:
         path = _single_image_file_path(files)
@@ -350,33 +413,45 @@ class ImagePreview(QLabel):
     def __init__(self) -> None:
         super().__init__()
         self._path = ""
+        self._image_loader = _ScaledImageLoader(self)
+        self._image_loader.image_ready.connect(self._image_loaded)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._render)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(220, 240)
         self.setText("图片预览")
 
     def set_path(self, path: str) -> None:
+        self._resize_timer.stop()
         self._path = path
+        self.clear()
+        if not path:
+            self.setText("图片预览")
+            return
+        self.setText("正在加载预览…")
         self._render()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._render()
+        if self._path:
+            self._resize_timer.start(40)
 
     def _render(self) -> None:
         if not self._path or self.width() < 20 or self.height() < 20:
             return
-        reader = QImageReader(self._path)
-        reader.setAutoTransform(True)
-        natural = reader.size()
         bounds = QSize(max(1, self.width() - 20), max(1, self.height() - 20))
-        if natural.isValid():
-            natural.scale(bounds, Qt.AspectRatioMode.KeepAspectRatio)
-            reader.setScaledSize(natural)
-        image = reader.read()
+        image = self._image_loader.request(self._path, bounds, keep_aspect=True)
+        if image is None:
+            return
         if image.isNull():
             self.setText("无法预览图片")
             return
         self.setPixmap(QPixmap.fromImage(image))
+
+    def _image_loaded(self, key: ImageLoadKey) -> None:
+        if key[0] == self._path:
+            self._render()
 
 
 class TextFilePreview(QPlainTextEdit):
@@ -861,6 +936,7 @@ class ClipPanel(QWidget):
     def _show_detail(self, row: int) -> None:
         item = self.model.item_at(row)
         if item is None:
+            self.image_preview.set_path("")
             self.text_preview.setPlainText("")
             self.preview_stack.setCurrentWidget(self.text_preview)
             self.info_type_value.setText("—")
@@ -873,6 +949,7 @@ class ClipPanel(QWidget):
             self.image_preview.set_path(image_path)
             self.preview_stack.setCurrentWidget(self.image_preview)
         elif item.kind is ClipKind.FILES:
+            self.image_preview.set_path("")
             file_text = _read_text_file_preview(item.files)
             if file_text is not None:
                 self.file_text_preview.setPlainText(file_text)
@@ -883,6 +960,7 @@ class ClipPanel(QWidget):
                 self.file_preview.setPixmap(icon.pixmap(160, 160))
                 self.preview_stack.setCurrentWidget(self.file_preview)
         else:
+            self.image_preview.set_path("")
             self.text_preview.setPlainText(item.text)
             self.preview_stack.setCurrentWidget(self.text_preview)
         if item.kind is ClipKind.FILES:
@@ -1032,6 +1110,19 @@ def _single_image_file_path(files: Sequence[str]) -> str:
         return ""
     path = files[0]
     return path if Path(path).suffix.casefold() in _IMAGE_FILE_SUFFIXES else ""
+
+
+def _read_scaled_image(path: str, bounds: QSize, keep_aspect: bool) -> QImage:
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    scaled_size = bounds
+    if keep_aspect:
+        natural = reader.size()
+        if natural.isValid():
+            scaled_size = QSize(natural)
+            scaled_size.scale(bounds, Qt.AspectRatioMode.KeepAspectRatio)
+    reader.setScaledSize(scaled_size)
+    return reader.read()
 
 
 def _read_text_file_preview(files: Sequence[str]) -> str | None:
