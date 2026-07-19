@@ -909,6 +909,7 @@ class ClipPanel(QWidget):
         self._remembered_item_ids: tuple[str, ...] = ()
         self._remembered_current_id: str | None = None
         self._selection_hidden_at: float | None = None
+        self._selection_hide_prepared = False
         self._selection_memory_timer = QTimer(self)
         self._selection_memory_timer.setSingleShot(True)
         self._selection_memory_timer.timeout.connect(self._expire_selection_memory)
@@ -1120,6 +1121,7 @@ class ClipPanel(QWidget):
         self.move(x, y)
         self.search.clear()
         self._select_for_show()
+        self._selection_hide_prepared = False
         self.show()
         self.raise_()
         self.activateWindow()
@@ -1127,11 +1129,23 @@ class ClipPanel(QWidget):
         return (time.perf_counter() - started) * 1_000
 
     def hideEvent(self, event) -> None:
+        self._prepare_selection_for_hide()
+        super().hideEvent(event)
+
+    def hide_panel(self) -> None:
+        if not self.isVisible():
+            return
+        self._prepare_selection_for_hide()
+        self.hide()
+
+    def _prepare_selection_for_hide(self) -> None:
+        if self._selection_hide_prepared:
+            return
+        self._selection_hide_prepared = True
         if self._settings().remember_selection:
             self._capture_selection_memory()
         else:
             self._clear_selection_memory()
-        super().hideEvent(event)
 
     def _select_for_show(self) -> None:
         selection_model = self.list.selectionModel()
@@ -1163,14 +1177,14 @@ class ClipPanel(QWidget):
             if restore:
                 self._clear_selection_memory()
 
+        current_row = rows_by_id.get(self._remembered_current_id, selected_rows[0]) if restore else 0
+        current = self.model.index(current_row)
         selection_model.clearSelection()
         for row in selected_rows:
             selection_model.select(
                 self.model.index(row),
                 QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
             )
-        current_row = rows_by_id.get(self._remembered_current_id, selected_rows[0]) if restore else 0
-        current = self.model.index(current_row)
         selection_model.setCurrentIndex(current, QItemSelectionModel.SelectionFlag.NoUpdate)
         self._selection_anchor = current_row
         self._show_detail(current_row)
@@ -1240,7 +1254,7 @@ class ClipPanel(QWidget):
             self.search.setFocus(Qt.FocusReason.TabFocusReason)
             return True
         if key == Qt.Key.Key_Escape:
-            self.hide()
+            self.hide_panel()
             return True
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if watched is self.search and QApplication.inputMethod().isVisible():
@@ -1276,7 +1290,7 @@ class ClipPanel(QWidget):
 
     def _hide_if_unfocused(self) -> None:
         if not self.isActiveWindow() and QApplication.activeModalWidget() is None and not self._keep_open:
-            self.hide()
+            self.hide_panel()
 
     def keep_open(self, value: bool) -> None:
         self._keep_open = value

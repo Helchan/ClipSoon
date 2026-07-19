@@ -238,6 +238,28 @@ def test_hidden_selection_memory_is_actively_cleared_when_timer_expires(qtbot) -
     assert {item.id for item in panel._selected_items()} == {"first"}
 
 
+def test_focus_loss_hide_starts_memory_once_and_expires_to_first_item(qtbot) -> None:
+    now = [100.0]
+    settings = AppSettings(remember_selection=True, selection_memory_seconds=3)
+    panel = ClipPanel(lambda: settings, selection_clock=lambda: now[0])
+    qtbot.addWidget(panel)
+    panel.set_items([clip("first", "first", 2), clip("second", "second", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    panel.list.setCurrentIndex(panel.model.index(1))
+
+    panel._hide_if_unfocused()
+
+    assert not panel.isVisible()
+    assert panel._selection_hidden_at == 100.0
+    assert panel._remembered_item_ids == ("second",)
+    now[0] += 3.1
+    panel.show_panel()
+
+    assert panel.list.currentIndex().row() == 0
+    assert {item.id for item in panel._selected_items()} == {"first"}
+
+
 def test_selection_expiry_does_not_reset_a_panel_reopened_within_the_limit(qtbot) -> None:
     settings = AppSettings(remember_selection=True, selection_memory_seconds=1)
     panel = ClipPanel(lambda: settings)

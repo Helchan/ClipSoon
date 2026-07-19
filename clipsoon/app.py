@@ -55,7 +55,7 @@ class ClipSoonApplication(QObject):
             self.repository,
             PynputPasteAdapter(),
             lambda: self.settings.value,
-            self.panel.hide,
+            self.panel.hide_panel,
         )
         self.hotkey = GlobalHotkeyService(self.signals.hotkey.emit, self.signals.hotkey_failed.emit)
         self.tray, self.tray_menu, self.tray_actions = create_tray_icon(self.panel)
@@ -92,7 +92,7 @@ class ClipSoonApplication(QObject):
 
     def toggle_panel(self) -> None:
         if self.panel.isVisible():
-            self.panel.hide()
+            self.panel.hide_panel()
         else:
             self.show_panel()
 
