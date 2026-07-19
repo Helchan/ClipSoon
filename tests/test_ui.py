@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QItemSelectionModel, QPoint, QRect, QSize, Qt
-from PySide6.QtGui import QColor, QImage, QKeySequence
+from PySide6.QtGui import QColor, QImage, QKeySequence, QPalette
 from PySide6.QtWidgets import QDialog, QFrame, QMenu, QStyleOptionViewItem
 
 import clipsoon.ui as ui_module
@@ -127,6 +127,42 @@ def test_state_memory_setting_is_an_optional_three_second_default(qtbot) -> None
     assert dialog.selection_memory.isEnabled()
     assert dialog.values()["remember_selection"] is True
     assert dialog.values()["selection_memory_seconds"] == 3
+
+
+def test_dark_settings_combo_popups_use_readable_theme_colors(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(theme="dark"), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    for combo in (dialog.hotkey_mode, dialog.theme):
+        view = combo.view()
+        palette = view.palette()
+        assert palette.color(QPalette.ColorRole.Base) == QColor("#242630")
+        assert palette.color(QPalette.ColorRole.Text) == QColor("#F7F7FA")
+        assert "background: #242630" in view.styleSheet()
+        assert "color: #F7F7FA" in view.styleSheet()
+        assert "background: #5B6CFF; color: #FFFFFF" in view.styleSheet()
+        assert "background: #242630" in view.window().styleSheet()
+        assert view.window().palette().color(QPalette.ColorRole.Window) == QColor("#242630")
+
+    dialog.theme.showPopup()
+    qtbot.waitUntil(dialog.theme.view().isVisible, timeout=500)
+    popup = dialog.theme.view()
+    rendered = popup.viewport().grab().toImage()
+    normal_rect = popup.visualRect(popup.model().index(0, 0))
+    sample_x = rendered.width() - 5
+    assert rendered.pixelColor(sample_x, normal_rect.center().y()) == QColor("#242630")
+
+
+def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(theme="light"), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+
+    for combo in (dialog.hotkey_mode, dialog.theme):
+        palette = combo.view().palette()
+        assert palette.color(QPalette.ColorRole.Base) == QColor("#FFFFFF")
+        assert palette.color(QPalette.ColorRole.Text) == QColor("#161821")
 
 
 def test_open_data_directory_closes_settings_before_emitting(qtbot, monkeypatch) -> None:
@@ -816,6 +852,22 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     background_sample = QPoint(action_rect.right() - 4, action_rect.center().y())
     assert menu.activeAction() is delete_action
     assert rendered.pixelColor(background_sample) == QColor("#CBD2E3")
+
+
+def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
+    menu = QMenu()
+    qtbot.addWidget(menu)
+    menu.addAction("删除所选")
+    menu.addSeparator()
+    menu.addAction("清空历史")
+
+    _compact_menu(menu, dark=True)
+
+    style = menu.styleSheet()
+    assert "background: #2B2E38" in style
+    assert "color: #F7F7FA" in style
+    assert "background: #515665" in style
+    assert "background: #4A4D59" in style
 
 
 def test_filter_and_list_background_align_with_bordered_search(qtbot) -> None:

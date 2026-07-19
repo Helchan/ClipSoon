@@ -764,6 +764,12 @@ class SettingsDialog(QDialog):
         self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
         add_row(history_form, 3, "外观", self.theme)
 
+        # A QComboBox popup is a separate top-level window on macOS.  It does
+        # not reliably inherit the dialog stylesheet, so an explicitly dark
+        # dialog could otherwise show white text on the system's light popup.
+        for combo in (self.hotkey_mode, self.theme):
+            _style_combo_popup(combo, dark)
+
         self.selection_memory = _spin(settings.selection_memory_seconds, 1, 300, " 秒")
         self.selection_memory.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.selection_memory.setEnabled(settings.remember_selection)
@@ -919,6 +925,7 @@ class ClipPanel(QWidget):
         self._selection_memory_timer.timeout.connect(self._expire_selection_memory)
         self._filter_buttons: list[tuple[QToolButton, ClipKind | None]] = []
         self._filter_index = 0
+        self._dark_theme = False
         self.setObjectName("panelWindow")
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -1256,6 +1263,7 @@ class ClipPanel(QWidget):
             self._settings().theme == "system"
             and QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
         )
+        self._dark_theme = dark
         delegate = self.list.itemDelegate()
         if isinstance(delegate, ClipDelegate):
             delegate.set_dark_theme(dark)
@@ -1450,7 +1458,7 @@ class ClipPanel(QWidget):
         menu.addSeparator()
         clear_action = menu.addAction("清空历史")
         clear_action.setEnabled(self.model.rowCount() > 0)
-        _compact_menu(menu)
+        _compact_menu(menu, dark=self._dark_theme)
         selected = menu.exec(self.list.viewport().mapToGlobal(position))
         if selected is delete_action:
             self._request_delete_selected()
@@ -1624,14 +1632,60 @@ def _read_text_file_preview(files: Sequence[str]) -> str | None:
     return text + ("\n..." if truncated else "")
 
 
-def _compact_menu(menu: QMenu) -> None:
-    dark = menu.palette().color(QPalette.ColorRole.Window).lightness() < 128
-    hover_background = "rgba(255,255,255,88)" if dark else "#CBD2E3"
+def _style_combo_popup(combo: QComboBox, dark: bool) -> None:
+    popup_background = "#242630" if dark else "#FFFFFF"
+    popup_hover = "#454957" if dark else "#E3E7F1"
+    text = "#F7F7FA" if dark else "#161821"
+    muted = "#8F93A3" if dark else "#8A8E9C"
+    border = "#484B58" if dark else "#D7DAE3"
+    view = combo.view()
+    container = view.window()
+    container.setObjectName("comboPopup")
+    container_palette = container.palette()
+    container_palette.setColor(QPalette.ColorRole.Window, QColor(popup_background))
+    container_palette.setColor(QPalette.ColorRole.Base, QColor(popup_background))
+    container.setPalette(container_palette)
+    container.setAutoFillBackground(True)
+    container.setStyleSheet(
+        f"#comboPopup {{ background: {popup_background}; border: 1px solid {border}; "
+        "border-radius: 6px; }"
+    )
+    palette = view.palette()
+    palette.setColor(QPalette.ColorRole.Base, QColor(popup_background))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(popup_background))
+    palette.setColor(QPalette.ColorRole.Window, QColor(popup_background))
+    palette.setColor(QPalette.ColorRole.Text, QColor(text))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(text))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#5B6CFF"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(muted))
+    view.setStyleSheet(
+        f"QAbstractItemView {{ background: {popup_background}; color: {text}; "
+        "border: none; outline: none; padding: 2px; }"
+        "QAbstractItemView::item { min-height: 28px; padding: 3px 8px; }"
+        f"QAbstractItemView::item:hover {{ background: {popup_hover}; color: {text}; }}"
+        "QAbstractItemView::item:selected { background: #5B6CFF; color: #FFFFFF; }"
+        f"QAbstractItemView::item:disabled {{ color: {muted}; }}"
+    )
+    # Apply the palette after QSS: some platform styles repolish the popup view
+    # when a stylesheet is installed and otherwise restore the system accent.
+    view.setPalette(palette)
+
+
+def _compact_menu(menu: QMenu, *, dark: bool | None = None) -> None:
+    if dark is None:
+        dark = menu.palette().color(QPalette.ColorRole.Window).lightness() < 128
+    background = "#2B2E38" if dark else "#F7F7F8"
+    text = "#F7F7FA" if dark else "#161821"
+    disabled = "#858998" if dark else "#9699A3"
+    separator = "#4A4D59" if dark else "#D5D7DE"
+    hover_background = "#515665" if dark else "#CBD2E3"
     menu.setStyleSheet(
-        "QMenu { padding: 2px; }"
+        f"QMenu {{ background: {background}; color: {text}; padding: 2px; }}"
         "QMenu::item { padding: 5px 7px; border-radius: 4px; }"
-        f"QMenu::item:selected {{ background: {hover_background}; }}"
-        "QMenu::separator { height: 1px; margin: 2px 4px; }"
+        f"QMenu::item:selected {{ background: {hover_background}; color: {text}; }}"
+        f"QMenu::item:disabled {{ color: {disabled}; }}"
+        f"QMenu::separator {{ background: {separator}; height: 1px; margin: 2px 4px; }}"
     )
     text_width = max(
         (menu.fontMetrics().horizontalAdvance(action.text()) for action in menu.actions() if not action.isSeparator()),
