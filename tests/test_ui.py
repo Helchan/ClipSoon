@@ -270,7 +270,7 @@ def test_detail_information_for_text_and_image(qtbot) -> None:
 def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     menu = QMenu()
     qtbot.addWidget(menu)
-    menu.addAction("删除所选")
+    delete_action = menu.addAction("删除所选")
     menu.addSeparator()
     menu.addAction("清空历史")
 
@@ -278,6 +278,19 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
 
     expected = max(68, menu.fontMetrics().horizontalAdvance("删除所选") + 18)
     assert menu.width() == expected
+    assert "QMenu::item:selected" in menu.styleSheet()
+    assert "background: #E7EAF1" in menu.styleSheet()
+
+    menu.show()
+    qtbot.waitExposed(menu)
+    action_rect = menu.actionGeometry(delete_action)
+    qtbot.mouseMove(menu, action_rect.center())
+    qtbot.wait(20)
+
+    rendered = menu.grab().toImage()
+    background_sample = QPoint(action_rect.right() - 4, action_rect.center().y())
+    assert menu.activeAction() is delete_action
+    assert rendered.pixelColor(background_sample) == QColor("#E7EAF1")
 
 
 def test_filter_and_list_background_align_with_bordered_search(qtbot) -> None:
