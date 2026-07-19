@@ -81,9 +81,40 @@ def test_settings_and_custom_hotkey_validation(qtbot) -> None:
         "Meta+Shift+V" if sys.platform == "darwin" else "Ctrl+Shift+V"
     )
     assert _parse_hotkey("V") == ""
-    assert dialog.version_label.text() == f"ClipSoon v{__version__}"
+    assert dialog.findChildren(QFrame, "settingsSection")
+    assert dialog.findChild(QFrame, "settingsSection") is not None
+    assert not hasattr(dialog, "version_label")
     dialog.hotkey_mode.setCurrentText("双击 Shift")
     assert dialog.values()["hotkey"] == "double:shift"
+
+
+def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    sections = dialog.findChildren(QFrame, "settingsSection")
+    assert len(sections) == 3
+    assert dialog.width() == 580
+    assert dialog.height() < 720
+    controls = [
+        dialog.hotkey_mode,
+        dialog.custom_hotkey,
+        dialog.interval,
+        dialog.maximum,
+        dialog.retention,
+        dialog.delay,
+        dialog.theme,
+    ]
+    assert len({control.width() for control in controls}) == 1
+
+
+def test_panel_footer_places_version_after_hide_hint(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+
+    assert panel.version_label.text().endswith(f"Esc 隐藏    ClipSoon v{__version__}")
 
 
 def test_macos_accessibility_prompt_only_when_not_granted(qtbot, monkeypatch) -> None:

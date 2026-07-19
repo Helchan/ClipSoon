@@ -43,13 +43,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileIconProvider,
-    QFormLayout,
     QFrame,
     QGraphicsDropShadowEffect,
     QGridLayout,
@@ -62,6 +62,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QStackedWidget,
     QStyle,
@@ -484,23 +485,64 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("ClipSoon 设置")
         self.setModal(True)
-        self.setMinimumWidth(470)
+        self.setFixedWidth(580)
+        dark = settings.theme == "dark" or (
+            settings.theme == "system"
+            and QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        )
+        self.setStyleSheet(_style_sheet(dark))
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 20)
-        layout.setSpacing(16)
+        layout.setContentsMargins(22, 16, 22, 16)
+        layout.setSpacing(9)
+
+        header = QVBoxLayout()
+        header.setSpacing(2)
         title = QLabel("偏好设置")
         title.setObjectName("dialogTitle")
-        layout.addWidget(title)
-        form = QFormLayout()
-        form.setHorizontalSpacing(24)
-        form.setVerticalSpacing(13)
-        layout.addLayout(form)
+        subtitle = QLabel("配置快捷键、历史记录与粘贴行为")
+        subtitle.setObjectName("settingsSubtitle")
+        header.addWidget(title)
+        header.addWidget(subtitle)
+        layout.addLayout(header)
+
+        def section(title_text: str) -> tuple[QFrame, QVBoxLayout]:
+            frame = QFrame()
+            frame.setObjectName("settingsSection")
+            section_layout = QVBoxLayout(frame)
+            section_layout.setContentsMargins(14, 10, 14, 10)
+            section_layout.setSpacing(7)
+            section_title = QLabel(title_text)
+            section_title.setObjectName("settingsSectionTitle")
+            section_layout.addWidget(section_title)
+            return frame, section_layout
+
+        def form_grid() -> QGridLayout:
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(14)
+            grid.setVerticalSpacing(6)
+            grid.setColumnMinimumWidth(0, 104)
+            grid.setColumnStretch(1, 1)
+            return grid
+
+        def add_row(grid: QGridLayout, row: int, text: str, control: QWidget) -> None:
+            label = QLabel(text)
+            label.setObjectName("settingsFieldLabel")
+            label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            control.setMinimumHeight(32)
+            control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            grid.addWidget(label, row, 0)
+            grid.addWidget(control, row, 1)
+
+        shortcut_section, shortcut_layout = section("快捷键")
+        shortcut_form = form_grid()
+        shortcut_layout.addLayout(shortcut_form)
 
         self.hotkey_mode = QComboBox()
         self.hotkey_mode.addItems(self._HOTKEYS)
         current = next((label for label, value in self._HOTKEYS.items() if value == settings.hotkey), "自定义组合键")
         self.hotkey_mode.setCurrentText(current)
-        form.addRow("呼出快捷键", self.hotkey_mode)
+        add_row(shortcut_form, 0, "呼出方式", self.hotkey_mode)
         self.custom_hotkey = QKeySequenceEdit()
         self.custom_hotkey.setMaximumSequenceLength(1)
         self.custom_hotkey.setClearButtonEnabled(True)
@@ -511,23 +553,31 @@ class SettingsDialog(QDialog):
         self.hotkey_mode.currentTextChanged.connect(
             lambda value: self.custom_hotkey.setEnabled(value == "自定义组合键")
         )
-        form.addRow("自定义组合键", self.custom_hotkey)
+        add_row(shortcut_form, 1, "自定义组合键", self.custom_hotkey)
 
         self.interval = _spin(settings.double_tap_interval_ms, 180, 900, " ms")
+        self.interval.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        add_row(shortcut_form, 2, "双击间隔", self.interval)
+        layout.addWidget(shortcut_section)
+
+        history_section, history_layout = section("历史与行为")
+        history_form = form_grid()
+        history_layout.addLayout(history_form)
         self.maximum = _spin(settings.max_history_items, 50, 10_000, " 条")
         self.retention = _spin(settings.retention_days, 0, 3_650, " 天（0 = 永久）")
         self.delay = _spin(settings.paste_delay_ms, 60, 2_000, " ms")
-        form.addRow("双击间隔", self.interval)
-        form.addRow("历史容量", self.maximum)
-        form.addRow("保留时间", self.retention)
-        form.addRow("目标恢复等待", self.delay)
+        for spin_box in (self.maximum, self.retention, self.delay):
+            spin_box.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        add_row(history_form, 0, "历史容量", self.maximum)
+        add_row(history_form, 1, "保留时间", self.retention)
+        add_row(history_form, 2, "恢复等待", self.delay)
 
         self.theme = QComboBox()
         self.theme.addItem("跟随系统", "system")
         self.theme.addItem("浅色", "light")
         self.theme.addItem("深色", "dark")
         self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
-        form.addRow("外观", self.theme)
+        add_row(history_form, 3, "外观", self.theme)
 
         self.capture = QCheckBox("记录新的剪贴板内容")
         self.capture.setChecked(settings.capture_enabled)
@@ -535,9 +585,15 @@ class SettingsDialog(QDialog):
         self.paste.setChecked(settings.paste_after_selection)
         self.hide = QCheckBox("面板失去焦点时自动隐藏")
         self.hide.setChecked(settings.hide_on_deactivate)
-        layout.addWidget(self.capture)
-        layout.addWidget(self.paste)
-        layout.addWidget(self.hide)
+        behavior_options = QGridLayout()
+        behavior_options.setContentsMargins(118, 3, 0, 0)
+        behavior_options.setHorizontalSpacing(18)
+        behavior_options.setVerticalSpacing(6)
+        behavior_options.addWidget(self.capture, 0, 0)
+        behavior_options.addWidget(self.paste, 0, 1)
+        behavior_options.addWidget(self.hide, 1, 0, 1, 2)
+        history_layout.addLayout(behavior_options)
+        layout.addWidget(history_section)
 
         self.accessibility_button = None
         platform_message = ""
@@ -564,7 +620,12 @@ class SettingsDialog(QDialog):
         if platform_message:
             layout.addWidget(platform_note)
 
+        data_section, data_layout = section("数据管理")
+        data_description = QLabel("历史数据仅保存在本机；清除操作不会影响已置顶条目。")
+        data_description.setObjectName("settingsSubtitle")
+        data_layout.addWidget(data_description)
         data_row = QHBoxLayout()
+        data_row.setSpacing(8)
         clear = QPushButton("清除未置顶历史")
         reveal = QPushButton("打开数据目录")
         clear.clicked.connect(self._confirm_clear)
@@ -572,7 +633,9 @@ class SettingsDialog(QDialog):
         data_row.addWidget(clear)
         data_row.addWidget(reveal)
         data_row.addStretch()
-        layout.addLayout(data_row)
+        data_layout.addLayout(data_row)
+        layout.addWidget(data_section)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save
         )
@@ -581,9 +644,6 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self._validate_accept)
         footer = QHBoxLayout()
-        self.version_label = QLabel(f"ClipSoon v{__version__}")
-        self.version_label.setObjectName("muted")
-        footer.addWidget(self.version_label)
         footer.addStretch()
         footer.addWidget(buttons)
         layout.addLayout(footer)
@@ -787,8 +847,9 @@ class ClipPanel(QWidget):
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
         self._status_timer.timeout.connect(self.clear_status)
-        hints = QLabel("↑↓ 选择    ↵ 发送    Esc 隐藏")
+        hints = QLabel(f"↑↓ 选择    ↵ 发送    Esc 隐藏    ClipSoon v{__version__}")
         hints.setObjectName("muted")
+        self.version_label = hints
         footer.addWidget(self.status)
         footer.addStretch()
         footer.addWidget(hints)
@@ -1094,10 +1155,15 @@ def _style_sheet(dark: bool) -> str:
         #muted {{ color: {muted}; font-size: 12px; }}
         #muted a {{ color: #6574FF; text-decoration: none; }}
         #platformNote {{ background: {input_bg}; border: 1px solid {border}; border-radius: 10px; }}
-        #dialogTitle {{ font-size: 22px; font-weight: 650; }}
+        #dialogTitle {{ font-size: 21px; font-weight: 650; }}
+        #settingsSubtitle {{ color: {muted}; font-size: 12px; }}
+        #settingsSection {{ background: {panel}; border: 1px solid {border}; border-radius: 11px; }}
+        #settingsSectionTitle {{ font-size: 14px; font-weight: 650; }}
+        #settingsFieldLabel {{ color: {muted}; font-size: 12px; }}
         QPlainTextEdit, QLineEdit, QComboBox, QSpinBox {{
             background: {input_bg}; border: 1px solid {border}; border-radius: 9px; padding: 7px;
         }}
+        QComboBox:disabled, QLineEdit:disabled {{ color: {muted}; background: {panel}; }}
         QPlainTextEdit {{ selection-background-color: #5B6CFF; }}
         QPushButton {{ background: {input_bg}; border: 1px solid {border}; border-radius: 8px; padding: 7px 12px; }}
         QPushButton:hover {{ border-color: #7A86FF; }}
