@@ -911,7 +911,7 @@ class ClipPanel(QWidget):
         self._selection_hidden_at: float | None = None
         self._selection_memory_timer = QTimer(self)
         self._selection_memory_timer.setSingleShot(True)
-        self._selection_memory_timer.timeout.connect(self._clear_selection_memory)
+        self._selection_memory_timer.timeout.connect(self._expire_selection_memory)
         self._filter_buttons: list[tuple[QToolButton, ClipKind | None]] = []
         self._filter_index = 0
         self.setObjectName("panelWindow")
@@ -1209,6 +1209,11 @@ class ClipPanel(QWidget):
         self._remembered_item_ids = ()
         self._remembered_current_id = None
         self._selection_hidden_at = None
+
+    def _expire_selection_memory(self) -> None:
+        self._clear_selection_memory()
+        if not self.isVisible():
+            self._select_for_show()
 
     def apply_theme(self) -> None:
         dark = self._settings().theme == "dark" or (

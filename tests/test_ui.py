@@ -231,10 +231,30 @@ def test_hidden_selection_memory_is_actively_cleared_when_timer_expires(qtbot) -
     panel.hide()
     assert panel._remembered_item_ids == ("second",)
     qtbot.waitUntil(lambda: panel._remembered_item_ids == (), timeout=1_500)
+    assert panel.list.currentIndex().row() == 0
     panel.show_panel()
 
     assert panel.list.currentIndex().row() == 0
     assert {item.id for item in panel._selected_items()} == {"first"}
+
+
+def test_selection_expiry_does_not_reset_a_panel_reopened_within_the_limit(qtbot) -> None:
+    settings = AppSettings(remember_selection=True, selection_memory_seconds=1)
+    panel = ClipPanel(lambda: settings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("first", "first", 2), clip("second", "second", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    panel.list.setCurrentIndex(panel.model.index(1))
+    panel.hide()
+
+    qtbot.wait(400)
+    panel.show_panel()
+    assert panel.list.currentIndex().row() == 1
+    qtbot.waitUntil(lambda: panel._remembered_item_ids == (), timeout=1_000)
+
+    assert panel.isVisible()
+    assert panel.list.currentIndex().row() == 1
 
 
 def test_macos_accessibility_prompt_only_when_not_granted(qtbot, monkeypatch) -> None:
