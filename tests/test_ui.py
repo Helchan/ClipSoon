@@ -186,12 +186,22 @@ def test_text_file_uses_bounded_read_only_preview(qtbot, tmp_path: Path) -> None
     preview = panel.file_text_preview.toPlainText()
     assert panel.preview_stack.currentWidget() is panel.file_text_preview
     assert preview.startswith("# ClipSoon\n\n预览内容")
-    assert preview.endswith("\n…")
-    assert len(preview) <= 2_050
+    assert preview.endswith("\n...")
+    assert len(preview) <= 224
     assert panel.file_text_preview.isReadOnly()
     assert panel.file_text_preview.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     assert panel.info_type_value.text() == "文件"
     assert panel.info_detail_value.text() == str(path)
+
+    class WheelEvent:
+        accepted = False
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    wheel = WheelEvent()
+    panel.file_text_preview.wheelEvent(wheel)
+    assert wheel.accepted
 
 
 def test_binary_file_keeps_file_icon_preview(qtbot, tmp_path: Path) -> None:

@@ -134,8 +134,8 @@ _TEXT_FILE_SUFFIXES = {
     ".yml",
 }
 _TEXT_FILE_NAMES = {"dockerfile", "license", "makefile", "readme"}
-_TEXT_FILE_PREVIEW_BYTES = 64 * 1024
-_TEXT_FILE_PREVIEW_CHARS = 2_048
+_TEXT_FILE_PREVIEW_BYTES = 4 * 1024
+_TEXT_FILE_PREVIEW_CHARS = 220
 
 
 class ClipListModel(QAbstractListModel):
@@ -376,6 +376,13 @@ class ImagePreview(QLabel):
             self.setText("无法预览图片")
             return
         self.setPixmap(QPixmap.fromImage(image))
+
+
+class TextFilePreview(QPlainTextEdit):
+    """A fixed, non-scrollable excerpt rather than a miniature file viewer."""
+
+    def wheelEvent(self, event) -> None:
+        event.accept()
 
 
 class SettingsDialog(QDialog):
@@ -657,7 +664,7 @@ class ClipPanel(QWidget):
         self.image_preview = ImagePreview()
         self.file_preview = QLabel()
         self.file_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.file_text_preview = QPlainTextEdit()
+        self.file_text_preview = TextFilePreview()
         self.file_text_preview.setReadOnly(True)
         self.file_text_preview.setFrameShape(QFrame.Shape.NoFrame)
         self.file_text_preview.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1063,7 +1070,7 @@ def _read_text_file_preview(files: Sequence[str]) -> str | None:
     if len(text) > _TEXT_FILE_PREVIEW_CHARS:
         text = text[:_TEXT_FILE_PREVIEW_CHARS]
         truncated = True
-    return text + ("\n…" if truncated else "")
+    return text + ("\n..." if truncated else "")
 
 
 def _compact_menu(menu: QMenu) -> None:
