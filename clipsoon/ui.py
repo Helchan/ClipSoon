@@ -896,7 +896,7 @@ class ClipPanel(QWidget):
         self,
         settings: Callable[[], AppSettings],
         *,
-        selection_clock: Callable[[], float] = time.time,
+        selection_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
         self._settings = settings
@@ -909,6 +909,9 @@ class ClipPanel(QWidget):
         self._remembered_item_ids: tuple[str, ...] = ()
         self._remembered_current_id: str | None = None
         self._selection_hidden_at: float | None = None
+        self._selection_memory_timer = QTimer(self)
+        self._selection_memory_timer.setSingleShot(True)
+        self._selection_memory_timer.timeout.connect(self._clear_selection_memory)
         self._filter_buttons: list[tuple[QToolButton, ClipKind | None]] = []
         self._filter_index = 0
         self.setObjectName("panelWindow")
@@ -1188,6 +1191,7 @@ class ClipPanel(QWidget):
         return False
 
     def _capture_selection_memory(self) -> None:
+        settings = self._settings()
         rows = sorted(index.row() for index in self.list.selectionModel().selectedRows())
         self._remembered_item_ids = tuple(
             item.id for row in rows if (item := self.model.item_at(row)) is not None
@@ -1195,8 +1199,13 @@ class ClipPanel(QWidget):
         current = self.model.item_at(self.list.currentIndex().row())
         self._remembered_current_id = current.id if current is not None else None
         self._selection_hidden_at = self._selection_clock() if self._remembered_item_ids else None
+        if self._selection_hidden_at is not None:
+            self._selection_memory_timer.start(settings.selection_memory_seconds * 1_000)
+        else:
+            self._selection_memory_timer.stop()
 
     def _clear_selection_memory(self) -> None:
+        self._selection_memory_timer.stop()
         self._remembered_item_ids = ()
         self._remembered_current_id = None
         self._selection_hidden_at = None
