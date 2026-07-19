@@ -21,8 +21,9 @@ def test_tag_release_workflow_builds_requested_platforms() -> None:
     assert 'tags:\n      - "v*"' in workflow
     assert "runs-on: windows-latest" in workflow
     assert "architecture: x64" in workflow
-    assert "runs-on: macos-14" in workflow
+    assert "runs-on: macos-15" in workflow
     assert "architecture: arm64" in workflow
+    assert 'MACOSX_DEPLOYMENT_TARGET: "13.0"' in workflow
     assert "ClipSoon-${{ github.ref_name }}-windows-x64.zip" in workflow
     assert "ClipSoon-${{ github.ref_name }}-macOS-arm64.zip" in workflow
     assert "contents: write" in workflow
