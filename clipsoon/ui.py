@@ -627,11 +627,15 @@ class SettingsDialog(QDialog):
         data_row = QHBoxLayout()
         data_row.setSpacing(8)
         clear = QPushButton("清除未置顶历史")
-        reveal = QPushButton("打开数据目录")
+        reveal_text = {
+            "darwin": "在 Finder 中打开",
+            "win32": "在资源管理器中打开",
+        }.get(sys.platform, "打开数据目录")
+        self.reveal_button = QPushButton(reveal_text)
         clear.clicked.connect(self._confirm_clear)
-        reveal.clicked.connect(self.reveal_requested)
+        self.reveal_button.clicked.connect(self._request_reveal)
         data_row.addWidget(clear)
-        data_row.addWidget(reveal)
+        data_row.addWidget(self.reveal_button)
         data_row.addStretch()
         data_layout.addLayout(data_row)
         layout.addWidget(data_section)
@@ -676,6 +680,13 @@ class SettingsDialog(QDialog):
         answer = QMessageBox.question(self, "清除历史", "清除所有未置顶的历史？此操作无法撤销。")
         if answer == QMessageBox.StandardButton.Yes:
             self.clear_requested.emit()
+
+    def _request_reveal(self) -> None:
+        # A modal settings window owned by the floating panel can otherwise
+        # remain above Finder/Explorer and make a successful open look broken.
+        self.setVisible(False)
+        self.reject()
+        self.reveal_requested.emit()
 
 
 class ClipPanel(QWidget):

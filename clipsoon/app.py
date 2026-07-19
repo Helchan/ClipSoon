@@ -116,7 +116,7 @@ class ClipSoonApplication(QObject):
             accessibility_granted=PlatformBridge.accessibility_permission_status(),
         )
         dialog.clear_requested.connect(self.clear_history)
-        dialog.reveal_requested.connect(lambda: PlatformBridge.reveal(self.data_dir))
+        dialog.reveal_requested.connect(self.open_data_directory)
         dialog.accessibility_requested.connect(self.open_accessibility_settings)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         if accepted:
@@ -130,6 +130,10 @@ class ClipSoonApplication(QObject):
             self.repository.cleanup(new.max_history_items, new.retention_days)
             self._reload_history()
         self.panel.keep_open(False)
+
+    def open_data_directory(self) -> None:
+        if not PlatformBridge.reveal(self.data_dir):
+            self.panel.set_status("无法打开数据目录")
 
     def clear_history(self) -> None:
         removed = self.repository.clear_unpinned()

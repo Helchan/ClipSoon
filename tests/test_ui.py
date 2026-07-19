@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QKeySequence
-from PySide6.QtWidgets import QFrame, QMenu, QStyleOptionViewItem
+from PySide6.QtWidgets import QDialog, QFrame, QMenu, QStyleOptionViewItem
 
 import clipsoon.ui as ui_module
 from clipsoon import __version__
@@ -108,6 +108,21 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
         dialog.theme,
     ]
     assert len({control.width() for control in controls}) == 1
+
+
+def test_open_data_directory_closes_settings_before_emitting(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "darwin")
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    revealed: list[bool] = []
+    dialog.reveal_requested.connect(lambda: revealed.append(dialog.isVisible()))
+    dialog.show()
+
+    qtbot.mouseClick(dialog.reveal_button, Qt.MouseButton.LeftButton)
+
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert revealed == [False]
+    assert dialog.reveal_button.text() == "在 Finder 中打开"
 
 
 def test_panel_footer_places_version_after_hide_hint(qtbot) -> None:
