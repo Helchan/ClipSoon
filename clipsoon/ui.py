@@ -6,6 +6,7 @@ import locale
 import logging
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -141,6 +142,11 @@ _TEXT_FILE_NAMES = {"dockerfile", "license", "makefile", "readme"}
 _TEXT_FILE_PREVIEW_BYTES = 4 * 1024
 _TEXT_FILE_PREVIEW_CHARS = 220
 _STATUS_TIMEOUT_MS = 4_000
+_THUMBNAIL_CACHE_BYTES = 32 * 1024 * 1024
+_DETAIL_CACHE_BYTES = 64 * 1024 * 1024
+_DETAIL_CACHE_ENTRIES = 12
+_PREVIEW_SIZE_BUCKET = 64
+_FILE_REVISION_TTL_SECONDS = 1.0
 
 
 class ClipListModel(QAbstractListModel):
@@ -219,7 +225,55 @@ class ClipListView(QListView):
         self.hover_index_changed.emit(QModelIndex())
 
 
-ImageLoadKey = tuple[str, int, int, bool]
+ImageLoadKey = tuple[str, int, int, int, int, bool]
+
+
+class _ByteLruCache[CacheKey, CacheValue]:
+    """A small exact-cost LRU with both byte and entry limits."""
+
+    def __init__(self, max_bytes: int, max_entries: int) -> None:
+        self.max_bytes = max(0, max_bytes)
+        self.max_entries = max(0, max_entries)
+        self._entries: OrderedDict[CacheKey, tuple[CacheValue, int]] = OrderedDict()
+        self.total_bytes = 0
+
+    def get(self, key: CacheKey) -> CacheValue | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        self._entries.move_to_end(key)
+        return entry[0]
+
+    def put(self, key: CacheKey, value: CacheValue, cost: int) -> bool:
+        self.remove(key)
+        if not self.max_entries or not self.max_bytes:
+            return False
+        normalized_cost = max(1, cost)
+        if normalized_cost > self.max_bytes:
+            return False
+        self._entries[key] = (value, normalized_cost)
+        self.total_bytes += normalized_cost
+        while len(self._entries) > self.max_entries or self.total_bytes > self.max_bytes:
+            _old_key, (_old_value, old_cost) = self._entries.popitem(last=False)
+            self.total_bytes -= old_cost
+        return key in self._entries
+
+    def remove(self, key: CacheKey) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self.total_bytes -= entry[1]
+
+    def remove_paths(self, paths: set[str]) -> None:
+        for key in tuple(self._entries):
+            if isinstance(key, tuple) and key and key[0] in paths:
+                self.remove(key)
+
+    @property
+    def keys(self) -> tuple[CacheKey, ...]:
+        return tuple(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 class _ImageLoadSignals(QObject):
@@ -233,48 +287,134 @@ class _ImageLoadTask(QRunnable):
         self.signals = _ImageLoadSignals()
 
     def run(self) -> None:
-        path, width, height, keep_aspect = self.key
+        path, _modified_ns, _file_size, width, height, keep_aspect = self.key
         image = _read_scaled_image(path, QSize(width, height), keep_aspect)
         self.signals.finished.emit(self.key, image)
 
 
 class _ScaledImageLoader(QObject):
-    image_ready = Signal(object)
+    image_ready = Signal(object, object)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        max_cache_bytes: int,
+        max_cache_entries: int,
+        priority: int = 0,
+    ) -> None:
         super().__init__(parent)
-        self._cache: dict[ImageLoadKey, QImage] = {}
+        self._cache = _ByteLruCache[ImageLoadKey, QImage](max_cache_bytes, max_cache_entries)
         self._tasks: dict[ImageLoadKey, _ImageLoadTask] = {}
+        self._discarded_tasks: set[ImageLoadKey] = set()
+        self._blocked_paths: set[str] = set()
+        self._revisions: dict[str, tuple[float, int, int]] = {}
+        self._priority = priority
 
-    @staticmethod
-    def key(path: str, size: QSize, keep_aspect: bool) -> ImageLoadKey:
-        return path, max(1, size.width()), max(1, size.height()), keep_aspect
+    def key(self, path: str, size: QSize, keep_aspect: bool) -> ImageLoadKey:
+        modified_ns, file_size = self._revision(path)
+        return (
+            path,
+            modified_ns,
+            file_size,
+            max(1, size.width()),
+            max(1, size.height()),
+            keep_aspect,
+        )
 
     def request(self, path: str, size: QSize, *, keep_aspect: bool) -> QImage | None:
+        self._blocked_paths.discard(path)
         key = self.key(path, size, keep_aspect)
-        if key in self._cache:
-            return self._cache[key]
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
         if key not in self._tasks:
             task = _ImageLoadTask(key)
             task.signals.finished.connect(self._complete)
             self._tasks[key] = task
-            QThreadPool.globalInstance().start(task)
+            QThreadPool.globalInstance().start(task, self._priority)
         return None
 
     def _complete(self, key: ImageLoadKey, image: QImage) -> None:
         self._tasks.pop(key, None)
-        self._cache[key] = image
-        self.image_ready.emit(key)
+        discarded = key in self._discarded_tasks or key[0] in self._blocked_paths
+        self._discarded_tasks.discard(key)
+        if not discarded:
+            self._cache.put(key, image, _image_cost(image))
+        self.image_ready.emit(key, image if not discarded else QImage())
+
+    def retain_only(self, path: str) -> None:
+        pool = QThreadPool.globalInstance()
+        for key, task in tuple(self._tasks.items()):
+            if key[0] == path:
+                self._discarded_tasks.discard(key)
+                continue
+            if pool.tryTake(task):
+                self._tasks.pop(key, None)
+            else:
+                self._discarded_tasks.add(key)
+
+    def invalidate_paths(self, paths: set[str]) -> None:
+        if not paths:
+            return
+        self._blocked_paths.update(paths)
+        self._cache.remove_paths(paths)
+        for path in paths:
+            self._revisions.pop(path, None)
+        pool = QThreadPool.globalInstance()
+        for key, task in tuple(self._tasks.items()):
+            if key[0] not in paths:
+                continue
+            if pool.tryTake(task):
+                self._tasks.pop(key, None)
+            else:
+                self._discarded_tasks.add(key)
+
+    def _revision(self, path: str) -> tuple[int, int]:
+        now = time.monotonic()
+        cached = self._revisions.get(path)
+        if cached is not None and now - cached[0] < _FILE_REVISION_TTL_SECONDS:
+            return cached[1], cached[2]
+        try:
+            stat = Path(path).stat()
+            revision = stat.st_mtime_ns, stat.st_size
+        except OSError:
+            revision = -1, -1
+        self._revisions[path] = (now, *revision)
+        return revision
+
+    @property
+    def cache_bytes(self) -> int:
+        return self._cache.total_bytes
+
+    @property
+    def cache_count(self) -> int:
+        return len(self._cache)
+
+    @property
+    def cache_keys(self) -> tuple[ImageLoadKey, ...]:
+        return self._cache.keys
 
 
 class ClipDelegate(QStyledItemDelegate):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._thumbnails: dict[ImageLoadKey, QPixmap] = {}
+        self._thumbnails = _ByteLruCache[ImageLoadKey, QPixmap](
+            _THUMBNAIL_CACHE_BYTES,
+            1_500,
+        )
+        self._failed_thumbnails = _ByteLruCache[ImageLoadKey, bool](512, 512)
         self._file_icons: dict[str, QPixmap] = {}
         self._file_icon_provider = QFileIconProvider()
-        self._image_loader = _ScaledImageLoader(self)
+        # Thumbnail QImages are handed off directly and not retained by the
+        # loader, so the final QPixmap is the only cached pixel copy.
+        self._image_loader = _ScaledImageLoader(
+            self,
+            max_cache_bytes=0,
+            max_cache_entries=0,
+        )
         self._image_loader.image_ready.connect(self._image_loaded)
+        self._invalidated_paths: set[str] = set()
         self.hovered_row = -1
         self.dark_theme = False
 
@@ -375,22 +515,48 @@ class ClipDelegate(QStyledItemDelegate):
     def _image_thumbnail(self, path: str, size: QSize) -> QPixmap:
         if not path:
             return QPixmap()
+        self._invalidated_paths.discard(path)
         key = self._image_loader.key(path, size, False)
-        if key not in self._thumbnails:
-            image = self._image_loader.request(path, size, keep_aspect=False)
-            if image is None:
-                return QPixmap()
-            self._thumbnails[key] = QPixmap.fromImage(image).scaled(
+        thumbnail = self._thumbnails.get(key)
+        if thumbnail is not None:
+            return thumbnail
+        if self._failed_thumbnails.get(key):
+            return QPixmap()
+        self._image_loader.request(path, size, keep_aspect=False)
+        return QPixmap()
+
+    def _image_loaded(self, key: ImageLoadKey, image: QImage) -> None:
+        if key[0] not in self._invalidated_paths and not image.isNull():
+            size = QSize(key[3], key[4])
+            thumbnail = QPixmap.fromImage(image).scaled(
                 size,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-        return self._thumbnails[key]
-
-    def _image_loaded(self, _key: ImageLoadKey) -> None:
+            self._thumbnails.put(key, thumbnail, _pixmap_cost(thumbnail))
+        elif key[0] not in self._invalidated_paths:
+            self._failed_thumbnails.put(key, True, 1)
         view = self.parent()
         if isinstance(view, QListView):
             view.viewport().update()
+
+    def invalidate_paths(self, paths: set[str]) -> None:
+        self._invalidated_paths.update(paths)
+        self._thumbnails.remove_paths(paths)
+        self._failed_thumbnails.remove_paths(paths)
+        self._image_loader.invalidate_paths(paths)
+
+    @property
+    def thumbnail_cache_bytes(self) -> int:
+        return self._thumbnails.total_bytes
+
+    @property
+    def thumbnail_cache_count(self) -> int:
+        return len(self._thumbnails)
+
+    @property
+    def thumbnail_cache_keys(self) -> tuple[ImageLoadKey, ...]:
+        return self._thumbnails.keys
 
     def _file_image_thumbnail(self, files: Sequence[str], size: QSize) -> QPixmap:
         path = _single_image_file_path(files)
@@ -414,7 +580,12 @@ class ImagePreview(QLabel):
     def __init__(self) -> None:
         super().__init__()
         self._path = ""
-        self._image_loader = _ScaledImageLoader(self)
+        self._image_loader = _ScaledImageLoader(
+            self,
+            max_cache_bytes=_DETAIL_CACHE_BYTES,
+            max_cache_entries=_DETAIL_CACHE_ENTRIES,
+            priority=1,
+        )
         self._image_loader.image_ready.connect(self._image_loaded)
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -426,6 +597,7 @@ class ImagePreview(QLabel):
     def set_path(self, path: str) -> None:
         self._resize_timer.stop()
         self._path = path
+        self._image_loader.retain_only(path)
         self.clear()
         if not path:
             self.setText("图片预览")
@@ -442,17 +614,30 @@ class ImagePreview(QLabel):
         if not self._path or self.width() < 20 or self.height() < 20:
             return
         bounds = QSize(max(1, self.width() - 20), max(1, self.height() - 20))
-        image = self._image_loader.request(self._path, bounds, keep_aspect=True)
+        decode_bounds = _bucketed_size(bounds)
+        image = self._image_loader.request(self._path, decode_bounds, keep_aspect=True)
         if image is None:
             return
         if image.isNull():
             self.setText("无法预览图片")
             return
-        self.setPixmap(QPixmap.fromImage(image))
+        self.setPixmap(
+            QPixmap.fromImage(image).scaled(
+                bounds,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
-    def _image_loaded(self, key: ImageLoadKey) -> None:
+    def _image_loaded(self, key: ImageLoadKey, image: QImage) -> None:
         if key[0] == self._path:
-            self._render()
+            if image.isNull():
+                self.setText("无法预览图片")
+            else:
+                self._render()
+
+    def invalidate_paths(self, paths: set[str]) -> None:
+        self._image_loader.invalidate_paths(paths)
 
 
 class TextFilePreview(QPlainTextEdit):
@@ -858,7 +1043,7 @@ class ClipPanel(QWidget):
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
         self._status_timer.timeout.connect(self.clear_status)
-        hints = QLabel(f"↑↓ 选择    ↵ 发送    Esc 隐藏    ClipSoon v{__version__}")
+        hints = QLabel(f"↑↓ 选择  |  ↵ 发送  |  Esc 隐藏  |  v{__version__}")
         hints.setObjectName("muted")
         self.version_label = hints
         footer.addWidget(self.status)
@@ -870,7 +1055,14 @@ class ClipPanel(QWidget):
         self.list.installEventFilter(self)
 
     def set_items(self, items: Sequence[ClipItem]) -> None:
-        self._items = list(items)
+        new_items = list(items)
+        removed_image_paths = _item_image_paths(self._items) - _item_image_paths(new_items)
+        if removed_image_paths:
+            delegate = self.list.itemDelegate()
+            if isinstance(delegate, ClipDelegate):
+                delegate.invalidate_paths(removed_image_paths)
+            self.image_preview.invalidate_paths(removed_image_paths)
+        self._items = new_items
         self._engine.replace(self._items)
         self._refresh_results()
 
@@ -1200,6 +1392,31 @@ def _read_scaled_image(path: str, bounds: QSize, keep_aspect: bool) -> QImage:
             scaled_size.scale(bounds, Qt.AspectRatioMode.KeepAspectRatio)
     reader.setScaledSize(scaled_size)
     return reader.read()
+
+
+def _image_cost(image: QImage) -> int:
+    return max(1, image.sizeInBytes())
+
+
+def _pixmap_cost(pixmap: QPixmap) -> int:
+    return max(1, pixmap.width() * pixmap.height() * max(1, pixmap.depth()) // 8)
+
+
+def _bucketed_size(size: QSize, bucket: int = _PREVIEW_SIZE_BUCKET) -> QSize:
+    def rounded(value: int) -> int:
+        return max(bucket, ((max(1, value) + bucket - 1) // bucket) * bucket)
+
+    return QSize(rounded(size.width()), rounded(size.height()))
+
+
+def _item_image_paths(items: Sequence[ClipItem]) -> set[str]:
+    paths: set[str] = set()
+    for item in items:
+        if item.kind is ClipKind.IMAGE and item.image_path:
+            paths.add(item.image_path)
+        elif item.kind is ClipKind.FILES and (image_path := _single_image_file_path(item.files)):
+            paths.add(image_path)
+    return paths
 
 
 def _read_text_file_preview(files: Sequence[str]) -> str | None:

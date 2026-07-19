@@ -14,12 +14,16 @@ from clipsoon.core import AppSettings, ClipItem, ClipKind
 from clipsoon.ui import (
     ClipDelegate,
     ClipPanel,
+    ImagePreview,
     SearchIcon,
     SettingsDialog,
+    _bucketed_size,
+    _ByteLruCache,
     _compact_menu,
     _hotkey_display,
     _hover_color,
     _parse_hotkey,
+    _ScaledImageLoader,
 )
 
 
@@ -129,7 +133,7 @@ def test_panel_footer_places_version_after_hide_hint(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
 
-    assert panel.version_label.text().endswith(f"Esc 隐藏    ClipSoon v{__version__}")
+    assert panel.version_label.text() == f"↑↓ 选择  |  ↵ 发送  |  Esc 隐藏  |  v{__version__}"
 
 
 def test_macos_accessibility_prompt_only_when_not_granted(qtbot, monkeypatch) -> None:
@@ -192,7 +196,130 @@ def test_copied_image_file_uses_image_thumbnail(qtbot, tmp_path: Path) -> None:
     )
     thumbnail = delegate._file_image_thumbnail((str(path),), image.size())
     assert thumbnail.toImage().pixelColor(0, 0) == QColor("#e23b4f")
+    assert delegate._image_loader.cache_count == 0
+    assert delegate.thumbnail_cache_bytes <= ui_module._THUMBNAIL_CACHE_BYTES
     assert delegate._file_image_thumbnail((str(path), str(path)), image.size()).isNull()
+
+
+def test_byte_lru_cache_enforces_cost_entry_limit_and_recency() -> None:
+    cache = _ByteLruCache[str, bytes](max_bytes=10, max_entries=2)
+    assert cache.put("first", b"1", 4)
+    assert cache.put("second", b"2", 4)
+    assert cache.get("first") == b"1"
+    assert cache.put("third", b"3", 4)
+
+    assert cache.keys == ("first", "third")
+    assert cache.total_bytes == 8
+    assert not cache.put("oversized", b"x", 11)
+    assert cache.keys == ("first", "third")
+
+
+def test_scaled_image_cache_is_byte_bounded_lru_and_revision_aware(
+    tmp_path: Path, monkeypatch
+) -> None:
+    loader = _ScaledImageLoader(max_cache_bytes=80_000, max_cache_entries=2)
+    paths = [tmp_path / f"image-{index}.png" for index in range(4)]
+    for index, path in enumerate(paths):
+        path.write_bytes(bytes(index + 1))
+
+    image = QImage(100, 100, QImage.Format.Format_RGB32)
+    keys = [loader.key(str(path), QSize(100, 100), True) for path in paths]
+    loader._complete(keys[0], image)
+    loader._complete(keys[1], image)
+    assert loader.request(str(paths[0]), QSize(100, 100), keep_aspect=True) is not None
+    loader._complete(keys[2], image)
+
+    assert loader.cache_bytes <= 80_000
+    assert loader.cache_count == 2
+    assert keys[0] in loader.cache_keys
+    assert keys[1] not in loader.cache_keys
+    assert keys[2] in loader.cache_keys
+
+    oversized = QImage(150, 150, QImage.Format.Format_RGB32)
+    loader._complete(keys[3], oversized)
+    assert loader.cache_bytes <= 80_000
+    assert keys[3] not in loader.cache_keys
+
+    monkeypatch.setattr(ui_module, "_FILE_REVISION_TTL_SECONDS", 0.0)
+    before = loader.key(str(paths[0]), QSize(100, 100), True)
+    paths[0].write_bytes(b"changed size")
+    after = loader.key(str(paths[0]), QSize(100, 100), True)
+    assert before != after
+
+
+def test_preview_size_is_bucketed_to_avoid_resize_cache_churn() -> None:
+    assert _bucketed_size(QSize(301, 449)) == QSize(320, 512)
+    assert _bucketed_size(QSize(319, 500)) == QSize(320, 512)
+
+
+def test_history_removal_invalidates_thumbnail_cache(qtbot, tmp_path: Path) -> None:
+    path = tmp_path / "history-image.png"
+    image = QImage(20, 20, QImage.Format.Format_RGB32)
+    image.fill(QColor("#6677ff"))
+    assert image.save(str(path), "PNG")
+    item = ClipItem("image", ClipKind.FILES, "image", 1, 1, files=(str(path),))
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([item])
+    delegate = panel.list.itemDelegate()
+    assert isinstance(delegate, ClipDelegate)
+    assert delegate._file_image_thumbnail(item.files, QSize(72, 72)).isNull()
+    qtbot.waitUntil(lambda: delegate.thumbnail_cache_count == 1, timeout=1_000)
+
+    panel.set_items([])
+
+    assert delegate.thumbnail_cache_count == 0
+    assert panel.image_preview._image_loader.cache_count == 0
+
+
+def test_failed_thumbnail_decode_is_negatively_cached(qtbot, tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "broken.jpg"
+    path.write_bytes(b"not an image")
+    attempts: list[str] = []
+
+    def failed_decode(path: str, bounds: QSize, keep_aspect: bool) -> QImage:
+        del bounds, keep_aspect
+        attempts.append(path)
+        return QImage()
+
+    monkeypatch.setattr(ui_module, "_read_scaled_image", failed_decode)
+    delegate = ClipDelegate()
+    assert delegate._file_image_thumbnail((str(path),), QSize(72, 72)).isNull()
+    qtbot.waitUntil(lambda: len(delegate._failed_thumbnails) == 1, timeout=1_000)
+
+    for _index in range(5):
+        assert delegate._file_image_thumbnail((str(path),), QSize(72, 72)).isNull()
+    qtbot.wait(20)
+
+    assert attempts == [str(path)]
+
+
+def test_outdated_detail_tasks_do_not_fill_cache(qtbot, tmp_path: Path, monkeypatch) -> None:
+    paths = [tmp_path / "old.jpg", tmp_path / "current.jpg"]
+    for path in paths:
+        path.write_bytes(b"placeholder")
+
+    def slow_decode(path: str, bounds: QSize, keep_aspect: bool) -> QImage:
+        del path, keep_aspect
+        time.sleep(0.05)
+        result = QImage(bounds, QImage.Format.Format_RGB32)
+        result.fill(QColor("#536cff"))
+        return result
+
+    monkeypatch.setattr(ui_module, "_read_scaled_image", slow_decode)
+    preview = ImagePreview()
+    preview.resize(360, 320)
+    qtbot.addWidget(preview)
+    preview.show()
+    preview.set_path(str(paths[0]))
+    preview.set_path(str(paths[1]))
+
+    qtbot.waitUntil(
+        lambda: preview.pixmap() is not None and not preview.pixmap().isNull(),
+        timeout=1_000,
+    )
+    assert preview._image_loader.cache_count <= 1
+    assert all(key[0] == str(paths[1]) for key in preview._image_loader.cache_keys)
 
 
 def test_copied_image_file_uses_detail_image_preview(qtbot, tmp_path: Path) -> None:
