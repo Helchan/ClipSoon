@@ -1075,7 +1075,7 @@ def _read_text_file_preview(files: Sequence[str]) -> str | None:
 
 def _compact_menu(menu: QMenu) -> None:
     dark = menu.palette().color(QPalette.ColorRole.Window).lightness() < 128
-    hover_background = "rgba(255,255,255,28)" if dark else "#E7EAF1"
+    hover_background = "rgba(255,255,255,88)" if dark else "#CBD2E3"
     menu.setStyleSheet(
         "QMenu { padding: 2px; }"
         "QMenu::item { padding: 5px 7px; border-radius: 4px; }"

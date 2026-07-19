@@ -279,7 +279,7 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     expected = max(68, menu.fontMetrics().horizontalAdvance("删除所选") + 18)
     assert menu.width() == expected
     assert "QMenu::item:selected" in menu.styleSheet()
-    assert "background: #E7EAF1" in menu.styleSheet()
+    assert "background: #CBD2E3" in menu.styleSheet()
 
     menu.show()
     qtbot.waitExposed(menu)
@@ -290,7 +290,7 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     rendered = menu.grab().toImage()
     background_sample = QPoint(action_rect.right() - 4, action_rect.center().y())
     assert menu.activeAction() is delete_action
-    assert rendered.pixelColor(background_sample) == QColor("#E7EAF1")
+    assert rendered.pixelColor(background_sample) == QColor("#CBD2E3")
 
 
 def test_filter_and_list_background_align_with_bordered_search(qtbot) -> None:
