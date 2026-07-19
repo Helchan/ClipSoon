@@ -7,6 +7,13 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Create .venv with Python 3.12 and install '.[package]' first."
   exit 1
 fi
+APP_VERSION="${CLIPSOON_VERSION:-$("${PYTHON_BIN}" -c 'import clipsoon; print(clipsoon.__version__)')}"
+APP_VERSION="${APP_VERSION#v}"
+BUILD_VERSION="${GITHUB_RUN_NUMBER:-1}"
+if [[ ! "${APP_VERSION}" =~ '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$' ]]; then
+  echo "Invalid ClipSoon version: ${APP_VERSION}"
+  exit 1
+fi
 cd "${PROJECT_DIR}"
 "${PYTHON_BIN}" -m PyInstaller \
   --noconfirm \
@@ -19,9 +26,9 @@ cd "${PROJECT_DIR}"
   --hidden-import AppKit \
   --hidden-import ApplicationServices \
   clipsoon/app.py
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 0.1.0" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 1" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist" 2>/dev/null || \
-  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION}" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${BUILD_VERSION}" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist" 2>/dev/null || \
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_VERSION}" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist" 2>/dev/null || \
   /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist"
 codesign --force --deep --sign - "${PROJECT_DIR}/dist/ClipSoon.app"

@@ -78,6 +78,23 @@ QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q
 
 Windows 包需要在 Windows 10 / 11 主机上生成。两个脚本都使用 PyInstaller one-dir，避免 one-file 每次启动时的临时解包开销。macOS 脚本会执行 ad-hoc 签名和严格签名校验；正式对外分发仍需要 Developer ID 签名与公证。
 
+## 自动发布
+
+推送 `v*` 版本标签后，[GitHub Actions](.github/workflows/release.yml) 会自动构建并发布：
+
+- Windows x64：`ClipSoon-vX.Y.Z-windows-x64.zip`。
+- macOS Apple Silicon / M1：`ClipSoon-vX.Y.Z-macOS-arm64.zip`。
+- 两个包的 SHA-256 校验文件：`SHA256SUMS.txt`。
+
+发布前先将 `pyproject.toml` 和 `clipsoon/__init__.py` 中的版本保持一致，提交并推送到 `main`，然后执行：
+
+```bash
+git tag v0.9.0
+git push origin v0.9.0
+```
+
+Release 会使用标签名生成说明并附加两个平台包。macOS 产物当前为 ad-hoc 签名，未使用 Developer ID 且未执行 Apple 公证。
+
 ## 项目结构
 
 ```text

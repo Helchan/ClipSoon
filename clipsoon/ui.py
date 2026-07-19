@@ -69,6 +69,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from clipsoon import __version__
 from clipsoon.core import AppSettings, ClipItem, ClipKind, format_bytes
 from clipsoon.search import SearchEngine
 
@@ -446,7 +447,13 @@ class SettingsDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self._validate_accept)
-        layout.addWidget(buttons)
+        footer = QHBoxLayout()
+        self.version_label = QLabel(f"ClipSoon v{__version__}")
+        self.version_label.setObjectName("muted")
+        footer.addWidget(self.version_label)
+        footer.addStretch()
+        footer.addWidget(buttons)
+        layout.addLayout(footer)
 
     def values(self) -> dict[str, object]:
         selected = self._HOTKEYS[self.hotkey_mode.currentText()]

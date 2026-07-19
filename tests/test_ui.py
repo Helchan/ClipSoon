@@ -8,6 +8,7 @@ from PySide6.QtGui import QColor, QImage, QKeySequence
 from PySide6.QtWidgets import QFrame, QMenu, QStyleOptionViewItem
 
 import clipsoon.ui as ui_module
+from clipsoon import __version__
 from clipsoon.core import AppSettings, ClipItem, ClipKind
 from clipsoon.ui import (
     ClipDelegate,
@@ -51,6 +52,7 @@ def test_settings_and_custom_hotkey_validation(qtbot) -> None:
         "Meta+Shift+V" if sys.platform == "darwin" else "Ctrl+Shift+V"
     )
     assert _parse_hotkey("V") == ""
+    assert dialog.version_label.text() == f"ClipSoon v{__version__}"
     dialog.hotkey_mode.setCurrentText("双击 Shift")
     assert dialog.values()["hotkey"] == "double:shift"
 
