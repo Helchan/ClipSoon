@@ -260,7 +260,7 @@ class ClipDelegate(QStyledItemDelegate):
                 return
             pixmap = self._file_thumbnail(item.files[0])
             if not pixmap.isNull():
-                target = QRect(rect.left() + 9, rect.top() + 9, 36, 36)
+                target = self._centered_file_icon_rect(rect)
                 painter.drawPixmap(target, pixmap, pixmap.rect())
                 return
         color = QColor("#FFFFFF") if selected else QColor("#5664E8")
@@ -270,6 +270,11 @@ class ClipDelegate(QStyledItemDelegate):
         font.setWeight(QFont.Weight.Bold)
         painter.setFont(font)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "T" if item.kind is ClipKind.TEXT else "F")
+
+    @staticmethod
+    def _centered_file_icon_rect(container: QRect) -> QRect:
+        inset = 3
+        return container.adjusted(inset, inset, -inset, -inset)
 
     def _image_thumbnail(self, path: str, size: QSize) -> QPixmap:
         if path not in self._thumbnails:

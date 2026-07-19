@@ -141,6 +141,15 @@ def test_list_item_content_has_equal_top_and_bottom_padding() -> None:
     assert content.top() - row.top() == row.bottom() - content.bottom()
 
 
+def test_file_icon_is_centered_inside_thumbnail() -> None:
+    thumbnail = QRect(12, 8, 36, 36)
+    icon = ClipDelegate._centered_file_icon_rect(thumbnail)
+
+    assert icon.left() - thumbnail.left() == thumbnail.right() - icon.right()
+    assert icon.top() - thumbnail.top() == thumbnail.bottom() - icon.bottom()
+    assert thumbnail.contains(icon)
+
+
 def test_filter_tabs_cycle_forward_and_backward(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
