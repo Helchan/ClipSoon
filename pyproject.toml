@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clipsoon"
-version = "0.9.3"
+version = "0.9.4"
 description = "A fast, private, Spotlight-style clipboard history for macOS and Windows"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

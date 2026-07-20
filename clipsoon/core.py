@@ -151,6 +151,9 @@ class AppSettings:
     capture_enabled: bool = True
     remember_selection: bool = False
     selection_memory_seconds: int = 3
+    launch_at_login: bool = False
+    panel_x: int | None = None
+    panel_y: int | None = None
     theme: str = "system"
 
     def validated(self) -> AppSettings:
@@ -165,6 +168,9 @@ class AppSettings:
             capture_enabled=bool(self.capture_enabled),
             remember_selection=bool(self.remember_selection),
             selection_memory_seconds=_clamp(self.selection_memory_seconds, 1, 300),
+            launch_at_login=bool(self.launch_at_login),
+            panel_x=_optional_coordinate(self.panel_x),
+            panel_y=_optional_coordinate(self.panel_y),
             theme=self.theme if self.theme in {"system", "light", "dark"} else "system",
         )
 
@@ -233,6 +239,15 @@ def _clamp(value: Any, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         return minimum
     return min(maximum, max(minimum, parsed))
+
+
+def _optional_coordinate(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return _clamp(int(value), -100_000, 100_000)
+    except (TypeError, ValueError):
+        return None
 
 
 # Persistence ---------------------------------------------------------------

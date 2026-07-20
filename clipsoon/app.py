@@ -19,6 +19,7 @@ from clipsoon.system import (
     ClipboardController,
     ForegroundTargetHandle,
     GlobalHotkeyService,
+    LaunchAtLoginManager,
     PlatformBridge,
     PynputPasteAdapter,
     SelectionSender,
@@ -39,6 +40,7 @@ class ClipSoonApplication(QObject):
         self.qt_app, self.data_dir = qt_app, data_dir
         self.settings = ObservableSettings(JsonSettingsStore(data_dir / "settings.json"))
         self.repository = HistoryRepository(data_dir)
+        self.launch_at_login = LaunchAtLoginManager()
         self.signals = _Signals()
         self.target: ForegroundTargetHandle | None = None
 
@@ -70,6 +72,10 @@ class ClipSoonApplication(QObject):
         # Permission failures can be emitted synchronously, so the tray must
         # already be visible for the first-launch warning to reach the user.
         self.hotkey.start(self.settings.value)
+        if self.settings.value.launch_at_login:
+            success, message = self.launch_at_login.set_enabled(True)
+            if not success:
+                self._notify_error(message)
         LOGGER.info("ClipSoon %s ready with %d items", __version__, len(self.repository.list_items()))
 
     def _connect(self) -> None:
@@ -82,6 +88,7 @@ class ClipSoonApplication(QObject):
         self.panel.delete_requested.connect(self._delete_many)
         self.panel.clear_requested.connect(self.clear_all_history)
         self.panel.accessibility_requested.connect(self.open_accessibility_settings)
+        self.panel.position_changed.connect(self._save_panel_position)
         self.sender.finished.connect(self._send_finished)
         self.tray_actions["show"].triggered.connect(self.show_panel)
         self.tray_actions["pause"].toggled.connect(self._toggle_capture)
@@ -121,7 +128,14 @@ class ClipSoonApplication(QObject):
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         if accepted:
             old = self.settings.value
-            new = self.settings.update(**dialog.values())
+            values = dialog.values()
+            requested_launch_at_login = bool(values["launch_at_login"])
+            launch_message = ""
+            if requested_launch_at_login or requested_launch_at_login != old.launch_at_login:
+                success, launch_message = self.launch_at_login.set_enabled(requested_launch_at_login)
+                if not success:
+                    values["launch_at_login"] = old.launch_at_login
+            new = self.settings.update(**values)
             self.panel.apply_theme()
             if old.hotkey != new.hotkey or old.double_tap_interval_ms != new.double_tap_interval_ms:
                 self.hotkey.start(new)
@@ -129,7 +143,14 @@ class ClipSoonApplication(QObject):
                 self.clipboard.sync_cursor()
             self.repository.cleanup(new.max_history_items, new.retention_days)
             self._reload_history()
+            if launch_message:
+                self.panel.set_status(launch_message)
         self.panel.keep_open(False)
+
+    def _save_panel_position(self, x: int, y: int) -> None:
+        if self.settings.value.panel_x == x and self.settings.value.panel_y == y:
+            return
+        self.settings.update(panel_x=x, panel_y=y)
 
     def open_data_directory(self) -> None:
         if not PlatformBridge.reveal(self.data_dir):

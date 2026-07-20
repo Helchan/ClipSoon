@@ -18,6 +18,7 @@ from PySide6.QtCore import (
     QItemSelectionModel,
     QModelIndex,
     QObject,
+    QPoint,
     QRect,
     QRunnable,
     QSize,
@@ -43,6 +44,7 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
     QAbstractSpinBox,
     QApplication,
@@ -677,8 +679,8 @@ class SettingsDialog(QDialog):
         )
         self.setStyleSheet(_style_sheet(dark))
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 16, 22, 16)
-        layout.setSpacing(9)
+        layout.setContentsMargins(22, 10, 22, 10)
+        layout.setSpacing(6)
 
         header = QVBoxLayout()
         header.setSpacing(2)
@@ -694,8 +696,8 @@ class SettingsDialog(QDialog):
             frame = QFrame()
             frame.setObjectName("settingsSection")
             section_layout = QVBoxLayout(frame)
-            section_layout.setContentsMargins(14, 10, 14, 10)
-            section_layout.setSpacing(7)
+            section_layout.setContentsMargins(14, 7, 14, 7)
+            section_layout.setSpacing(5)
             section_title = QLabel(title_text)
             section_title.setObjectName("settingsSectionTitle")
             section_layout.addWidget(section_title)
@@ -705,7 +707,7 @@ class SettingsDialog(QDialog):
             grid = QGridLayout()
             grid.setContentsMargins(0, 0, 0, 0)
             grid.setHorizontalSpacing(14)
-            grid.setVerticalSpacing(6)
+            grid.setVerticalSpacing(4)
             grid.setColumnMinimumWidth(0, 104)
             grid.setColumnStretch(1, 1)
             return grid
@@ -781,6 +783,8 @@ class SettingsDialog(QDialog):
         self.paste.setChecked(settings.paste_after_selection)
         self.hide = QCheckBox("面板失去焦点时自动隐藏")
         self.hide.setChecked(settings.hide_on_deactivate)
+        self.launch_at_login = QCheckBox("开机时自动启动 ClipSoon")
+        self.launch_at_login.setChecked(settings.launch_at_login)
         # Keep the persisted ``remember_selection`` key for upgrade compatibility,
         # while the user-facing feature now restores the complete panel state.
         self.remember_selection = QCheckBox("记住上次状态")
@@ -789,11 +793,12 @@ class SettingsDialog(QDialog):
         behavior_options = QGridLayout()
         behavior_options.setContentsMargins(118, 3, 0, 0)
         behavior_options.setHorizontalSpacing(18)
-        behavior_options.setVerticalSpacing(6)
+        behavior_options.setVerticalSpacing(3)
         behavior_options.addWidget(self.capture, 0, 0)
         behavior_options.addWidget(self.paste, 0, 1)
         behavior_options.addWidget(self.hide, 1, 0)
         behavior_options.addWidget(self.remember_selection, 1, 1)
+        behavior_options.addWidget(self.launch_at_login, 2, 0, 1, 2)
         history_layout.addLayout(behavior_options)
         layout.addWidget(history_section)
 
@@ -871,6 +876,7 @@ class SettingsDialog(QDialog):
             "hide_on_deactivate": self.hide.isChecked(),
             "remember_selection": self.remember_selection.isChecked(),
             "selection_memory_seconds": self.selection_memory.value(),
+            "launch_at_login": self.launch_at_login.isChecked(),
         }
 
     def _validate_accept(self) -> None:
@@ -899,6 +905,7 @@ class ClipPanel(QWidget):
     delete_requested = Signal(object)
     clear_requested = Signal()
     accessibility_requested = Signal()
+    position_changed = Signal(int, int)
 
     def __init__(
         self,
@@ -926,6 +933,8 @@ class ClipPanel(QWidget):
         self._filter_buttons: list[tuple[QToolButton, ClipKind | None]] = []
         self._filter_index = 0
         self._dark_theme = False
+        self._drag_offset: QPoint | None = None
+        self._drag_origin: QPoint | None = None
         self.setObjectName("panelWindow")
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -1122,15 +1131,27 @@ class ClipPanel(QWidget):
 
     def show_panel(self) -> float:
         started = time.perf_counter()
-        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        settings = self._settings()
+        saved_position = (
+            QPoint(settings.panel_x, settings.panel_y)
+            if settings.panel_x is not None and settings.panel_y is not None
+            else None
+        )
+        screen = (
+            QApplication.screenAt(saved_position)
+            if saved_position is not None
+            else None
+        ) or QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         geometry = screen.availableGeometry()
         width = min(920, max(720, int(geometry.width() * 0.68)))
         height = min(630, max(500, int(geometry.height() * 0.66)))
         self.resize(width, height)
-        x = geometry.left() + (geometry.width() - width) // 2
-        y = geometry.top() + max(34, int(geometry.height() * 0.13))
-        self.move(x, y)
-        settings = self._settings()
+        if saved_position is None:
+            saved_position = QPoint(
+                geometry.left() + (geometry.width() - width) // 2,
+                geometry.top() + max(34, int(geometry.height() * 0.13)),
+            )
+        self.move(self._bounded_position(saved_position, geometry))
         restore_state = settings.remember_selection and self._selection_memory_is_valid(settings)
         target_kind = self._remembered_kind if restore_state else None
         search_text = self._remembered_search_text if restore_state else ""
@@ -1147,6 +1168,56 @@ class ClipPanel(QWidget):
         self.activateWindow()
         self.search.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
         return (time.perf_counter() - started) * 1_000
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._can_start_drag(event.position().toPoint())
+        ):
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._drag_origin = self.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            screen = QApplication.screenAt(event.globalPosition().toPoint()) or self.screen()
+            target = event.globalPosition().toPoint() - self._drag_offset
+            self.move(self._bounded_position(target, screen.availableGeometry()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._drag_offset is not None and event.button() == Qt.MouseButton.LeftButton:
+            origin = self._drag_origin
+            self._drag_offset = None
+            self._drag_origin = None
+            self.unsetCursor()
+            if origin is not None and self.pos() != origin:
+                self.position_changed.emit(self.x(), self.y())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _can_start_drag(self, position: QPoint) -> bool:
+        widget = self.childAt(position)
+        blocked = (QAbstractButton, QAbstractItemView, QLineEdit, QPlainTextEdit, QLabel, QStackedWidget)
+        while widget is not None and widget is not self:
+            if widget is self.search_icon or isinstance(widget, blocked):
+                return False
+            widget = widget.parentWidget()
+        return True
+
+    def _bounded_position(self, position: QPoint, geometry: QRect) -> QPoint:
+        maximum_x = max(geometry.left(), geometry.right() - self.width() + 1)
+        maximum_y = max(geometry.top(), geometry.bottom() - self.height() + 1)
+        return QPoint(
+            min(max(position.x(), geometry.left()), maximum_x),
+            min(max(position.y(), geometry.top()), maximum_y),
+        )
 
     def hideEvent(self, event) -> None:
         self._prepare_selection_for_hide()

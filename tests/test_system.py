@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import plistlib
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -13,6 +15,7 @@ from clipsoon.system import (
     ClipboardController,
     GlobalHotkeyService,
     HotkeyStateMachine,
+    LaunchAtLoginManager,
     PlatformBridge,
     SelectionSender,
     _canonical_key,
@@ -361,3 +364,79 @@ def test_accessibility_permission_is_not_required_on_windows(monkeypatch) -> Non
 
     assert PlatformBridge.accessibility_permission_status() is None
     assert not PlatformBridge.request_accessibility_permission()
+
+
+def test_macos_launch_at_login_writes_source_command_and_removes_it(tmp_path: Path) -> None:
+    executable = tmp_path / ".venv" / "bin" / "python"
+    manager = LaunchAtLoginManager(
+        platform="darwin",
+        executable=executable,
+        frozen=False,
+        home=tmp_path,
+    )
+
+    success, message = manager.set_enabled(True)
+
+    target = tmp_path / "Library" / "LaunchAgents" / "com.clipsoon.app.plist"
+    payload = plistlib.loads(target.read_bytes())
+    assert success
+    assert message == "已开启开机自启动"
+    assert payload["Label"] == "com.clipsoon.app"
+    assert payload["ProgramArguments"] == [str(executable.resolve()), "-m", "clipsoon"]
+    assert payload["RunAtLoad"] is True
+
+    success, message = manager.set_enabled(False)
+    assert success
+    assert message == "已关闭开机自启动"
+    assert not target.exists()
+
+
+def test_windows_launch_at_login_uses_pythonw_and_current_user_run_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    values: dict[str, str] = {}
+
+    class FakeKey:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    def set_value(_key, name, _reserved, _kind, value) -> None:
+        values[name] = value
+
+    def delete_value(_key, name) -> None:
+        if name not in values:
+            raise FileNotFoundError(name)
+        del values[name]
+
+    winreg = types.SimpleNamespace(
+        HKEY_CURRENT_USER="HKCU",
+        KEY_SET_VALUE=2,
+        REG_SZ=1,
+        CreateKey=lambda *_args: FakeKey(),
+        OpenKey=lambda *_args: FakeKey(),
+        SetValueEx=set_value,
+        DeleteValue=delete_value,
+    )
+    monkeypatch.setitem(sys.modules, "winreg", winreg)
+    scripts = tmp_path / ".venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    python = scripts / "python.exe"
+    pythonw = scripts / "pythonw.exe"
+    python.write_bytes(b"")
+    pythonw.write_bytes(b"")
+    manager = LaunchAtLoginManager(platform="win32", executable=python, frozen=False)
+
+    assert manager.set_enabled(True)[0]
+    assert values["ClipSoon"] == subprocess.list2cmdline((str(pythonw.resolve()), "-m", "clipsoon"))
+    assert manager.set_enabled(False)[0]
+    assert "ClipSoon" not in values
+
+
+def test_frozen_launch_at_login_command_only_contains_the_app_executable(tmp_path: Path) -> None:
+    executable = tmp_path / "ClipSoon.exe"
+    manager = LaunchAtLoginManager(platform="win32", executable=executable, frozen=True)
+
+    assert manager.command == (str(executable.resolve()),)

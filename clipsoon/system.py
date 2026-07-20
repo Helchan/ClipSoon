@@ -5,6 +5,8 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import plistlib
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -371,6 +373,95 @@ class ForegroundTargetHandle:
         except Exception:
             return False
         return False
+
+
+class LaunchAtLoginManager:
+    """Own the current user's platform startup registration."""
+
+    _MACOS_LABEL = "com.clipsoon.app"
+    _WINDOWS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    _WINDOWS_VALUE = "ClipSoon"
+
+    def __init__(
+        self,
+        *,
+        platform: str | None = None,
+        executable: Path | None = None,
+        frozen: bool | None = None,
+        home: Path | None = None,
+    ) -> None:
+        self.platform = platform or sys.platform
+        self.executable = Path(executable or sys.executable).resolve()
+        self.frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+        self.home = Path.home() if home is None else home
+
+    @property
+    def command(self) -> tuple[str, ...]:
+        executable = self.executable
+        if self.platform == "win32" and not self.frozen:
+            pythonw = executable.with_name("pythonw.exe")
+            if pythonw.exists():
+                executable = pythonw
+        if self.frozen:
+            return (str(executable),)
+        return (str(executable), "-m", "clipsoon")
+
+    def set_enabled(self, enabled: bool) -> tuple[bool, str]:
+        try:
+            if self.platform == "darwin":
+                self._set_macos_enabled(enabled)
+            elif self.platform == "win32":
+                self._set_windows_enabled(enabled)
+            else:
+                return False, "当前平台不支持开机自启动"
+        except Exception as exc:
+            LOGGER.exception("Could not update launch-at-login registration")
+            return False, f"无法更新开机自启动：{exc}"
+        return True, "已开启开机自启动" if enabled else "已关闭开机自启动"
+
+    def _set_macos_enabled(self, enabled: bool) -> None:
+        launch_agents = self.home / "Library" / "LaunchAgents"
+        target = launch_agents / f"{self._MACOS_LABEL}.plist"
+        if not enabled:
+            target.unlink(missing_ok=True)
+            return
+        launch_agents.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "Label": self._MACOS_LABEL,
+            "ProgramArguments": list(self.command),
+            "ProcessType": "Interactive",
+            "RunAtLoad": True,
+        }
+        temporary = target.with_suffix(".plist.tmp")
+        try:
+            temporary.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True))
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _set_windows_enabled(self, enabled: bool) -> None:
+        import winreg
+
+        if enabled:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self._WINDOWS_KEY) as key:
+                winreg.SetValueEx(
+                    key,
+                    self._WINDOWS_VALUE,
+                    0,
+                    winreg.REG_SZ,
+                    subprocess.list2cmdline(self.command),
+                )
+            return
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                self._WINDOWS_KEY,
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                winreg.DeleteValue(key, self._WINDOWS_VALUE)
+        except FileNotFoundError:
+            pass
 
 
 class PlatformBridge:

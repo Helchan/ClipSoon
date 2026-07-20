@@ -4,7 +4,7 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QItemSelectionModel, QPoint, QRect, QSize, Qt
+from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPalette
 from PySide6.QtWidgets import QDialog, QFrame, QMenu, QStyleOptionViewItem
 
@@ -129,6 +129,16 @@ def test_state_memory_setting_is_an_optional_three_second_default(qtbot) -> None
     assert dialog.values()["selection_memory_seconds"] == 3
 
 
+def test_launch_at_login_setting_round_trips_through_dialog(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(launch_at_login=True), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+
+    assert dialog.launch_at_login.text() == "开机时自动启动 ClipSoon"
+    assert dialog.launch_at_login.isChecked()
+    dialog.launch_at_login.setChecked(False)
+    assert dialog.values()["launch_at_login"] is False
+
+
 def test_dark_settings_combo_popups_use_readable_theme_colors(qtbot) -> None:
     dialog = SettingsDialog(AppSettings(theme="dark"), accessibility_granted=True)
     qtbot.addWidget(dialog)
@@ -200,6 +210,89 @@ def test_panel_defaults_to_first_item_each_time_it_is_shown(qtbot) -> None:
 
     assert panel.list.currentIndex().row() == 0
     assert {index.row() for index in panel.list.selectionModel().selectedRows()} == {0}
+
+
+class _FakeMouseEvent:
+    def __init__(
+        self,
+        local: QPoint,
+        global_position: QPoint,
+        button: Qt.MouseButton,
+        buttons: Qt.MouseButton,
+    ) -> None:
+        self._local = QPointF(local)
+        self._global = QPointF(global_position)
+        self._button = button
+        self._buttons = buttons
+        self.accepted = False
+
+    def position(self) -> QPointF:
+        return self._local
+
+    def globalPosition(self) -> QPointF:
+        return self._global
+
+    def button(self) -> Qt.MouseButton:
+        return self._button
+
+    def buttons(self) -> Qt.MouseButton:
+        return self._buttons
+
+    def accept(self) -> None:
+        self.accepted = True
+
+
+def test_panel_drag_from_blank_area_emits_and_restores_position(qtbot) -> None:
+    settings = AppSettings()
+    panel = ClipPanel(lambda: settings)
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    assert panel._can_start_drag(QPoint(5, 5))
+    assert not panel._can_start_drag(panel.search.mapTo(panel, QPoint(5, 5)))
+    moved: list[tuple[int, int]] = []
+    panel.position_changed.connect(lambda x, y: moved.append((x, y)))
+    local = QPoint(5, 5)
+    start = panel.mapToGlobal(local)
+    delta = QPoint(20, 20)
+
+    panel.mousePressEvent(
+        _FakeMouseEvent(local, start, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton)
+    )
+    panel.mouseMoveEvent(
+        _FakeMouseEvent(
+            local + delta,
+            start + delta,
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+        )
+    )
+    panel.mouseReleaseEvent(
+        _FakeMouseEvent(
+            local + delta,
+            start + delta,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+        )
+    )
+
+    assert moved == [(panel.x(), panel.y())]
+    settings.panel_x, settings.panel_y = moved[0]
+    restored = ClipPanel(lambda: settings)
+    qtbot.addWidget(restored)
+    restored.show_panel()
+    qtbot.waitExposed(restored)
+    assert restored.pos() == panel.pos()
+
+
+def test_panel_saved_position_is_clamped_to_available_screen(qtbot) -> None:
+    settings = AppSettings(panel_x=100_000, panel_y=100_000)
+    panel = ClipPanel(lambda: settings)
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    assert panel.screen().availableGeometry().contains(panel.frameGeometry())
 
 
 def test_panel_restores_multi_selection_by_id_before_memory_expires(qtbot) -> None:

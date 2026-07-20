@@ -82,12 +82,17 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
         paste_delay_ms=9_999,
         remember_selection=True,
         selection_memory_seconds=999,
+        launch_at_login=True,
+        panel_x=-320,
+        panel_y=240,
     )
     assert value.hotkey == "double:shift"
     assert value.max_history_items == 50
     assert value.paste_delay_ms == 2_000
     assert value.remember_selection
     assert value.selection_memory_seconds == 300
+    assert value.launch_at_login
+    assert (value.panel_x, value.panel_y) == (-320, 240)
     assert store.load() == value
     assert observed == [value]
     unsubscribe()
@@ -112,6 +117,8 @@ def test_hotkey_validation() -> None:
     assert AppSettings(double_tap_interval_ms="bad").validated().double_tap_interval_ms == 180
     assert AppSettings().selection_memory_seconds == 3
     assert AppSettings(selection_memory_seconds=0).validated().selection_memory_seconds == 1
+    assert AppSettings(panel_x="bad", panel_y=None).validated().panel_x is None
+    assert AppSettings(panel_x=200_000).validated().panel_x == 100_000
 
 
 def test_search_contract_exact_prefix_substring_subsequence_and_rejection() -> None:
