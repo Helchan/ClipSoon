@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from clipsoon.ui import (
     _hover_color,
     _parse_hotkey,
     _ScaledImageLoader,
+    _style_sheet,
 )
 
 
@@ -195,6 +197,29 @@ def test_panel_footer_places_version_after_hide_hint(qtbot) -> None:
     qtbot.addWidget(panel)
 
     assert panel.version_label.text() == f"↑↓ 选择  |  ↵ 发送  |  Esc 隐藏  |  v{__version__}"
+
+
+def test_styles_use_point_fonts_so_windows_styles_never_receive_negative_point_size(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    assert not re.search(r"font-size:\s*\d+(?:\.\d+)?px", _style_sheet(False))
+    for widget in (panel, panel.search, panel.list, panel.version_label):
+        assert widget.font().pointSizeF() > 0
+        assert widget.font().pixelSize() == -1
+
+
+def test_windows_panel_avoids_drop_shadow_dirty_regions_outside_layered_window(
+    qtbot, monkeypatch
+) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+
+    assert panel.card.graphicsEffect() is None
 
 
 def test_panel_defaults_to_first_item_each_time_it_is_shown(qtbot) -> None:

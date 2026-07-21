@@ -48,6 +48,19 @@ class FakeClipboard(QObject):
         self.dataChanged.emit()
 
 
+class FlakyClipboard(FakeClipboard):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.read_attempts = 0
+
+    def mimeData(self, _mode=QClipboard.Mode.Clipboard) -> QMimeData:
+        self.read_attempts += 1
+        if self.read_attempts <= self.failures:
+            raise RuntimeError("clipboard busy")
+        return self.mime
+
+
 def test_double_modifier_state_machine_contract() -> None:
     hits: list[str] = []
     machine = HotkeyStateMachine("double:ctrl", 420, lambda: hits.append("hit"))
@@ -112,12 +125,14 @@ def test_clipboard_capture_precedence_and_self_write(qtbot, tmp_path: Path) -> N
     file_path.write_text("hello", encoding="utf-8")
     mime.setUrls([QUrl.fromLocalFile(str(file_path))])
     clipboard.set_external(mime)
+    qtbot.waitUntil(lambda: bool(captured), timeout=1_000)
     assert captured[-1].kind is ClipKind.FILES
     assert len(repository.list_items()) == 1
 
     text_mime = QMimeData()
     text_mime.setText("plain text")
     clipboard.set_external(text_mime)
+    qtbot.waitUntil(lambda: captured[-1].text == "plain text", timeout=1_000)
     assert captured[-1].text == "plain text"
     before = len(repository.list_items())
     assert controller.write_item(captured[-1])
@@ -144,7 +159,66 @@ def test_async_image_capture(qtbot, tmp_path: Path) -> None:
     repository.close()
 
 
-def test_clipboard_pause_secret_poll_and_write_formats(tmp_path: Path) -> None:
+def test_clipboard_capture_waits_for_owner_and_retries_without_losing_item(qtbot, tmp_path: Path) -> None:
+    clipboard = FlakyClipboard(failures=2)
+    controller, repository = make_controller(tmp_path, clipboard)
+    captured: list[ClipItem] = []
+    failures: list[str] = []
+    controller.captured.connect(captured.append)
+    controller.failed.connect(failures.append)
+    mime = QMimeData()
+    mime.setText("available after owner releases it")
+
+    clipboard.set_external(mime)
+
+    qtbot.waitUntil(lambda: bool(captured), timeout=2_000)
+    assert captured[0].text == "available after owner releases it"
+    assert clipboard.read_attempts == 3
+    assert failures == []
+    controller.stop()
+    repository.close()
+
+
+def test_clipboard_capture_coalesces_rapid_changes_to_latest_sequence(qtbot, tmp_path: Path) -> None:
+    clipboard = FakeClipboard()
+    controller, repository = make_controller(tmp_path, clipboard)
+    captured: list[ClipItem] = []
+    controller.captured.connect(captured.append)
+    first = QMimeData()
+    first.setText("first")
+    latest = QMimeData()
+    latest.setText("latest")
+
+    clipboard.set_external(first)
+    clipboard.set_external(latest)
+
+    qtbot.waitUntil(lambda: bool(captured), timeout=1_000)
+    assert [item.text for item in captured] == ["latest"]
+    controller.stop()
+    repository.close()
+
+
+def test_delayed_clipboard_capture_keeps_source_from_change_notification(qtbot, tmp_path: Path) -> None:
+    clipboard = FakeClipboard()
+    source = ["Copying app"]
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(clipboard, repository, AppSettings, lambda: source[0])
+    controller._sequence_number = lambda: clipboard.sequence  # type: ignore[method-assign]
+    controller._last_sequence = clipboard.sequence
+    controller.start()
+    mime = QMimeData()
+    mime.setText("captured before switching")
+
+    clipboard.set_external(mime)
+    source[0] = "Next app"
+
+    qtbot.waitUntil(lambda: bool(repository.list_items()), timeout=1_000)
+    assert repository.list_items()[0].source_app == "Copying app"
+    controller.stop()
+    repository.close()
+
+
+def test_clipboard_pause_secret_poll_and_write_formats(qtbot, tmp_path: Path) -> None:
     clipboard = FakeClipboard()
     settings = AppSettings(capture_enabled=False)
     repository = HistoryRepository(tmp_path)
@@ -168,6 +242,7 @@ def test_clipboard_pause_secret_poll_and_write_formats(tmp_path: Path) -> None:
     clipboard.mime = text
     clipboard.sequence += 1
     controller._poll_native_sequence()
+    qtbot.waitUntil(lambda: bool(repository.list_items()), timeout=1_000)
     assert repository.list_items()[0].text == "captured"
     controller.sync_cursor()
     controller._poll_native_sequence()
@@ -217,6 +292,7 @@ def test_hotkey_service_listener_lifecycle_and_failure(monkeypatch) -> None:
     service = GlobalHotkeyService(lambda: events.append("hit"), events.append)
     service.start(AppSettings())
     listener = service._listener
+    assert service.is_running
     class FakeKey:
         char = None
 
@@ -231,6 +307,7 @@ def test_hotkey_service_listener_lifecycle_and_failure(monkeypatch) -> None:
     assert events == ["hit"]
     service.stop()
     assert listener.stopped
+    assert not service.is_running
 
     class BrokenListener:
         def __init__(self, **_kwargs) -> None:
@@ -242,6 +319,85 @@ def test_hotkey_service_listener_lifecycle_and_failure(monkeypatch) -> None:
     service.start(AppSettings())
     assert "denied" in events[-1]
     assert _canonical_key("Key.cmd_l") == "meta"
+
+
+def test_hotkey_service_detects_listener_that_stopped_after_start(monkeypatch) -> None:
+    class FakeListener:
+        IS_TRUSTED = True
+
+        def __init__(self, **_kwargs) -> None:
+            self.running = False
+
+        def start(self) -> None:
+            self.running = True
+
+        def stop(self) -> None:
+            self.running = False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pynput",
+        types.SimpleNamespace(keyboard=types.SimpleNamespace(Listener=FakeListener)),
+    )
+    service = GlobalHotkeyService(lambda: None, lambda _message: None)
+    service.start(AppSettings())
+    assert service.is_running
+
+    service._listener.running = False
+
+    assert not service.is_running
+    service.stop()
+
+
+def test_windows_panel_activation_uses_and_verifies_foreground_window(monkeypatch) -> None:
+    foreground = [101]
+    calls: list[tuple[str, int]] = []
+
+    def handle_value(value) -> int:
+        return int(value.value if hasattr(value, "value") else value)
+
+    def show_window(hwnd, command) -> int:
+        calls.append(("show", handle_value(hwnd)))
+        assert command == 5
+        return 1
+
+    def bring_to_top(hwnd) -> int:
+        calls.append(("top", handle_value(hwnd)))
+        return 1
+
+    def set_foreground(hwnd) -> int:
+        foreground[0] = handle_value(hwnd)
+        calls.append(("foreground", foreground[0]))
+        return 1
+
+    def get_foreground() -> int:
+        return foreground[0]
+
+    user32 = types.SimpleNamespace(
+        ShowWindow=show_window,
+        BringWindowToTop=bring_to_top,
+        SetForegroundWindow=set_foreground,
+        GetForegroundWindow=get_foreground,
+    )
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module.ctypes, "windll", types.SimpleNamespace(user32=user32), raising=False)
+
+    assert PlatformBridge.request_window_activation(202)
+    assert PlatformBridge.foreground_window_id() == 202
+    assert calls == [("show", 202), ("top", 202), ("foreground", 202)]
+
+
+def test_windows_primary_button_detects_short_click_between_polls(monkeypatch) -> None:
+    user32 = types.SimpleNamespace(GetAsyncKeyState=lambda _key: 0x0001)
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        system_module.ctypes,
+        "windll",
+        types.SimpleNamespace(user32=user32),
+        raising=False,
+    )
+
+    assert PlatformBridge.primary_button_down()
 
 
 class FakeTarget:

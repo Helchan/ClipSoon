@@ -26,5 +26,10 @@ cd /d "%PROJECT_DIR%"
 "%PYTHON_BIN%" -m clipsoon --show
 set "EXIT_CODE=%ERRORLEVEL%"
 
-if not "%EXIT_CODE%"=="0" pause
+if not "%EXIT_CODE%"=="0" (
+  echo ClipSoon 异常退出，退出码：%EXIT_CODE%
+  echo Python 异常日志：%LOCALAPPDATA%\ClipSoon\logs\clipsoon.log
+  echo 原生崩溃日志：%LOCALAPPDATA%\ClipSoon\logs\native-crash.log
+  pause
+)
 exit /b %EXIT_CODE%

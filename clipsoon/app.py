@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from platformdirs import user_data_path
 from PySide6.QtCore import QLockFile, QObject, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QDialog, QSystemTrayIcon
 
 from clipsoon import __version__
@@ -27,11 +30,60 @@ from clipsoon.system import (
 from clipsoon.ui import ClipPanel, SettingsDialog, create_tray_icon
 
 LOGGER = logging.getLogger(__name__)
+_CRASH_LOG_STREAM = None
+_PANEL_WATCH_INTERVAL_MS = 35
+_HOTKEY_HEALTH_INTERVAL_MS = 2_000
+_HOTKEY_RESTART_BACKOFF_SECONDS = 15.0
 
 
 class _Signals(QObject):
     hotkey = Signal()
     hotkey_failed = Signal(str)
+
+
+@dataclass(slots=True)
+class _WindowsPanelGuard:
+    initial_foreground: int | None = None
+    panel_window: int | None = None
+    saw_panel_foreground: bool = False
+    primary_button_was_down: bool = False
+
+    def arm(
+        self,
+        *,
+        initial_foreground: int | None,
+        panel_window: int,
+        primary_button_down: bool,
+    ) -> None:
+        self.initial_foreground = initial_foreground
+        self.panel_window = panel_window
+        self.saw_panel_foreground = initial_foreground == panel_window
+        self.primary_button_was_down = primary_button_down
+
+    def sync_primary_button(self, primary_button_down: bool) -> None:
+        self.primary_button_was_down = primary_button_down
+
+    def should_hide(
+        self,
+        *,
+        foreground: int | None,
+        primary_button_down: bool,
+        cursor_inside: bool,
+    ) -> bool:
+        newly_pressed = primary_button_down and not self.primary_button_was_down
+        self.primary_button_was_down = primary_button_down
+        if foreground == self.panel_window:
+            self.saw_panel_foreground = True
+            return False
+        if newly_pressed and not cursor_inside:
+            return True
+        if self.saw_panel_foreground:
+            return foreground is not None
+        return (
+            self.initial_foreground is not None
+            and foreground is not None
+            and foreground != self.initial_foreground
+        )
 
 
 class ClipSoonApplication(QObject):
@@ -43,6 +95,14 @@ class ClipSoonApplication(QObject):
         self.launch_at_login = LaunchAtLoginManager()
         self.signals = _Signals()
         self.target: ForegroundTargetHandle | None = None
+        self._panel_guard = _WindowsPanelGuard()
+        self._panel_watch_timer = QTimer(self)
+        self._panel_watch_timer.setInterval(_PANEL_WATCH_INTERVAL_MS)
+        self._panel_watch_timer.timeout.connect(self._watch_windows_panel)
+        self._hotkey_health_timer = QTimer(self)
+        self._hotkey_health_timer.setInterval(_HOTKEY_HEALTH_INTERVAL_MS)
+        self._hotkey_health_timer.timeout.connect(self._ensure_hotkey_listener)
+        self._next_hotkey_restart_at = 0.0
 
         self.panel = ClipPanel(lambda: self.settings.value)
         self.panel.set_items(self.repository.list_items())
@@ -72,6 +132,7 @@ class ClipSoonApplication(QObject):
         # Permission failures can be emitted synchronously, so the tray must
         # already be visible for the first-launch warning to reach the user.
         self.hotkey.start(self.settings.value)
+        self._hotkey_health_timer.start()
         if self.settings.value.launch_at_login:
             success, message = self.launch_at_login.set_enabled(True)
             if not success:
@@ -110,10 +171,68 @@ class ClipSoonApplication(QObject):
         ):
             self.panel.clear_status()
         self.target = PlatformBridge.capture_target()
+        initial_foreground = (
+            self.target.identifier
+            if self.target is not None and self.target.kind == "windows"
+            else PlatformBridge.foreground_window_id()
+        )
         elapsed = self.panel.show_panel()
+        if PlatformBridge.is_windows():
+            panel_window = int(self.panel.winId())
+            self._panel_guard.arm(
+                initial_foreground=initial_foreground,
+                panel_window=panel_window,
+                primary_button_down=PlatformBridge.primary_button_down(),
+            )
+            self._panel_watch_timer.start()
+            QTimer.singleShot(0, lambda: self._activate_windows_panel(0))
         LOGGER.info("Panel visible in %.1f ms; target=%s", elapsed, self.target.name if self.target else "none")
         if elapsed > 100:
             LOGGER.warning("Hotkey-to-visible budget exceeded: %.1f ms", elapsed)
+
+    def _activate_windows_panel(self, attempt: int) -> None:
+        if not PlatformBridge.is_windows() or not self.panel.isVisible():
+            return
+        if PlatformBridge.request_window_activation(int(self.panel.winId())):
+            self._panel_guard.saw_panel_foreground = True
+            self.panel.activateWindow()
+            self.panel.search.setFocus()
+            return
+        if attempt == 0:
+            QTimer.singleShot(45, lambda: self._activate_windows_panel(1))
+
+    def _watch_windows_panel(self) -> None:
+        if not self.panel.isVisible():
+            self._panel_watch_timer.stop()
+            return
+        primary_down = PlatformBridge.primary_button_down()
+        if (
+            not self.settings.value.hide_on_deactivate
+            or QApplication.activeModalWidget() is not None
+            or QApplication.activePopupWidget() is not None
+        ):
+            self._panel_guard.sync_primary_button(primary_down)
+            return
+        should_hide = self._panel_guard.should_hide(
+            foreground=PlatformBridge.foreground_window_id(),
+            primary_button_down=primary_down,
+            cursor_inside=self.panel.frameGeometry().contains(QCursor.pos()),
+        )
+        if should_hide:
+            LOGGER.info("Hiding Windows panel after native foreground/pointer change")
+            self.panel.hide_panel()
+            self._panel_watch_timer.stop()
+
+    def _ensure_hotkey_listener(self) -> None:
+        if self.hotkey.is_running:
+            self._next_hotkey_restart_at = 0.0
+            return
+        now = time.monotonic()
+        if now < self._next_hotkey_restart_at:
+            return
+        LOGGER.warning("Global hotkey listener stopped; restarting it")
+        self._next_hotkey_restart_at = now + _HOTKEY_RESTART_BACKOFF_SECONDS
+        self.hotkey.start(self.settings.value)
 
     def show_settings(self) -> None:
         self.panel.keep_open(True)
@@ -220,6 +339,8 @@ class ClipSoonApplication(QObject):
         self.panel.set_status(message)
 
     def shutdown(self) -> None:
+        self._panel_watch_timer.stop()
+        self._hotkey_health_timer.stop()
         self.hotkey.stop()
         self.clipboard.stop()
         QThreadPool.globalInstance().waitForDone(3_000)
@@ -240,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
     data_dir = Path(os.environ.get("CLIPSOON_DATA_DIR") or user_data_path("ClipSoon", appauthor=False))
     data_dir.mkdir(parents=True, exist_ok=True)
     _configure_logging(data_dir)
+    _configure_crash_reporting(data_dir)
     lock = QLockFile(str(data_dir / "ClipSoon.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock(50):
@@ -264,6 +386,25 @@ def _configure_logging(data_dir: Path) -> None:
     )
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+
+def _configure_crash_reporting(data_dir: Path) -> None:
+    global _CRASH_LOG_STREAM
+    try:
+        crash_log = data_dir / "logs" / "native-crash.log"
+        _CRASH_LOG_STREAM = crash_log.open("a", encoding="utf-8")
+        faulthandler.enable(_CRASH_LOG_STREAM, all_threads=True)
+    except (OSError, RuntimeError):
+        LOGGER.exception("Could not enable native crash reporting")
+
+    def log_unhandled(exception_type, exception, traceback) -> None:
+        LOGGER.critical(
+            "Unhandled Python exception",
+            exc_info=(exception_type, exception, traceback),
+        )
+        sys.__excepthook__(exception_type, exception, traceback)
+
+    sys.excepthook = log_unhandled
 
 
 if __name__ == "__main__":

@@ -504,7 +504,7 @@ class ClipDelegate(QStyledItemDelegate):
         color = QColor("#FFFFFF") if selected else QColor("#5664E8")
         painter.setPen(color)
         font = painter.font()
-        font.setPixelSize(21)
+        font.setPointSize(16)
         font.setWeight(QFont.Weight.Bold)
         painter.setFont(font)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "T" if item.kind is ClipKind.TEXT else "F")
@@ -950,14 +950,15 @@ class ClipPanel(QWidget):
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setContentsMargins(*(1, 1, 1, 1) if sys.platform == "win32" else (14, 14, 14, 14))
         self.card = QFrame()
         self.card.setObjectName("card")
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(32)
-        shadow.setOffset(0, 8)
-        shadow.setColor(QColor(0, 0, 0, 115))
-        self.card.setGraphicsEffect(shadow)
+        if sys.platform != "win32":
+            shadow = QGraphicsDropShadowEffect(self)
+            shadow.setBlurRadius(32)
+            shadow.setOffset(0, 8)
+            shadow.setColor(QColor(0, 0, 0, 115))
+            self.card.setGraphicsEffect(shadow)
         outer.addWidget(self.card)
         root = QVBoxLayout(self.card)
         root.setContentsMargins(12, 10, 12, 8)
@@ -1575,27 +1576,27 @@ def _style_sheet(dark: bool) -> str:
     border = "rgba(255,255,255,24)" if dark else "rgba(46,52,76,26)"
     input_bg = "#343743" if dark else "#EAECF4"
     return f"""
-        QWidget {{ color: {text}; font-size: 13px; }}
+        QWidget {{ color: {text}; font-size: 10pt; }}
         #card {{ background: {bg}; border: 1px solid {border}; border-radius: 20px; }}
         #searchBox {{ background: transparent; border: 2px solid #6574FF; border-radius: 10px; }}
-        #search {{ background: transparent; border: none; font-size: 22px; padding: 4px 2px; }}
+        #search {{ background: transparent; border: none; font-size: 16pt; padding: 4px 2px; }}
         QToolButton {{ border: none; border-radius: 9px; padding: 7px 10px; background: transparent; }}
         QToolButton:hover {{ background: {input_bg}; }}
         QToolButton[filterChip="true"] {{ color: {muted}; padding: 5px 12px; }}
         QToolButton[filterChip="true"]:checked {{ color: white; background: #5B6CFF; }}
         #historyList {{ background: transparent; border: none; outline: none; }}
         #detail {{ background: {panel}; border: 1px solid {border}; border-radius: 15px; }}
-        #informationTitle {{ font-size: 15px; font-weight: 650; padding-top: 6px; }}
-        #informationLabel {{ color: {muted}; font-size: 12px; }}
-        #informationValue {{ font-size: 12px; }}
-        #muted {{ color: {muted}; font-size: 12px; }}
+        #informationTitle {{ font-size: 11pt; font-weight: 650; padding-top: 6px; }}
+        #informationLabel {{ color: {muted}; font-size: 9pt; }}
+        #informationValue {{ font-size: 9pt; }}
+        #muted {{ color: {muted}; font-size: 9pt; }}
         #muted a {{ color: #6574FF; text-decoration: none; }}
         #platformNote {{ background: {input_bg}; border: 1px solid {border}; border-radius: 10px; }}
-        #dialogTitle {{ font-size: 21px; font-weight: 650; }}
-        #settingsSubtitle {{ color: {muted}; font-size: 12px; }}
+        #dialogTitle {{ font-size: 16pt; font-weight: 650; }}
+        #settingsSubtitle {{ color: {muted}; font-size: 9pt; }}
         #settingsSection {{ background: {panel}; border: 1px solid {border}; border-radius: 11px; }}
-        #settingsSectionTitle {{ font-size: 14px; font-weight: 650; }}
-        #settingsFieldLabel {{ color: {muted}; font-size: 12px; }}
+        #settingsSectionTitle {{ font-size: 11pt; font-weight: 650; }}
+        #settingsFieldLabel {{ color: {muted}; font-size: 9pt; }}
         QPlainTextEdit, QLineEdit, QComboBox, QSpinBox {{
             background: {input_bg}; border: 1px solid {border}; border-radius: 9px; padding: 7px;
         }}

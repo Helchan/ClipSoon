@@ -21,6 +21,22 @@ from clipsoon.core import AppSettings, ClipItem, ClipKind, HistoryRepository
 
 LOGGER = logging.getLogger(__name__)
 _MODIFIERS = {"ctrl", "shift", "alt", "meta"}
+_CLIPBOARD_SETTLE_MS = 70
+_CLIPBOARD_RETRY_DELAYS_MS = (90, 180)
+
+
+def _windows_handle(identifier: int):
+    return ctypes.c_void_p(identifier)
+
+
+def _windows_foreground_window() -> int:
+    user32 = ctypes.windll.user32
+    get_foreground = user32.GetForegroundWindow
+    get_foreground.restype = ctypes.c_void_p
+    value = get_foreground()
+    if hasattr(value, "value"):
+        value = value.value
+    return int(value or 0)
 
 
 class HotkeyStateMachine:
@@ -127,6 +143,13 @@ class GlobalHotkeyService:
                 LOGGER.debug("Hotkey listener stop failed", exc_info=True)
         self._listener = None
 
+    @property
+    def is_running(self) -> bool:
+        if self._listener is None:
+            return False
+        running = getattr(self._listener, "running", None)
+        return True if running is None else bool(running)
+
     def _on_press(self, key: object) -> None:
         if self._machine is not None:
             self._machine.press(_pynput_key_name(key))
@@ -202,6 +225,13 @@ class ClipboardController(QObject):
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(220)
         self._poll_timer.timeout.connect(self._poll_native_sequence)
+        self._capture_timer = QTimer(self)
+        self._capture_timer.setSingleShot(True)
+        self._capture_timer.timeout.connect(self._capture_pending)
+        self._pending_sequence: int | None = None
+        self._pending_source = ""
+        self._capture_attempt = 0
+        self._last_capture_error: Exception | None = None
 
     def start(self) -> None:
         self.clipboard.dataChanged.connect(self._clipboard_changed)
@@ -212,11 +242,17 @@ class ClipboardController(QObject):
 
     def stop(self) -> None:
         self._poll_timer.stop()
+        self._capture_timer.stop()
+        self._pending_sequence = None
+        self._pending_source = ""
         with suppress(RuntimeError, TypeError):
             self.clipboard.dataChanged.disconnect(self._clipboard_changed)
 
     def sync_cursor(self) -> None:
         """Advance without reading; used by clear/pause to prevent resurrection."""
+        self._capture_timer.stop()
+        self._pending_sequence = None
+        self._pending_source = ""
         self._last_sequence = self._sequence_number()
         self._suppressed_sequence = self._last_sequence
 
@@ -228,7 +264,7 @@ class ClipboardController(QObject):
         if sequence == self._suppressed_sequence:
             self._suppressed_sequence = None
             return
-        self._capture_current()
+        self._schedule_capture(sequence)
 
     def _clipboard_changed(self) -> None:
         sequence = self._sequence_number()
@@ -239,33 +275,85 @@ class ClipboardController(QObject):
         if self._self_write or (sequence is not None and sequence == self._suppressed_sequence):
             self._suppressed_sequence = None
             return
-        self._capture_current()
+        self._schedule_capture(sequence)
 
-    def _capture_current(self) -> None:
-        if not self._settings().capture_enabled:
-            return
-        mime = self.clipboard.mimeData(QClipboard.Mode.Clipboard)
-        if mime is None or self._is_secret(mime):
-            return
-        source = self._source_app()
+    def _schedule_capture(self, sequence: int | None) -> None:
+        self._pending_sequence = sequence
         try:
+            self._pending_source = self._source_app()
+        except Exception:
+            self._pending_source = ""
+            LOGGER.debug("Clipboard source lookup failed", exc_info=True)
+        self._capture_attempt = 0
+        self._last_capture_error = None
+        self._capture_timer.start(_CLIPBOARD_SETTLE_MS)
+
+    def _capture_pending(self) -> None:
+        current_sequence = self._sequence_number()
+        if (
+            self._pending_sequence is not None
+            and current_sequence is not None
+            and current_sequence != self._pending_sequence
+        ):
+            self._last_sequence = current_sequence
+            self._schedule_capture(current_sequence)
+            return
+        if self._capture_current():
+            self._pending_sequence = None
+            self._pending_source = ""
+            self._last_capture_error = None
+            return
+        if self._capture_attempt < len(_CLIPBOARD_RETRY_DELAYS_MS):
+            delay = _CLIPBOARD_RETRY_DELAYS_MS[self._capture_attempt]
+            self._capture_attempt += 1
+            self._capture_timer.start(delay)
+            return
+        error = self._last_capture_error or RuntimeError("系统剪贴板暂时不可用")
+        LOGGER.warning("Clipboard remained unavailable after retries: %s", error)
+        self.failed.emit(f"剪贴板记录失败：{error}")
+        self._pending_sequence = None
+        self._pending_source = ""
+        self._last_capture_error = None
+
+    def _capture_current(self) -> bool:
+        if not self._settings().capture_enabled:
+            return True
+        try:
+            mime = self.clipboard.mimeData(QClipboard.Mode.Clipboard)
+            if mime is None:
+                raise RuntimeError("系统剪贴板暂时不可用")
+            if self._is_secret(mime):
+                return True
+            source = self._pending_source or self._source_app()
             local_files = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
             if local_files:
-                item = self.repository.add_files(local_files, source)
-                self._finish_capture(item)
-                return
-            if mime.hasImage():
+                payload = "files", local_files
+            elif mime.hasImage():
                 image = self.clipboard.image(QClipboard.Mode.Clipboard)
-                if not image.isNull():
-                    self._store_image_async(image.copy(), source)
-                return
-            if mime.hasText():
+                payload = ("image", image.copy()) if not image.isNull() else None
+            elif mime.hasText():
                 text = mime.text()
-                if text:
-                    self._finish_capture(self.repository.add_text(text, source))
+                payload = ("text", text) if text else None
+            else:
+                payload = None
         except Exception as exc:
-            LOGGER.exception("Clipboard capture failed")
+            self._last_capture_error = exc
+            LOGGER.debug("Clipboard capture attempt failed", exc_info=True)
+            return False
+        if payload is None:
+            return True
+        try:
+            kind, value = payload
+            if kind == "files":
+                self._finish_capture(self.repository.add_files(value, source))
+            elif kind == "image":
+                self._store_image_async(value, source)
+            else:
+                self._finish_capture(self.repository.add_text(value, source))
+        except Exception as exc:
+            LOGGER.exception("Clipboard persistence failed")
             self.failed.emit(f"剪贴板记录失败：{exc}")
+        return True
 
     def _finish_capture(self, item: ClipItem) -> None:
         settings = self._settings()
@@ -353,10 +441,12 @@ class ForegroundTargetHandle:
                 return bool(app and app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
             if self.kind == "windows":
                 user32 = ctypes.windll.user32
-                if not user32.IsWindow(self.identifier):
+                handle = _windows_handle(self.identifier)
+                if not user32.IsWindow(handle):
                     return False
-                user32.ShowWindow(self.identifier, 9)  # SW_RESTORE
-                return bool(user32.SetForegroundWindow(self.identifier))
+                user32.ShowWindow(handle, 9)  # SW_RESTORE
+                user32.BringWindowToTop(handle)
+                return bool(user32.SetForegroundWindow(handle))
         except Exception:
             LOGGER.exception("Could not restore target window")
         return False
@@ -369,7 +459,7 @@ class ForegroundTargetHandle:
                 app = NSWorkspace.sharedWorkspace().frontmostApplication()
                 return bool(app and int(app.processIdentifier()) == self.identifier)
             if self.kind == "windows":
-                return int(ctypes.windll.user32.GetForegroundWindow()) == self.identifier
+                return _windows_foreground_window() == self.identifier
         except Exception:
             return False
         return False
@@ -479,10 +569,11 @@ class PlatformBridge:
                 return str(app.localizedName() or "") if app else ""
             if sys.platform == "win32":
                 user32 = ctypes.windll.user32
-                hwnd = user32.GetForegroundWindow()
-                length = user32.GetWindowTextLengthW(hwnd)
+                hwnd = _windows_foreground_window()
+                handle = _windows_handle(hwnd)
+                length = user32.GetWindowTextLengthW(handle)
                 buffer = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buffer, len(buffer))
+                user32.GetWindowTextW(handle, buffer, len(buffer))
                 return buffer.value
         except Exception:
             LOGGER.debug("Current app name unavailable", exc_info=True)
@@ -500,12 +591,53 @@ class PlatformBridge:
                         "mac", int(app.processIdentifier()), str(app.localizedName() or "")
                     )
             elif sys.platform == "win32":
-                hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+                hwnd = _windows_foreground_window()
                 if hwnd:
                     return ForegroundTargetHandle("windows", hwnd, PlatformBridge.current_app_name())
         except Exception:
             LOGGER.exception("Could not capture foreground target")
         return None
+
+    @staticmethod
+    def is_windows() -> bool:
+        return sys.platform == "win32"
+
+    @staticmethod
+    def foreground_window_id() -> int | None:
+        if sys.platform != "win32":
+            return None
+        try:
+            return _windows_foreground_window() or None
+        except Exception:
+            LOGGER.debug("Could not read Windows foreground window", exc_info=True)
+            return None
+
+    @staticmethod
+    def request_window_activation(identifier: int) -> bool:
+        if sys.platform != "win32" or not identifier:
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            handle = _windows_handle(identifier)
+            user32.ShowWindow(handle, 5)  # SW_SHOW
+            user32.BringWindowToTop(handle)
+            user32.SetForegroundWindow(handle)
+            return _windows_foreground_window() == identifier
+        except Exception:
+            LOGGER.debug("Could not activate ClipSoon panel", exc_info=True)
+            return False
+
+    @staticmethod
+    def primary_button_down() -> bool:
+        if sys.platform != "win32":
+            return False
+        try:
+            # The high bit reports the current state; the low bit also catches a
+            # short click that began and ended between two panel-guard polls.
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8001)
+        except Exception:
+            LOGGER.debug("Could not read Windows primary button state", exc_info=True)
+            return False
 
     @staticmethod
     def configure_macos_accessory() -> None:
