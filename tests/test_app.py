@@ -41,6 +41,7 @@ def test_application_requests_verified_native_activation_after_show(qtbot, tmp_p
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)
     application.clipboard.start()
+    application.panel.keep_open(True)
     activation_requests: list[int] = []
     monkeypatch.setattr(PlatformBridge, "accessibility_permission_status", lambda: None)
     monkeypatch.setattr(
@@ -64,4 +65,5 @@ def test_application_requests_verified_native_activation_after_show(qtbot, tmp_p
     assert application._panel_guard.initial_foreground == 101
     assert application._panel_guard.saw_panel_foreground
     assert application._panel_watch_timer.isActive()
+    application.panel.keep_open(False)
     application.shutdown()

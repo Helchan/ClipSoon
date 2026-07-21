@@ -493,7 +493,12 @@ def test_selection_sender_copy_only_write_failure_and_inactive(qtbot) -> None:
 
 def test_platform_reveal_failure(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(system_module.sys, "platform", "darwin")
-    monkeypatch.setattr(system_module.os, "spawnlp", lambda *_args: (_ for _ in ()).throw(OSError("no")))
+    monkeypatch.setattr(
+        system_module.os,
+        "spawnlp",
+        lambda *_args: (_ for _ in ()).throw(OSError("no")),
+        raising=False,
+    )
     assert not PlatformBridge.reveal(tmp_path)
 
 
@@ -507,7 +512,12 @@ def test_macos_accessibility_status_prompt_and_settings_link(monkeypatch) -> Non
     )
     monkeypatch.setattr(system_module.sys, "platform", "darwin")
     monkeypatch.setitem(sys.modules, "ApplicationServices", services)
-    monkeypatch.setattr(system_module.os, "spawnlp", lambda *args: opened.append(args) or 1)
+    monkeypatch.setattr(
+        system_module.os,
+        "spawnlp",
+        lambda *args: opened.append(args) or 1,
+        raising=False,
+    )
 
     assert PlatformBridge.accessibility_permission_status() is True
     assert PlatformBridge.request_accessibility_permission()
