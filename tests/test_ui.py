@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPalette
-from PySide6.QtWidgets import QDialog, QFrame, QMenu, QStyleOptionViewItem
+from PySide6.QtWidgets import QDialog, QFrame, QLabel, QMenu, QStyleOptionViewItem
 
 import clipsoon.ui as ui_module
 from clipsoon import __version__
@@ -209,6 +209,32 @@ def test_styles_use_point_fonts_so_windows_styles_never_receive_negative_point_s
     for widget in (panel, panel.search, panel.list, panel.version_label):
         assert widget.font().pointSizeF() > 0
         assert widget.font().pixelSize() == -1
+
+
+def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    information_title = panel.findChild(QLabel, "informationTitle")
+    assert information_title is not None
+    assert panel.search.font().pointSizeF() == 16
+    assert all(button.font().pointSizeF() == 13 for button, _kind in panel._filter_buttons)
+    assert panel.list.font().pointSizeF() == 13
+    assert panel.text_preview.font().pointSizeF() == 13
+    assert panel.file_text_preview.font().pointSizeF() == 13
+    assert information_title.font().pointSizeF() == 13
+    assert panel.info_type_label.font().pointSizeF() == 13
+    assert panel.info_type_value.font().pointSizeF() == 13
+    assert panel.search_icon.size() == QSize(30, 30)
+    text_height = panel.search.fontMetrics().tightBoundingRect("Ag").height()
+    assert panel.search_box.height() == text_height * 2 + 4
+    search_margins = panel.search.parentWidget().layout().contentsMargins()
+    assert search_margins.top() == 0
+    assert search_margins.bottom() == 0
+    search_rule = "#search { background: transparent; border: none; font-size: 16pt; padding: 0 2px; }"
+    assert search_rule in _style_sheet(False)
 
 
 def test_windows_panel_avoids_drop_shadow_dirty_regions_outside_layered_window(
@@ -763,7 +789,7 @@ def test_copied_image_file_uses_detail_image_preview(qtbot, tmp_path: Path) -> N
     assert panel.info_type_value.text() == "文件"
     assert panel.info_detail_label.text() == "路径"
     assert panel.info_detail_value.text() == str(path)
-    assert panel.list.itemDelegate().sizeHint(QStyleOptionViewItem(), panel.model.index(0)).height() == 52
+    assert panel.list.itemDelegate().sizeHint(QStyleOptionViewItem(), panel.model.index(0)).height() == 44
 
 
 def test_large_image_decode_does_not_block_selection(qtbot, tmp_path: Path, monkeypatch) -> None:
@@ -814,14 +840,15 @@ def test_large_image_decode_does_not_block_selection(qtbot, tmp_path: Path, monk
 
 
 def test_list_item_content_has_equal_top_and_bottom_padding() -> None:
-    row = QRect(4, 1, 500, 50)
+    row = QRect(4, 1, 500, 42)
     content = ClipDelegate._thumbnail_rect(row)
 
+    assert content.size() == QSize(30, 30)
     assert content.top() - row.top() == row.bottom() - content.bottom()
 
 
 def test_file_icon_is_centered_inside_thumbnail() -> None:
-    thumbnail = QRect(12, 8, 36, 36)
+    thumbnail = QRect(12, 8, 30, 30)
     icon = ClipDelegate._centered_file_icon_rect(thumbnail)
 
     assert icon.left() - thumbnail.left() == thumbnail.right() - icon.right()
@@ -1007,7 +1034,7 @@ def test_filter_and_list_background_align_with_bordered_search(qtbot) -> None:
     search_right = search_box.mapTo(panel, QPoint(search_box.width(), 0)).x()
     detail_right = panel.detail.mapTo(panel, QPoint(panel.detail.width(), 0)).x()
     assert search_right == detail_right
-    assert search_icon is not None and search_icon.width() == 36
+    assert search_icon is not None and search_icon.width() == 30
 
 
 def test_clicking_search_icon_requests_settings(qtbot) -> None:

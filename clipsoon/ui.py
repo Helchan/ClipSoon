@@ -32,6 +32,7 @@ from PySide6.QtGui import (
     QColor,
     QCursor,
     QFont,
+    QFontMetrics,
     QIcon,
     QImage,
     QImageReader,
@@ -145,6 +146,8 @@ _TEXT_FILE_PREVIEW_BYTES = 4 * 1024
 _TEXT_FILE_PREVIEW_CHARS = 220
 _STATUS_TIMEOUT_MS = 4_000
 _THUMBNAIL_CACHE_BYTES = 32 * 1024 * 1024
+_LIST_ROW_HEIGHT = 44
+_LIST_THUMBNAIL_SIZE = 30
 _DETAIL_CACHE_BYTES = 64 * 1024 * 1024
 _DETAIL_CACHE_ENTRIES = 12
 _PREVIEW_SIZE_BUCKET = 64
@@ -183,7 +186,7 @@ class SearchIcon(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setFixedSize(36, 36)
+        self.setFixedSize(30, 30)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName("设置")
 
@@ -193,8 +196,8 @@ class SearchIcon(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(QColor("#6574FF"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(5, 4, 21, 21)
-        painter.drawLine(22, 22, 31, 31)
+        painter.drawEllipse(4, 3, 18, 18)
+        painter.drawLine(19, 19, 26, 26)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
@@ -439,7 +442,7 @@ class ClipDelegate(QStyledItemDelegate):
         return False
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
-        return QSize(option.rect.width(), 52)
+        return QSize(option.rect.width(), _LIST_ROW_HEIGHT)
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         item: ClipItem = index.data(ITEM_ROLE)
@@ -463,7 +466,7 @@ class ClipDelegate(QStyledItemDelegate):
         foreground = QColor("#FFFFFF") if selected else option.palette.color(QPalette.ColorRole.Text)
 
         title_font = QFont(option.font)
-        title_font.setWeight(QFont.Weight.DemiBold)
+        title_font.setWeight(QFont.Weight.Medium)
         painter.setFont(title_font)
         painter.setPen(foreground)
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter, _elide(painter, item.title, title_rect.width()))
@@ -475,14 +478,14 @@ class ClipDelegate(QStyledItemDelegate):
 
     @staticmethod
     def _thumbnail_rect(row_rect: QRect) -> QRect:
-        size = 36
+        size = _LIST_THUMBNAIL_SIZE
         top = row_rect.top() + (row_rect.height() - size) // 2
         return QRect(row_rect.left() + 8, top, size, size)
 
     def _paint_thumbnail(self, painter: QPainter, rect: QRect, item: ClipItem, selected: bool) -> None:
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(255, 255, 255, 28) if selected else QColor("#E9ECF5"))
-        painter.drawRoundedRect(rect, 11, 11)
+        painter.drawRoundedRect(rect, 9, 9)
         if item.kind is ClipKind.IMAGE:
             pixmap = self._image_thumbnail(item.image_path, rect.size() * 2)
             if not pixmap.isNull():
@@ -966,10 +969,10 @@ class ClipPanel(QWidget):
 
         search_row = QHBoxLayout()
         search_row.setContentsMargins(4, 0, 0, 0)
-        search_box = QFrame()
-        search_box.setObjectName("searchBox")
-        search_layout = QHBoxLayout(search_box)
-        search_layout.setContentsMargins(8, 3, 8, 3)
+        self.search_box = QFrame()
+        self.search_box.setObjectName("searchBox")
+        search_layout = QHBoxLayout(self.search_box)
+        search_layout.setContentsMargins(8, 0, 8, 0)
         search_layout.setSpacing(5)
         self.search_icon = SearchIcon()
         self.search_icon.clicked.connect(self.settings_requested.emit)
@@ -979,7 +982,7 @@ class ClipPanel(QWidget):
         self.search.setClearButtonEnabled(True)
         search_layout.addWidget(self.search_icon)
         search_layout.addWidget(self.search, 1)
-        search_row.addWidget(search_box, 1)
+        search_row.addWidget(self.search_box, 1)
         root.addLayout(search_row)
 
         filters = QHBoxLayout()
@@ -1036,12 +1039,14 @@ class ClipPanel(QWidget):
         detail_layout.setSpacing(6)
         self.preview_stack = QStackedWidget()
         self.text_preview = QPlainTextEdit()
+        self.text_preview.setObjectName("textPreview")
         self.text_preview.setReadOnly(True)
         self.text_preview.setFrameShape(QFrame.Shape.NoFrame)
         self.image_preview = ImagePreview()
         self.file_preview = QLabel()
         self.file_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.file_text_preview = TextFilePreview()
+        self.file_text_preview.setObjectName("fileTextPreview")
         self.file_text_preview.setReadOnly(True)
         self.file_text_preview.setFrameShape(QFrame.Shape.NoFrame)
         self.file_text_preview.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1058,7 +1063,7 @@ class ClipPanel(QWidget):
         information = QGridLayout()
         information.setContentsMargins(0, 0, 0, 0)
         information.setHorizontalSpacing(18)
-        information.setVerticalSpacing(8)
+        information.setVerticalSpacing(10)
         self.info_type_label = QLabel("类型")
         self.info_type_value = QLabel("—")
         self.info_type_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1340,6 +1345,17 @@ class ClipPanel(QWidget):
         if isinstance(delegate, ClipDelegate):
             delegate.set_dark_theme(dark)
         self.setStyleSheet(_style_sheet(dark))
+        self._sync_search_box_height()
+
+    def _sync_search_box_height(self) -> None:
+        """Keep each search-frame gap at half the visible search-text height."""
+        self.search.ensurePolished()
+        metrics = QFontMetrics(self.search.font())
+        text_height = metrics.tightBoundingRect("Ag").height() or metrics.height()
+        # The search frame has a 2 px border. Its content therefore reserves
+        # one text-height for the glyphs and one text-height for both half-height
+        # top and bottom gaps combined.
+        self.search_box.setFixedHeight(text_height * 2 + 4)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if event.type() != QEvent.Type.KeyPress:
@@ -1579,16 +1595,17 @@ def _style_sheet(dark: bool) -> str:
         QWidget {{ color: {text}; font-size: 10pt; }}
         #card {{ background: {bg}; border: 1px solid {border}; border-radius: 20px; }}
         #searchBox {{ background: transparent; border: 2px solid #6574FF; border-radius: 10px; }}
-        #search {{ background: transparent; border: none; font-size: 16pt; padding: 4px 2px; }}
+        #search {{ background: transparent; border: none; font-size: 16pt; padding: 0 2px; }}
         QToolButton {{ border: none; border-radius: 9px; padding: 7px 10px; background: transparent; }}
         QToolButton:hover {{ background: {input_bg}; }}
-        QToolButton[filterChip="true"] {{ color: {muted}; padding: 5px 12px; }}
+        QToolButton[filterChip="true"] {{ color: {muted}; font-size: 13pt; font-weight: 500; padding: 5px 12px; }}
         QToolButton[filterChip="true"]:checked {{ color: white; background: #5B6CFF; }}
-        #historyList {{ background: transparent; border: none; outline: none; }}
+        #historyList {{ background: transparent; border: none; outline: none; font-size: 13pt; }}
         #detail {{ background: {panel}; border: 1px solid {border}; border-radius: 15px; }}
-        #informationTitle {{ font-size: 11pt; font-weight: 650; padding-top: 6px; }}
-        #informationLabel {{ color: {muted}; font-size: 9pt; }}
-        #informationValue {{ font-size: 9pt; }}
+        #textPreview, #fileTextPreview {{ font-size: 13pt; padding: 11px; }}
+        #informationTitle {{ font-size: 13pt; font-weight: 650; padding-top: 6px; }}
+        #informationLabel {{ color: {muted}; font-size: 13pt; font-weight: 500; }}
+        #informationValue {{ font-size: 13pt; }}
         #muted {{ color: {muted}; font-size: 9pt; }}
         #muted a {{ color: #6574FF; text-decoration: none; }}
         #platformNote {{ background: {input_bg}; border: 1px solid {border}; border-radius: 10px; }}
