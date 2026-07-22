@@ -944,7 +944,13 @@ class ClipPanel(QWidget):
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        if sys.platform == "win32":
+            # A translucent frameless top-level takes Qt's layered-window path.
+            # Windows rejects any dirty rectangle that extends even slightly
+            # outside that backing store, leaving an invisible-but-visible panel.
+            self.setAutoFillBackground(True)
+        else:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
         self.setMinimumSize(720, 500)
         self.resize(900, 610)
@@ -1341,6 +1347,13 @@ class ClipPanel(QWidget):
             and QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
         )
         self._dark_theme = dark
+        if sys.platform == "win32":
+            palette = self.palette()
+            palette.setColor(
+                QPalette.ColorRole.Window,
+                QColor("#1C1D24" if dark else "#F9FAFD"),
+            )
+            self.setPalette(palette)
         delegate = self.list.itemDelegate()
         if isinstance(delegate, ClipDelegate):
             delegate.set_dark_theme(dark)

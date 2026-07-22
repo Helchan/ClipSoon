@@ -13,6 +13,7 @@ import clipsoon.system as system_module
 from clipsoon.core import AppSettings, ClipItem, ClipKind, HistoryRepository
 from clipsoon.system import (
     ClipboardController,
+    ForegroundTargetHandle,
     GlobalHotkeyService,
     HotkeyStateMachine,
     LaunchAtLoginManager,
@@ -385,6 +386,60 @@ def test_windows_panel_activation_uses_and_verifies_foreground_window(monkeypatc
     assert PlatformBridge.request_window_activation(202)
     assert PlatformBridge.foreground_window_id() == 202
     assert calls == [("show", 202), ("top", 202), ("foreground", 202)]
+
+
+def test_windows_target_activation_preserves_non_minimized_window_state(monkeypatch) -> None:
+    calls: list[tuple[str, int, int | None]] = []
+
+    def handle_value(value) -> int:
+        return int(value.value if hasattr(value, "value") else value)
+
+    user32 = types.SimpleNamespace(
+        IsWindow=lambda _handle: True,
+        IsIconic=lambda _handle: False,
+        ShowWindow=lambda handle, command: calls.append(("show", handle_value(handle), command)) or 1,
+        BringWindowToTop=lambda handle: calls.append(("top", handle_value(handle), None)) or 1,
+        SetForegroundWindow=lambda handle: calls.append(("foreground", handle_value(handle), None)) or 1,
+    )
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        system_module.ctypes,
+        "windll",
+        types.SimpleNamespace(user32=user32),
+        raising=False,
+    )
+
+    assert ForegroundTargetHandle("windows", 303, "Editor").activate()
+    assert calls == [("top", 303, None), ("foreground", 303, None)]
+
+
+def test_windows_target_activation_restores_minimized_window(monkeypatch) -> None:
+    calls: list[tuple[str, int, int | None]] = []
+
+    def handle_value(value) -> int:
+        return int(value.value if hasattr(value, "value") else value)
+
+    user32 = types.SimpleNamespace(
+        IsWindow=lambda _handle: True,
+        IsIconic=lambda _handle: True,
+        ShowWindow=lambda handle, command: calls.append(("show", handle_value(handle), command)) or 1,
+        BringWindowToTop=lambda handle: calls.append(("top", handle_value(handle), None)) or 1,
+        SetForegroundWindow=lambda handle: calls.append(("foreground", handle_value(handle), None)) or 1,
+    )
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        system_module.ctypes,
+        "windll",
+        types.SimpleNamespace(user32=user32),
+        raising=False,
+    )
+
+    assert ForegroundTargetHandle("windows", 303, "Editor").activate()
+    assert calls == [
+        ("show", 303, 9),
+        ("top", 303, None),
+        ("foreground", 303, None),
+    ]
 
 
 def test_windows_primary_button_detects_short_click_between_polls(monkeypatch) -> None:

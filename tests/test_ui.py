@@ -237,7 +237,7 @@ def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
     assert search_rule in _style_sheet(False)
 
 
-def test_windows_panel_avoids_drop_shadow_dirty_regions_outside_layered_window(
+def test_windows_panel_uses_opaque_backing_store_without_drop_shadow(
     qtbot, monkeypatch
 ) -> None:
     monkeypatch.setattr(ui_module.sys, "platform", "win32")
@@ -246,6 +246,8 @@ def test_windows_panel_avoids_drop_shadow_dirty_regions_outside_layered_window(
     qtbot.addWidget(panel)
 
     assert panel.card.graphicsEffect() is None
+    assert not panel.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert panel.autoFillBackground()
 
 
 def test_panel_defaults_to_first_item_each_time_it_is_shown(qtbot) -> None:

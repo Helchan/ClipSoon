@@ -444,7 +444,11 @@ class ForegroundTargetHandle:
                 handle = _windows_handle(self.identifier)
                 if not user32.IsWindow(handle):
                     return False
-                user32.ShowWindow(handle, 9)  # SW_RESTORE
+                # SW_RESTORE also unmaximizes a maximized window. Only use it
+                # for a genuinely minimized target so sending never changes the
+                # user's chosen normal/maximized window state.
+                if user32.IsIconic(handle):
+                    user32.ShowWindow(handle, 9)  # SW_RESTORE
                 user32.BringWindowToTop(handle)
                 return bool(user32.SetForegroundWindow(handle))
         except Exception:
