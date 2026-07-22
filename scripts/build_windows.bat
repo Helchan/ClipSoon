@@ -12,6 +12,6 @@ if not exist ".venv\Scripts\python.exe" (
   --onedir ^
   --name ClipSoon ^
   --collect-submodules pynput ^
-  clipsoon\app.py
+  clipsoon\launcher.py
 if errorlevel 1 exit /b %errorlevel%
 echo Built: %CD%\dist\ClipSoon\ClipSoon.exe

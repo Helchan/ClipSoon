@@ -24,6 +24,7 @@ from clipsoon.ui import (
     _hotkey_display,
     _hover_color,
     _parse_hotkey,
+    _platform_hotkey_validation_error,
     _ScaledImageLoader,
     _style_sheet,
 )
@@ -87,11 +88,21 @@ def test_settings_and_custom_hotkey_validation(qtbot) -> None:
         "Meta+Shift+V" if sys.platform == "darwin" else "Ctrl+Shift+V"
     )
     assert _parse_hotkey("V") == ""
+    expected_plus_ctrl = "meta" if sys.platform == "darwin" else "ctrl"
+    assert _parse_hotkey("Ctrl++") == f"combo:{expected_plus_ctrl}+plus"
+    assert _hotkey_display("combo:ctrl+plus").endswith("++")
     assert dialog.findChildren(QFrame, "settingsSection")
     assert dialog.findChild(QFrame, "settingsSection") is not None
     assert not hasattr(dialog, "version_label")
     dialog.hotkey_mode.setCurrentText("双击 Shift")
     assert dialog.values()["hotkey"] == "double:shift"
+
+
+def test_windows_rejects_custom_keys_not_supported_by_register_hotkey(monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+
+    assert _platform_hotkey_validation_error("combo:ctrl+print")
+    assert _platform_hotkey_validation_error("combo:ctrl+,") == ""
 
 
 def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:

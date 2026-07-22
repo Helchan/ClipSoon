@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def test_release_version_is_consistent() -> None:
     project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert __version__ == "0.9.7"
+    assert __version__ == "0.10.0"
     assert project["project"]["version"] == __version__
 
 
@@ -28,3 +28,4 @@ def test_tag_release_workflow_builds_requested_platforms() -> None:
     assert "ClipSoon-${{ github.ref_name }}-macOS-arm64.zip" in workflow
     assert "contents: write" in workflow
     assert "gh release create" in workflow
+    assert "scripts\\smoke_windows_helpers.py dist\\ClipSoon\\ClipSoon.exe" in workflow

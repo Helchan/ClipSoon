@@ -6,7 +6,7 @@ hiddenimports += collect_submodules('pynput')
 
 
 a = Analysis(
-    ['clipsoon/app.py'],
+    ['clipsoon/launcher.py'],
     pathex=[],
     binaries=[],
     datas=[],

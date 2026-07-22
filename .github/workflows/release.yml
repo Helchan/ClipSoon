@@ -86,6 +86,8 @@ jobs:
           if (-not (Test-Path "dist\ClipSoon\ClipSoon.exe")) {
             throw "dist\ClipSoon\ClipSoon.exe was not produced"
           }
+          .\.venv\Scripts\python.exe scripts\smoke_windows_helpers.py dist\ClipSoon\ClipSoon.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Archive Windows package
         shell: pwsh

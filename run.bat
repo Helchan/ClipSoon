@@ -17,8 +17,8 @@ taskkill /IM ClipSoon.exe /T >nul 2>&1
 
 echo 正在停止旧的 ClipSoon 源码实例...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$python = [Regex]::Escape('%PYTHON_BIN%');" ^
-  "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match $python -and $_.CommandLine -match '-m\s+clipsoon' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" ^
+  "$python = [Regex]::Escape('%PROJECT_DIR%.venv\Scripts\python');" ^
+  "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match ($python + 'w?\.exe') -and $_.CommandLine -match '-m\s+clipsoon' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" ^
   >nul 2>&1
 
 echo 正在从当前源码启动 ClipSoon（不会执行打包）...

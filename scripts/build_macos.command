@@ -25,7 +25,7 @@ cd "${PROJECT_DIR}"
   --collect-submodules pynput \
   --hidden-import AppKit \
   --hidden-import ApplicationServices \
-  clipsoon/app.py
+  clipsoon/launcher.py
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION}" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${BUILD_VERSION}" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist" 2>/dev/null || \
   /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_VERSION}" "${PROJECT_DIR}/dist/ClipSoon.app/Contents/Info.plist"

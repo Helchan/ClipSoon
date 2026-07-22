@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import plistlib
 import subprocess
 import sys
@@ -20,7 +21,30 @@ from clipsoon.system import (
     PlatformBridge,
     SelectionSender,
     _canonical_key,
+    _NativeClipboardStoreTask,
 )
+
+
+def test_windows_ipc_cleanup_preserves_only_live_helper_sessions(tmp_path: Path) -> None:
+    clipboard = FakeClipboard()
+    controller, repository = make_controller(tmp_path, clipboard)
+    controller._windows_ipc_dir.mkdir(parents=True, exist_ok=True)
+    live = "a" * 32
+    stale = "b" * 32
+    live_manifest = controller._windows_ipc_dir / f"manifest-{live}-7-test.json"
+    stale_manifest = controller._windows_ipc_dir / f"manifest-{stale}-8-test.json"
+    stale_payload = controller._windows_ipc_dir / f".clip-{stale}-8-test.tmp"
+    legacy = controller._windows_ipc_dir / "manifest-8-legacy.json"
+    for path in (live_manifest, stale_manifest, stale_payload, legacy):
+        path.write_text("x", encoding="utf-8")
+
+    controller._cleanup_windows_ipc_orphans({live})
+
+    assert live_manifest.exists()
+    assert not stale_manifest.exists()
+    assert not stale_payload.exists()
+    assert not legacy.exists()
+    repository.close()
 
 
 class FakeClipboard(QObject):
@@ -60,6 +84,44 @@ class FlakyClipboard(FakeClipboard):
         if self.read_attempts <= self.failures:
             raise RuntimeError("clipboard busy")
         return self.mime
+
+
+class CallbackSignal:
+    def __init__(self) -> None:
+        self.callbacks: list = []
+
+    def connect(self, callback) -> None:
+        self.callbacks.append(callback)
+
+    def emit(self, *arguments) -> None:
+        for callback in tuple(self.callbacks):
+            callback(*arguments)
+
+
+class FakeWorkerSupervisor:
+    instances: list[FakeWorkerSupervisor] = []
+
+    def __init__(self, role, arguments) -> None:
+        self.role, self.arguments = role, arguments
+        self.message = CallbackSignal()
+        self.failed = CallbackSignal()
+        self.is_healthy = False
+        self.session_id = ""
+        self.started = 0
+        self.stopped = 0
+        self.restarted = 0
+        self.instances.append(self)
+
+    def start(self) -> None:
+        self.started += 1
+        self.is_healthy = True
+
+    def stop(self) -> None:
+        self.stopped += 1
+        self.is_healthy = False
+
+    def restart(self) -> None:
+        self.restarted += 1
 
 
 def test_double_modifier_state_machine_contract() -> None:
@@ -102,6 +164,19 @@ def test_combo_state_machine_triggers_once_per_chord() -> None:
     machine.configure("double:shift", 300)
     machine.press("shift", 2)
     machine.release("shift", 2.01)
+
+
+def test_hotkey_state_machine_recovers_from_a_missing_non_modifier_release() -> None:
+    hits: list[str] = []
+    machine = HotkeyStateMachine("double:ctrl", 420, lambda: hits.append("hit"))
+    machine.press("c", 0.0)
+
+    machine.press("ctrl", 1.1)
+    machine.release("ctrl", 1.15)
+    machine.press("ctrl", 1.3)
+    machine.release("ctrl", 1.35)
+
+    assert hits == ["hit"]
 
 
 def make_controller(tmp_path: Path, clipboard: FakeClipboard) -> tuple[ClipboardController, HistoryRepository]:
@@ -157,6 +232,122 @@ def test_async_image_capture(qtbot, tmp_path: Path) -> None:
     assert (captured[0].width, captured[0].height) == (3, 2)
     assert QImage(captured[0].image_path).pixelColor(0, 0).alpha() == 136
     controller.stop()
+    repository.close()
+
+
+def test_native_windows_manifest_task_stores_text_and_removes_ipc_file(tmp_path: Path) -> None:
+    repository = HistoryRepository(tmp_path)
+    ipc_dir = tmp_path / "ipc"
+    ipc_dir.mkdir()
+    manifest = {
+        "protocol": 1,
+        "sequence": 17,
+        "kind": "text",
+        "source_app": "Editor",
+        "text": "isolated clipboard text",
+    }
+    manifest_path = ipc_dir / "manifest-17-test.json"
+    encoded = json.dumps(manifest).encode()
+    manifest_path.write_bytes(encoded)
+    stored: list[tuple[ClipItem, int]] = []
+    task = _NativeClipboardStoreTask(
+        repository,
+        ipc_dir,
+        manifest_path.name,
+        len(encoded),
+        17,
+        "text",
+        AppSettings(),
+        store=True,
+    )
+    task.signals.stored.connect(lambda item, sequence: stored.append((item, sequence)))
+
+    task.run()
+
+    assert stored[0][0].text == "isolated clipboard text"
+    assert stored[0][0].source_app == "Editor"
+    assert stored[0][1] == 17
+    assert not manifest_path.exists()
+    repository.close()
+
+
+def test_native_windows_manifest_task_discards_stale_capture_epoch(tmp_path: Path) -> None:
+    repository = HistoryRepository(tmp_path)
+    ipc_dir = tmp_path / "ipc"
+    ipc_dir.mkdir()
+    manifest = {
+        "protocol": 1,
+        "sequence": 19,
+        "kind": "text",
+        "source_app": "Editor",
+        "text": "must not return after clear",
+    }
+    manifest_path = ipc_dir / "manifest-19-test.json"
+    encoded = json.dumps(manifest).encode()
+    manifest_path.write_bytes(encoded)
+    consumed: list[int] = []
+    task = _NativeClipboardStoreTask(
+        repository,
+        ipc_dir,
+        manifest_path.name,
+        len(encoded),
+        19,
+        "text",
+        AppSettings(),
+        store=True,
+        store_guard=lambda: False,
+    )
+    task.signals.consumed.connect(consumed.append)
+
+    task.run()
+
+    assert consumed == [19]
+    assert repository.list_items() == []
+    assert not manifest_path.exists()
+    repository.close()
+
+
+def test_native_windows_manifest_task_converts_image_and_cleans_payload(tmp_path: Path) -> None:
+    repository = HistoryRepository(tmp_path)
+    ipc_dir = tmp_path / "ipc"
+    ipc_dir.mkdir()
+    image = QImage(3, 2, QImage.Format.Format_ARGB32)
+    image.fill(0xFF336699)
+    payload_path = ipc_dir / "clip-18-test.png"
+    assert image.save(str(payload_path), "PNG")
+    manifest = {
+        "protocol": 1,
+        "sequence": 18,
+        "kind": "image",
+        "source_app": "Capture",
+        "payload_file": payload_path.name,
+        "encoding": "png",
+        "bytes": payload_path.stat().st_size,
+        "width": 3,
+        "height": 2,
+    }
+    manifest_path = ipc_dir / "manifest-18-test.json"
+    encoded = json.dumps(manifest).encode()
+    manifest_path.write_bytes(encoded)
+    stored: list[ClipItem] = []
+    task = _NativeClipboardStoreTask(
+        repository,
+        ipc_dir,
+        manifest_path.name,
+        len(encoded),
+        18,
+        "image",
+        AppSettings(),
+        store=True,
+    )
+    task.signals.stored.connect(lambda item, _sequence: stored.append(item))
+
+    task.run()
+
+    assert stored[0].kind is ClipKind.IMAGE
+    assert (stored[0].width, stored[0].height) == (3, 2)
+    assert not manifest_path.exists()
+    assert not payload_path.exists()
     repository.close()
 
 
@@ -348,6 +539,71 @@ def test_hotkey_service_detects_listener_that_stopped_after_start(monkeypatch) -
 
     assert not service.is_running
     service.stop()
+
+
+def test_hotkey_service_detects_listener_thread_that_died_with_running_flag(monkeypatch) -> None:
+    class FakeListener:
+        running = True
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.running = False
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pynput",
+        types.SimpleNamespace(keyboard=types.SimpleNamespace(Listener=FakeListener)),
+    )
+    service = GlobalHotkeyService(lambda: None, lambda _message: None)
+    service.start(AppSettings())
+
+    assert not service.is_running
+    service.stop()
+
+
+def test_windows_services_use_supervised_native_workers(monkeypatch, tmp_path: Path) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    hits: list[str] = []
+    hotkey = GlobalHotkeyService(lambda: hits.append("hit"), hits.append)
+
+    hotkey.start(AppSettings(hotkey="double:shift", double_tap_interval_ms=360))
+
+    hotkey_worker = FakeWorkerSupervisor.instances[-1]
+    assert hotkey_worker.role == "hotkey"
+    assert hotkey_worker.arguments() == ["--hotkey", "double:shift", "--interval-ms", "360"]
+    hotkey_worker.message.emit({"type": "hotkey"})
+    assert hits == ["hit"]
+    assert hotkey.is_running
+
+    monkeypatch.setattr(ClipboardController, "_sequence_number", lambda _self: 77)
+    clipboard = FakeClipboard()
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(clipboard, repository, AppSettings, lambda: "ignored")
+    controller.start()
+
+    clipboard_worker = FakeWorkerSupervisor.instances[-1]
+    assert clipboard_worker.role == "clipboard"
+    assert clipboard_worker.arguments() == [
+        "--ipc-dir",
+        str(tmp_path / "ipc"),
+        "--after-sequence",
+        "77",
+    ]
+    controller.stop()
+    hotkey.stop()
+    assert clipboard_worker.stopped == 1
+    assert hotkey_worker.stopped == 1
+    repository.close()
 
 
 def test_windows_panel_activation_uses_and_verifies_foreground_window(monkeypatch) -> None:

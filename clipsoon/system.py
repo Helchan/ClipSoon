@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import plistlib
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,11 +21,27 @@ from PySide6.QtCore import QBuffer, QIODevice, QMimeData, QObject, QRunnable, QT
 from PySide6.QtGui import QClipboard, QImage
 
 from clipsoon.core import AppSettings, ClipItem, ClipKind, HistoryRepository
+from clipsoon.windows_workers import WindowsWorkerSupervisor
 
 LOGGER = logging.getLogger(__name__)
 _MODIFIERS = {"ctrl", "shift", "alt", "meta"}
 _CLIPBOARD_SETTLE_MS = 70
 _CLIPBOARD_RETRY_DELAYS_MS = (90, 180)
+_WINDOWS_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
+_WINDOWS_IMAGE_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _windows_ipc_session(name: str) -> str | None:
+    value = name.removeprefix(".")
+    if not value.startswith(("manifest-", "clip-")):
+        return None
+    parts = value.split("-", 2)
+    if len(parts) < 3:
+        return None
+    session_id = parts[1].casefold()
+    if len(session_id) != 32 or any(character not in "0123456789abcdef" for character in session_id):
+        return None
+    return session_id
 
 
 def _windows_handle(identifier: int):
@@ -58,6 +77,7 @@ class HotkeyStateMachine:
         self.spec = spec
         self.interval = max(0.18, min(0.9, interval_ms / 1_000))
         self._pressed: set[str] = set()
+        self._pressed_at: dict[str, float] = {}
         self._press_started: float | None = None
         self._last_tap: float | None = None
         self._chorded = False
@@ -71,6 +91,7 @@ class HotkeyStateMachine:
 
     def press(self, key: str, at: float | None = None) -> None:
         key, at = _canonical_key(key), self._clock() if at is None else at
+        self._prune_stale_keys(at)
         if not key or key in self._pressed:  # ignore OS auto-repeat
             return
         if self._target:
@@ -82,6 +103,7 @@ class HotkeyStateMachine:
                     self._chorded = True
                 self._last_tap = None
         self._pressed.add(key)
+        self._pressed_at[key] = at
         if self._combo and not self._combo_latched and self._combo <= self._pressed:
             self._combo_latched = True
             self._callback()
@@ -103,6 +125,22 @@ class HotkeyStateMachine:
             self._press_started = None
             self._chorded = False
         self._pressed.discard(key)
+        self._pressed_at.pop(key, None)
+        if self._combo_latched and not self._combo <= self._pressed:
+            self._combo_latched = False
+
+    def _prune_stale_keys(self, at: float) -> None:
+        stale_after = max(1.0, self.interval * 2)
+        stale = {key for key, pressed_at in self._pressed_at.items() if at - pressed_at > stale_after}
+        if not stale:
+            return
+        self._pressed.difference_update(stale)
+        for key in stale:
+            self._pressed_at.pop(key, None)
+        if self._target in stale:
+            self._press_started = None
+            self._chorded = False
+            self._last_tap = None
         if self._combo_latched and not self._combo <= self._pressed:
             self._combo_latched = False
 
@@ -117,9 +155,25 @@ class GlobalHotkeyService:
         self._failed = failed
         self._listener = None
         self._machine: HotkeyStateMachine | None = None
+        self._windows_worker: WindowsWorkerSupervisor | None = None
 
     def start(self, settings: AppSettings) -> None:
         self.stop()
+        if sys.platform == "win32":
+            worker = WindowsWorkerSupervisor(
+                "hotkey",
+                lambda: [
+                    "--hotkey",
+                    settings.hotkey,
+                    "--interval-ms",
+                    str(settings.double_tap_interval_ms),
+                ],
+            )
+            worker.message.connect(self._on_windows_message)
+            worker.failed.connect(self._failed)
+            self._windows_worker = worker
+            worker.start()
+            return
         self._machine = HotkeyStateMachine(
             settings.hotkey, settings.double_tap_interval_ms, self._activated
         )
@@ -136,19 +190,32 @@ class GlobalHotkeyService:
             self._failed(f"全局快捷键不可用：{exc}")
 
     def stop(self) -> None:
+        if self._windows_worker is not None:
+            self._windows_worker.stop()
+            self._windows_worker = None
         if self._listener is not None:
             try:
                 self._listener.stop()
             except Exception:
                 LOGGER.debug("Hotkey listener stop failed", exc_info=True)
         self._listener = None
+        self._machine = None
 
     @property
     def is_running(self) -> bool:
+        if self._windows_worker is not None:
+            return self._windows_worker.is_healthy
         if self._listener is None:
             return False
         running = getattr(self._listener, "running", None)
-        return True if running is None else bool(running)
+        if running is not None and not running:
+            return False
+        is_alive = getattr(self._listener, "is_alive", None)
+        return not callable(is_alive) or bool(is_alive())
+
+    def _on_windows_message(self, message: object) -> None:
+        if isinstance(message, dict) and message.get("type") == "hotkey":
+            self._activated()
 
     def _on_press(self, key: object) -> None:
         if self._machine is not None:
@@ -162,6 +229,12 @@ class GlobalHotkeyService:
 class _WorkerSignals(QObject):
     stored = Signal(object)
     failed = Signal(str)
+
+
+class _NativeClipboardSignals(QObject):
+    stored = Signal(object, int)
+    consumed = Signal(int)
+    failed = Signal(str, int)
 
 
 class _ImageStoreTask(QRunnable):
@@ -195,6 +268,137 @@ class _ImageStoreTask(QRunnable):
             self.signals.failed.emit(f"图片记录失败：{exc}")
 
 
+class _NativeClipboardStoreTask(QRunnable):
+    """Validate and persist one manifest without touching the GUI thread."""
+
+    def __init__(
+        self,
+        repository: HistoryRepository,
+        ipc_dir: Path,
+        manifest_name: str,
+        manifest_bytes: int,
+        sequence: int,
+        expected_kind: str,
+        settings: AppSettings,
+        *,
+        store: bool,
+        cleanup_on_failure: bool = False,
+        store_guard: Callable[[], bool] | None = None,
+        store_lock: object | None = None,
+    ) -> None:
+        super().__init__()
+        self.repository = repository
+        self.ipc_dir = ipc_dir.resolve()
+        self.manifest_name = manifest_name
+        self.manifest_bytes = manifest_bytes
+        self.sequence = sequence
+        self.expected_kind = expected_kind
+        self.settings = settings
+        self.store = store
+        self.cleanup_on_failure = cleanup_on_failure
+        self.store_guard = store_guard or (lambda: True)
+        self.store_lock = store_lock
+        self.signals = _NativeClipboardSignals()
+
+    def run(self) -> None:
+        cleanup: list[Path] = []
+        succeeded = False
+        try:
+            manifest_path = self._ipc_file(self.manifest_name, ".json")
+            cleanup.append(manifest_path)
+            size = manifest_path.stat().st_size
+            if not 0 < size <= _WINDOWS_MANIFEST_MAX_BYTES or size != self.manifest_bytes:
+                raise ValueError("剪贴板清单大小不合法")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("剪贴板清单格式不合法")
+            if manifest.get("protocol") != 1 or manifest.get("sequence") != self.sequence:
+                raise ValueError("剪贴板清单序号不匹配")
+            kind = manifest.get("kind")
+            if kind != self.expected_kind:
+                raise ValueError("剪贴板清单类型不匹配")
+            source = str(manifest.get("source_app") or "")
+            payload_path: Path | None = None
+            if kind == "image":
+                payload_path = self._ipc_file(str(manifest.get("payload_file") or ""), (".png", ".bmp"))
+                cleanup.append(payload_path)
+            if not self.store or kind in {"ignored", "unsupported"} or not self.store_guard():
+                succeeded = True
+                self.signals.consumed.emit(self.sequence)
+                return
+            if kind == "text":
+                text = manifest.get("text")
+                if not isinstance(text, str) or not text:
+                    raise ValueError("剪贴板文本为空")
+                prepared: object = text
+            elif kind == "files":
+                files = manifest.get("files")
+                if not isinstance(files, list) or not files or not all(isinstance(path, str) for path in files):
+                    raise ValueError("剪贴板文件列表不合法")
+                prepared = files
+            elif kind == "image" and payload_path is not None:
+                prepared = self._decode_image(payload_path, manifest)
+            else:
+                raise ValueError(f"不支持的剪贴板清单类型：{kind}")
+            lock_context = nullcontext() if self.store_lock is None else self.store_lock
+            with lock_context:  # type: ignore[attr-defined]
+                if not self.store_guard():
+                    succeeded = True
+                    self.signals.consumed.emit(self.sequence)
+                    return
+                if kind == "text":
+                    item = self.repository.add_text(str(prepared), source)
+                elif kind == "files":
+                    item = self.repository.add_files(prepared, source)  # type: ignore[arg-type]
+                else:
+                    png, width, height = prepared  # type: ignore[misc]
+                    item = self.repository.add_image(png, width, height, source)
+                self.repository.cleanup(self.settings.max_history_items, self.settings.retention_days)
+            succeeded = True
+            self.signals.stored.emit(item, self.sequence)
+        except Exception as exc:
+            LOGGER.exception("Windows clipboard manifest persistence failed")
+            self.signals.failed.emit(f"剪贴板记录失败：{exc}", self.sequence)
+        finally:
+            if succeeded or self.cleanup_on_failure:
+                for path in cleanup:
+                    with suppress(OSError):
+                        path.unlink()
+
+    def _decode_image(self, payload_path: Path, manifest: dict[object, object]) -> tuple[bytes, int, int]:
+        size = payload_path.stat().st_size
+        expected_size = manifest.get("bytes")
+        if (
+            not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or not 0 < size <= _WINDOWS_IMAGE_MAX_BYTES
+            or size != expected_size
+        ):
+            raise ValueError("剪贴板图片大小不合法")
+        image = QImage.fromData(payload_path.read_bytes())
+        if image.isNull():
+            raise ValueError("剪贴板图片无法解码")
+        claimed_width, claimed_height = manifest.get("width"), manifest.get("height")
+        if (image.width(), image.height()) != (claimed_width, claimed_height):
+            raise ValueError("剪贴板图片尺寸不匹配")
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not image.save(buffer, "PNG"):
+            raise ValueError("剪贴板图片无法转换为 PNG")
+        return bytes(buffer.data()), image.width(), image.height()
+
+    def _ipc_file(self, name: str, suffix: str | tuple[str, ...]) -> Path:
+        if not name or Path(name).name != name or not name.endswith(suffix):
+            raise ValueError("剪贴板临时文件名不合法")
+        unresolved = self.ipc_dir / name
+        if unresolved.is_symlink():
+            raise ValueError("剪贴板临时文件路径不合法")
+        path = unresolved.resolve()
+        if path.parent != self.ipc_dir or not path.is_file():
+            raise ValueError("剪贴板临时文件路径不合法")
+        return path
+
+
 class ClipboardController(QObject):
     captured = Signal(object)
     failed = Signal(str)
@@ -218,10 +422,19 @@ class ClipboardController(QObject):
         self.clipboard, self.repository = clipboard, repository
         self._settings, self._source_app = settings, source_app
         self._thread_pool = QThreadPool.globalInstance()
-        self._active_tasks: set[_ImageStoreTask] = set()
+        self._active_tasks: set[QRunnable] = set()
         self._self_write = False
         self._suppressed_sequence: int | None = None
         self._last_sequence = self._sequence_number()
+        self._windows_worker: WindowsWorkerSupervisor | None = None
+        self._windows_ipc_dir = repository.data_dir / "ipc"
+        self._windows_accepted_sequence = self._last_sequence
+        self._windows_inflight_sequences: set[int] = set()
+        self._windows_capture_lock = threading.RLock()
+        self._windows_capture_epoch = 0
+        self._windows_manifest_queue: deque[tuple[int, dict[object, object]]] = deque()
+        self._windows_manifest_task: _NativeClipboardStoreTask | None = None
+        self._windows_capture_failures: dict[int, int] = {}
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(220)
         self._poll_timer.timeout.connect(self._poll_native_sequence)
@@ -234,6 +447,9 @@ class ClipboardController(QObject):
         self._last_capture_error: Exception | None = None
 
     def start(self) -> None:
+        if sys.platform == "win32":
+            self._start_windows_worker()
+            return
         self.clipboard.dataChanged.connect(self._clipboard_changed)
         # macOS does not emit reliable background QClipboard change events.
         # changeCount polling is a single integer read and stays below 0.02% CPU.
@@ -241,10 +457,16 @@ class ClipboardController(QObject):
             self._poll_timer.start()
 
     def stop(self) -> None:
+        native_windows = sys.platform == "win32"
+        if self._windows_worker is not None:
+            self._windows_worker.stop()
+            self._windows_worker = None
         self._poll_timer.stop()
         self._capture_timer.stop()
         self._pending_sequence = None
         self._pending_source = ""
+        if native_windows:
+            return
         with suppress(RuntimeError, TypeError):
             self.clipboard.dataChanged.disconnect(self._clipboard_changed)
 
@@ -253,6 +475,15 @@ class ClipboardController(QObject):
         self._capture_timer.stop()
         self._pending_sequence = None
         self._pending_source = ""
+        if sys.platform == "win32":
+            with self._windows_capture_lock:
+                self._windows_capture_epoch += 1
+                self._last_sequence = self._sequence_number()
+                self._suppressed_sequence = self._last_sequence
+                self._windows_accepted_sequence = self._last_sequence
+            if self._windows_worker is not None:
+                self._windows_worker.restart()
+            return
         self._last_sequence = self._sequence_number()
         self._suppressed_sequence = self._last_sequence
 
@@ -374,6 +605,222 @@ class ClipboardController(QObject):
     def _image_failed(self, task: _ImageStoreTask, message: str) -> None:
         self._active_tasks.discard(task)
         self.failed.emit(message)
+
+    def _start_windows_worker(self) -> None:
+        if self._windows_worker is not None:
+            return
+        self._windows_ipc_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_windows_ipc_orphans()
+        worker = WindowsWorkerSupervisor("clipboard", self._windows_worker_arguments)
+        worker.message.connect(self._on_windows_worker_message)
+        worker.failed.connect(self.failed.emit)
+        self._windows_worker = worker
+        worker.start()
+
+    def _windows_worker_arguments(self) -> list[str]:
+        self._cleanup_windows_ipc_orphans(self._live_windows_ipc_sessions())
+        arguments = ["--ipc-dir", str(self._windows_ipc_dir)]
+        if self._windows_accepted_sequence is not None:
+            arguments.extend(("--after-sequence", str(self._windows_accepted_sequence)))
+        return arguments
+
+    def _on_windows_worker_message(self, raw_message: object) -> None:
+        if not isinstance(raw_message, dict):
+            return
+        kind = raw_message.get("type")
+        if kind == "clipboard":
+            self._queue_windows_manifest(raw_message)
+        elif kind == "error" and not raw_message.get("retrying") and not raw_message.get("fatal"):
+            self._retry_windows_capture(raw_message)
+
+    def _queue_windows_manifest(self, message: dict[object, object]) -> None:
+        sequence = message.get("sequence")
+        manifest_name = message.get("manifest")
+        manifest_bytes = message.get("manifest_bytes")
+        kind = message.get("kind")
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence < 0
+            or not isinstance(manifest_name, str)
+            or not isinstance(manifest_bytes, int)
+            or isinstance(manifest_bytes, bool)
+            or not isinstance(kind, str)
+        ):
+            self.failed.emit("剪贴板宿主返回了无效数据")
+            return
+        if sequence in self._windows_inflight_sequences:
+            self._discard_duplicate_windows_manifest(message)
+            return
+        self._last_sequence = sequence
+        self._windows_inflight_sequences.add(sequence)
+        self._windows_manifest_queue.append((self._windows_capture_epoch, message))
+        self._start_next_windows_manifest()
+
+    def _start_next_windows_manifest(self) -> None:
+        if self._windows_manifest_task is not None or not self._windows_manifest_queue:
+            return
+        epoch, message = self._windows_manifest_queue.popleft()
+        sequence = int(message["sequence"])
+        store = self._settings().capture_enabled and sequence != self._suppressed_sequence
+        if sequence == self._suppressed_sequence:
+            self._suppressed_sequence = None
+        prior_failures = self._windows_capture_failures.get(sequence, 0)
+        task = _NativeClipboardStoreTask(
+            self.repository,
+            self._windows_ipc_dir,
+            str(message["manifest"]),
+            int(message["manifest_bytes"]),
+            sequence,
+            str(message["kind"]),
+            self._settings(),
+            store=store,
+            cleanup_on_failure=prior_failures >= 2,
+            store_guard=lambda epoch=epoch: epoch == self._windows_capture_epoch,
+            store_lock=self._windows_capture_lock,
+        )
+        self._windows_manifest_task = task
+        self._active_tasks.add(task)
+        task.signals.stored.connect(
+            lambda item, value, task=task, epoch=epoch: self._windows_item_stored(task, item, value, epoch)
+        )
+        task.signals.consumed.connect(
+            lambda value, task=task, epoch=epoch: self._windows_manifest_consumed(task, value, epoch)
+        )
+        task.signals.failed.connect(
+            lambda text, value, task=task, message=message, epoch=epoch: self._windows_manifest_failed(
+                task, message, text, value, epoch
+            )
+        )
+        self._thread_pool.start(task)
+
+    def _discard_duplicate_windows_manifest(self, message: dict[object, object]) -> None:
+        task = _NativeClipboardStoreTask(
+            self.repository,
+            self._windows_ipc_dir,
+            str(message["manifest"]),
+            int(message["manifest_bytes"]),
+            int(message["sequence"]),
+            str(message["kind"]),
+            self._settings(),
+            store=False,
+            cleanup_on_failure=True,
+        )
+        self._active_tasks.add(task)
+        task.signals.consumed.connect(lambda _value, task=task: self._active_tasks.discard(task))
+        task.signals.failed.connect(lambda _text, _value, task=task: self._active_tasks.discard(task))
+        self._thread_pool.start(task)
+
+    def _windows_item_stored(
+        self,
+        task: _NativeClipboardStoreTask,
+        item: ClipItem,
+        sequence: int,
+        epoch: int,
+    ) -> None:
+        current = self._finish_windows_task(task, sequence, epoch)
+        if current:
+            self.captured.emit(item)
+
+    def _windows_manifest_consumed(
+        self,
+        task: _NativeClipboardStoreTask,
+        sequence: int,
+        epoch: int,
+    ) -> None:
+        self._finish_windows_task(task, sequence, epoch)
+
+    def _windows_manifest_failed(
+        self,
+        task: _NativeClipboardStoreTask,
+        manifest: dict[object, object],
+        message: str,
+        sequence: int,
+        epoch: int,
+    ) -> None:
+        self._remove_windows_task(task, sequence)
+        if epoch != self._windows_capture_epoch:
+            self._discard_duplicate_windows_manifest(manifest)
+            QTimer.singleShot(0, self._start_next_windows_manifest)
+            return
+        attempts = self._windows_capture_failures.get(sequence, 0) + 1
+        self._windows_capture_failures[sequence] = attempts
+        if attempts < 3:
+            self._windows_inflight_sequences.add(sequence)
+            self._windows_manifest_queue.appendleft((epoch, manifest))
+            QTimer.singleShot(50, self._start_next_windows_manifest)
+            return
+        self._windows_capture_failures.pop(sequence, None)
+        self._windows_accepted_sequence = sequence
+        self.failed.emit(message)
+        QTimer.singleShot(0, self._start_next_windows_manifest)
+
+    def _finish_windows_task(self, task: _NativeClipboardStoreTask, sequence: int, epoch: int) -> bool:
+        self._remove_windows_task(task, sequence)
+        if epoch != self._windows_capture_epoch:
+            QTimer.singleShot(0, self._start_next_windows_manifest)
+            return False
+        self._windows_capture_failures.pop(sequence, None)
+        self._windows_accepted_sequence = sequence
+        QTimer.singleShot(0, self._start_next_windows_manifest)
+        return True
+
+    def _remove_windows_task(self, task: _NativeClipboardStoreTask, sequence: int) -> None:
+        self._active_tasks.discard(task)
+        if self._windows_manifest_task is task:
+            self._windows_manifest_task = None
+        self._windows_inflight_sequences.discard(sequence)
+
+    def _retry_windows_capture(self, message: dict[object, object]) -> None:
+        sequence = message.get("sequence")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+            return
+        self._restart_or_abandon_windows_sequence(
+            sequence,
+            f"剪贴板记录失败：{message.get('message') or '无法读取当前内容'}",
+        )
+
+    def _restart_or_abandon_windows_sequence(self, sequence: int, message: str) -> None:
+        attempts = self._windows_capture_failures.get(sequence, 0) + 1
+        self._windows_capture_failures[sequence] = attempts
+        if attempts <= 3 and self._windows_worker is not None:
+            LOGGER.warning("Restarting Windows clipboard helper after capture failure for sequence %d", sequence)
+            self._windows_worker.restart()
+            return
+        self._windows_accepted_sequence = sequence
+        self._windows_capture_failures.pop(sequence, None)
+        self.failed.emit(message)
+
+    def _live_windows_ipc_sessions(self) -> set[str]:
+        sessions: set[str] = set()
+        if self._windows_worker is not None and self._windows_worker.session_id:
+            sessions.add(self._windows_worker.session_id)
+        for _epoch, message in self._windows_manifest_queue:
+            session_id = _windows_ipc_session(str(message.get("manifest") or ""))
+            if session_id is not None:
+                sessions.add(session_id)
+        for task in self._active_tasks:
+            if not isinstance(task, _NativeClipboardStoreTask):
+                continue
+            session_id = _windows_ipc_session(task.manifest_name)
+            if session_id is not None:
+                sessions.add(session_id)
+        return sessions
+
+    def _cleanup_windows_ipc_orphans(self, preserve_sessions: set[str] | None = None) -> None:
+        preserved = preserve_sessions or set()
+        try:
+            entries = tuple(self._windows_ipc_dir.iterdir())
+        except OSError:
+            return
+        for path in entries:
+            if path.is_symlink() or not path.is_file():
+                continue
+            if path.name.startswith(("manifest-", "clip-", ".manifest-", ".clip-")):
+                if _windows_ipc_session(path.name) in preserved:
+                    continue
+                with suppress(OSError):
+                    path.unlink()
 
     def write_item(self, item: ClipItem) -> bool:
         mime = QMimeData()

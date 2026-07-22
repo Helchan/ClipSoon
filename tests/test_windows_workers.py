@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+import sys
+
+from clipsoon.windows_workers import (
+    _PERMANENT_FATAL_CODES,
+    WindowsWorkerSupervisor,
+    WorkerProtocolCursor,
+    WorkerWatchdog,
+    windows_worker_command,
+)
+
+
+def test_windows_worker_command_handles_source_and_frozen_modes(monkeypatch) -> None:
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(sys, "executable", "/python")
+
+    assert windows_worker_command("hotkey", ("--spec", "double:ctrl")) == (
+        "/python",
+        ["-u", "-m", "clipsoon", "--windows-helper=hotkey", "--spec", "double:ctrl"],
+    )
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert windows_worker_command("clipboard", ("--payload-dir", "C:/clips")) == (
+        "/python",
+        ["--windows-helper=clipboard", "--payload-dir", "C:/clips"],
+    )
+
+
+def test_worker_protocol_rejects_wrong_role_session_and_duplicate_events() -> None:
+    cursor = WorkerProtocolCursor("hotkey")
+    first = {
+        "protocol": 1,
+        "role": "hotkey",
+        "session_id": "one",
+        "event_id": 0,
+    }
+
+    cursor.reset("one")
+    assert not cursor.accept({**first, "type": "heartbeat"})
+    assert cursor.accept({**first, "type": "ready"})
+    assert not cursor.accept(first)
+    assert not cursor.accept({**first, "event_id": 1, "session_id": "two"})
+    assert not cursor.accept({**first, "event_id": 1, "role": "clipboard"})
+    assert not cursor.accept({**first, "event_id": 1, "protocol": 2})
+    assert cursor.accept({**first, "event_id": 2})
+
+    cursor.reset("two")
+    assert cursor.accept({**first, "session_id": "two", "type": "ready"})
+
+    cursor.reset("fatal")
+    assert cursor.accept(
+        {
+            **first,
+            "session_id": "fatal",
+            "type": "error",
+            "fatal": True,
+        }
+    )
+
+
+def test_worker_watchdog_distinguishes_startup_and_heartbeat_timeouts() -> None:
+    watchdog = WorkerWatchdog(startup_timeout=4.0, heartbeat_timeout=1.75)
+    watchdog.started(10.0)
+
+    assert watchdog.unhealthy_reason(running=True, at=13.9) is None
+    assert watchdog.unhealthy_reason(running=True, at=14.1) == "启动握手超时"
+
+    watchdog.activity(14.2, ready=True)
+    assert watchdog.unhealthy_reason(running=True, at=15.9) is None
+    assert watchdog.unhealthy_reason(running=True, at=16.0) == "心跳超时"
+    assert watchdog.unhealthy_reason(running=False, at=14.3) == "进程已停止"
+
+
+def test_stale_hotkey_mutex_is_retryable_but_registration_conflict_is_permanent() -> None:
+    assert "already_active" not in _PERMANENT_FATAL_CODES
+    assert "startup_failed" not in _PERMANENT_FATAL_CODES
+    assert "invalid_hotkey" in _PERMANENT_FATAL_CODES
+    assert "registration_failed" in _PERMANENT_FATAL_CODES
+
+
+def test_supervisor_retries_stale_mutex_once_but_stops_invalid_configuration(qapp) -> None:
+    del qapp
+    supervisor = WindowsWorkerSupervisor("hotkey", lambda: [])
+    failures: list[str] = []
+    supervisor.failed.connect(failures.append)
+    supervisor._desired = True
+    supervisor._accept_events = True
+
+    stale = {"type": "error", "fatal": True, "code": "already_active"}
+    supervisor._handle_message(stale)
+    supervisor._handle_message(stale)
+
+    assert supervisor._desired
+    assert failures == ["正在等待旧的 ClipSoon 热键宿主退出"]
+
+    supervisor._handle_message(
+        {
+            "type": "error",
+            "fatal": True,
+            "code": "invalid_hotkey",
+            "message": "invalid shortcut",
+        }
+    )
+
+    assert not supervisor._desired
+    assert failures[-1] == "invalid shortcut"
+
+
+def test_clipboard_native_capture_has_a_separate_bounded_timeout(qapp) -> None:
+    del qapp
+    now = [20.0]
+    supervisor = WindowsWorkerSupervisor("clipboard", lambda: [], clock=lambda: now[0])
+    supervisor._watchdog.started(10.0)
+    supervisor._watchdog.activity(10.1, ready=True)
+    supervisor._native_capture_started_at = 12.0
+
+    assert supervisor._unhealthy_reason(running=True, at=21.9) is None
+    assert supervisor._unhealthy_reason(running=True, at=22.1) == "原生剪贴板读取超时"
+
+    supervisor._native_capture_started_at = None
+    supervisor._materialization_started_at = 30.0
+    supervisor._watchdog.activity(149.5)
+    assert supervisor._unhealthy_reason(running=True, at=149.9) is None
+    assert supervisor._unhealthy_reason(running=True, at=150.1) == "剪贴板内容转换落盘超时"

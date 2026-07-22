@@ -884,8 +884,14 @@ class SettingsDialog(QDialog):
 
     def _validate_accept(self) -> None:
         recorded = self.custom_hotkey.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
-        if self._HOTKEYS[self.hotkey_mode.currentText()] == "custom" and not _parse_hotkey(recorded):
+        custom = self._HOTKEYS[self.hotkey_mode.currentText()] == "custom"
+        parsed = _parse_hotkey(recorded) if custom else ""
+        if custom and not parsed:
             QMessageBox.warning(self, "快捷键无效", "组合键必须包含 Ctrl/Shift/Alt/Command 和一个普通键。")
+            return
+        platform_error = _platform_hotkey_validation_error(parsed)
+        if custom and platform_error:
+            QMessageBox.warning(self, "快捷键无效", platform_error)
             return
         self.accept()
 
@@ -1815,6 +1821,7 @@ def _spin(value: int, minimum: int, maximum: int, suffix: str) -> QSpinBox:
 def _parse_hotkey(text: str) -> str:
     aliases = {"control": "ctrl", "cmd": "meta", "command": "meta", "win": "meta", "option": "alt"}
     parts: list[str] = []
+    plus_key = text.rstrip().endswith("++")
     for part in text.split("+"):
         raw = part.strip().casefold()
         if not raw:
@@ -1825,6 +1832,8 @@ def _parse_hotkey(text: str) -> str:
             parts.append("meta" if raw == "ctrl" else "ctrl")
         else:
             parts.append(aliases.get(raw, raw))
+    if plus_key:
+        parts.append("plus")
     modifiers = {"ctrl", "shift", "alt", "meta"}
     if not set(parts) & modifiers or not set(parts) - modifiers:
         return ""
@@ -1840,4 +1849,16 @@ def _hotkey_display(spec: str) -> str:
         if sys.platform == "darwin"
         else {"ctrl": "Ctrl", "shift": "Shift", "alt": "Alt", "meta": "Meta"}
     )
-    return "+".join(labels.get(value, value.upper()) for value in values)
+    return "+".join(labels.get(value, "+" if value == "plus" else value.upper()) for value in values)
+
+
+def _platform_hotkey_validation_error(spec: str) -> str:
+    if sys.platform != "win32" or not spec:
+        return ""
+    from clipsoon.windows_hotkey_host import parse_registered_hotkey
+
+    try:
+        parse_registered_hotkey(spec)
+    except ValueError as exc:
+        return f"Windows 不支持该全局组合键：{exc}"
+    return ""

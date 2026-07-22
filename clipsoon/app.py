@@ -132,7 +132,8 @@ class ClipSoonApplication(QObject):
         # Permission failures can be emitted synchronously, so the tray must
         # already be visible for the first-launch warning to reach the user.
         self.hotkey.start(self.settings.value)
-        self._hotkey_health_timer.start()
+        if not PlatformBridge.is_windows():
+            self._hotkey_health_timer.start()
         if self.settings.value.launch_at_login:
             success, message = self.launch_at_login.set_enabled(True)
             if not success:
@@ -224,6 +225,8 @@ class ClipSoonApplication(QObject):
             self._panel_watch_timer.stop()
 
     def _ensure_hotkey_listener(self) -> None:
+        if PlatformBridge.is_windows():
+            return
         if self.hotkey.is_running:
             self._next_hotkey_restart_at = 0.0
             return
@@ -276,14 +279,14 @@ class ClipSoonApplication(QObject):
             self.panel.set_status("无法打开数据目录")
 
     def clear_history(self) -> None:
-        removed = self.repository.clear_unpinned()
         self.clipboard.sync_cursor()
+        removed = self.repository.clear_unpinned()
         self._reload_history()
         self.panel.set_status(f"已清除 {removed} 条未置顶历史")
 
     def clear_all_history(self) -> None:
-        removed = self.repository.clear_all()
         self.clipboard.sync_cursor()
+        removed = self.repository.clear_all()
         self._reload_history()
         self.panel.set_status(f"已清空 {removed} 条历史")
 
@@ -349,8 +352,8 @@ class ClipSoonApplication(QObject):
 
 
 def main(argv: list[str] | None = None) -> int:
-    started = time.perf_counter()
     arguments = argv if argv is not None else sys.argv
+    started = time.perf_counter()
     qt_app = QApplication(arguments)
     qt_app.setApplicationName("ClipSoon")
     qt_app.setApplicationVersion(__version__)

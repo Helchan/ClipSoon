@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clipsoon"
-version = "0.9.7"
+version = "0.10.0"
 description = "A fast, private, Spotlight-style clipboard history for macOS and Windows"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -28,7 +28,7 @@ package = [
 ]
 
 [project.scripts]
-clipsoon = "clipsoon.app:main"
+clipsoon = "clipsoon.launcher:main"
 
 [tool.setuptools.packages.find]
 include = ["clipsoon*"]
@@ -41,7 +41,14 @@ qt_api = "pyside6"
 [tool.coverage.run]
 branch = true
 source = ["clipsoon"]
-omit = ["clipsoon/ui.py", "clipsoon/app.py", "clipsoon/__main__.py"]
+omit = [
+  "clipsoon/ui.py",
+  "clipsoon/app.py",
+  "clipsoon/__main__.py",
+  "clipsoon/windows_clipboard_host.py",
+  "clipsoon/windows_hotkey_host.py",
+  "clipsoon/windows_workers.py",
+]
 
 [tool.coverage.report]
 show_missing = true
