@@ -250,7 +250,14 @@ class ClipSoonApplication(QObject):
         ):
             self.panel.clear_status()
         captured_target = (
-            PlatformBridge.target_from_window_id(context.target_window)
+            PlatformBridge.target_from_window_id(
+                context.target_window,
+                target_thread_id=context.target_thread_id,
+                target_process_id=context.target_process_id,
+                focus_window=context.focus_window,
+                focus_thread_id=context.focus_thread_id,
+                focus_process_id=context.focus_process_id,
+            )
             if windows
             and isinstance(context, HotkeyActivationContext)
             and context.target_window is not None

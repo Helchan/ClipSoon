@@ -78,6 +78,29 @@ class _Point(ctypes.Structure):
     _fields_ = (("x", _LONG), ("y", _LONG))
 
 
+class _Rect(ctypes.Structure):
+    _fields_ = (
+        ("left", _LONG),
+        ("top", _LONG),
+        ("right", _LONG),
+        ("bottom", _LONG),
+    )
+
+
+class _GuiThreadInfo(ctypes.Structure):
+    _fields_ = (
+        ("cbSize", _DWORD),
+        ("flags", _DWORD),
+        ("hwndActive", _HWND),
+        ("hwndFocus", _HWND),
+        ("hwndCapture", _HWND),
+        ("hwndMenuOwner", _HWND),
+        ("hwndMoveSize", _HWND),
+        ("hwndCaret", _HWND),
+        ("rcCaret", _Rect),
+    )
+
+
 class _Message(ctypes.Structure):
     _fields_ = (
         ("hwnd", _HWND),
@@ -316,6 +339,10 @@ class _WindowsApiProtocol(Protocol):
 
     def foreground_window(self) -> int: ...
 
+    def window_thread_process_id(self, hwnd: int) -> tuple[int, int]: ...
+
+    def focus_window(self, thread_id: int) -> int: ...
+
     def allow_set_foreground_window(self, process_id: int) -> bool: ...
 
     def create_message_window(self, wndproc: Callable[[int, int, int, int], int]) -> int: ...
@@ -414,6 +441,10 @@ class _Win32Api:
         self.user32.SetTimer.restype = _WPARAM
         self.user32.GetForegroundWindow.argtypes = ()
         self.user32.GetForegroundWindow.restype = _HWND
+        self.user32.GetWindowThreadProcessId.argtypes = (_HWND, ctypes.POINTER(_DWORD))
+        self.user32.GetWindowThreadProcessId.restype = _DWORD
+        self.user32.GetGUIThreadInfo.argtypes = (_DWORD, ctypes.POINTER(_GuiThreadInfo))
+        self.user32.GetGUIThreadInfo.restype = _BOOL
         self.user32.AllowSetForegroundWindow.argtypes = (_DWORD,)
         self.user32.AllowSetForegroundWindow.restype = _BOOL
 
@@ -447,6 +478,29 @@ class _Win32Api:
 
     def foreground_window(self) -> int:
         return int(self.user32.GetForegroundWindow() or 0)
+
+    def window_thread_process_id(self, hwnd: int) -> tuple[int, int]:
+        process_id = _DWORD()
+        ctypes.set_last_error(0)
+        thread_id = int(
+            self.user32.GetWindowThreadProcessId(
+                self._as_hwnd(hwnd),
+                ctypes.byref(process_id),
+            )
+        )
+        if not thread_id or not process_id.value:
+            raise self._error("GetWindowThreadProcessId")
+        return thread_id, int(process_id.value)
+
+    def focus_window(self, thread_id: int) -> int:
+        if thread_id <= 0:
+            raise ValueError("GUI thread ID must be positive")
+        information = _GuiThreadInfo()
+        information.cbSize = ctypes.sizeof(_GuiThreadInfo)
+        ctypes.set_last_error(0)
+        if not self.user32.GetGUIThreadInfo(_DWORD(thread_id), ctypes.byref(information)):
+            raise self._error("GetGUIThreadInfo")
+        return int(information.hwndFocus or 0)
 
     def allow_set_foreground_window(self, process_id: int) -> bool:
         return bool(self.user32.AllowSetForegroundWindow(_DWORD(process_id)))
@@ -773,16 +827,54 @@ class WindowsHotkeyHost:
             target_window = self._api.foreground_window()
         except OSError:
             target_window = 0
+        context: dict[str, object] = {"target_hwnd": target_window or None}
+        if target_window:
+            try:
+                target_thread_id, target_process_id = (
+                    self._api.window_thread_process_id(target_window)
+                )
+                if target_thread_id <= 0 or target_process_id <= 0:
+                    raise ValueError("target window identity must be positive")
+                context.update(
+                    {
+                        "target_thread_id": target_thread_id,
+                        "target_process_id": target_process_id,
+                    }
+                )
+            except Exception:
+                target_thread_id = 0
+            try:
+                focus_window = (
+                    self._api.focus_window(target_thread_id)
+                    if target_thread_id
+                    else 0
+                )
+                if focus_window:
+                    focus_thread_id, focus_process_id = (
+                        self._api.window_thread_process_id(focus_window)
+                    )
+                    if focus_thread_id <= 0 or focus_process_id <= 0:
+                        raise ValueError("focus window identity must be positive")
+                    context.update(
+                        {
+                            "focus_hwnd": focus_window,
+                            "focus_thread_id": focus_thread_id,
+                            "focus_process_id": focus_process_id,
+                        }
+                    )
+            except Exception:
+                # Target identity remains independently useful for rejecting a
+                # recycled top-level HWND. Focus identity is all-or-nothing so
+                # a race cannot leak a partially trusted child snapshot.
+                pass
         foreground_granted = False
         if self._parent_pid is not None:
             try:
                 foreground_granted = self._api.allow_set_foreground_window(self._parent_pid)
             except OSError:
                 foreground_granted = False
-        return {
-            "target_hwnd": target_window or None,
-            "foreground_granted": foreground_granted,
-        }
+        context["foreground_granted"] = foreground_granted
+        return context
 
     def _watch_parent_process(self) -> None:
         if self._parent_pid is None:

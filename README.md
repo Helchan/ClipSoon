@@ -180,15 +180,15 @@ PowerShell 对应命令为：
 
 ClipSoon 是系统托盘常驻应用，主窗口隐藏不代表进程退出。如果启动立即返回退出码 `2`，通常表示已有实例持有单实例锁；先从托盘退出旧实例，再重新调试。应用日志位于所用数据目录下的 `logs/clipsoon.log`，原生崩溃栈写入同目录的 `native-crash.log`。Windows 的 `run.bat` 在异常退出时会同时显示退出码和这两个日志位置。
 
-Windows 正常运行时会看到三个同源进程：一个 ClipSoon 主界面、一个原生热键宿主和一个原生剪贴板宿主。Windows 呼出快捷键只使用系统 `RegisterHotKey`；不再安装 Raw Input、低级键盘钩子或物理按键轮询器。旧版保存的双 Ctrl/Shift/Alt/Win 配置以及 Win32 不支持的组合键会在首次启动时迁移为 `Ctrl+Shift+Space` 并明确提示，之后可在设置中录制其他组合键；保存前会校验键位能否由 Win32 注册。若新组合键已被其他程序占用，ClipSoon 会自动恢复并重新注册上一个可用快捷键；启动时自定义组合键被占用且尚无已确认配置时会改用默认组合键，默认组合键也被占用时则保留托盘运行并明确报错，不会循环重启宿主。热键宿主会在触发瞬间记录原目标窗口并尝试把前台激活许可交给主进程；若 Windows 仍拒绝普通激活请求，主进程会临时附加到当前前台线程的输入队列并重试、校验，避免窗口可见但 Enter 仍发往原应用。Windows 的窗口失焦隐藏只由原生前台窗口监测负责，不再与 Qt 的通用失焦定时器竞争。
+Windows 空闲时会看到三个同源进程：一个 ClipSoon 主界面、一个原生热键宿主和一个原生剪贴板宿主。Windows 呼出快捷键只使用系统 `RegisterHotKey`；不再安装 Raw Input、低级键盘钩子或物理按键轮询器。旧版保存的双 Ctrl/Shift/Alt/Win 配置以及 Win32 不支持的组合键会在首次启动时迁移为 `Ctrl+Shift+Space` 并明确提示，之后可在设置中录制其他组合键；保存前会校验键位能否由 Win32 注册。若新组合键已被其他程序占用，ClipSoon 会自动恢复并重新注册上一个可用快捷键；启动时自定义组合键被占用且尚无已确认配置时会改用默认组合键，默认组合键也被占用时则保留托盘运行并明确报错，不会循环重启宿主。热键宿主会在触发瞬间记录原目标顶层窗口和实际输入焦点的 HWND/TID/PID，并尝试把前台激活许可交给主进程；发送时会校验句柄身份。若普通恢复不足，ClipSoon 按需启动一个一次性焦点 helper，在该短生命进程内临时附加当前前台、目标和焦点输入线程，执行并复核 `SetForegroundWindow + SetFocus` 后立即退出；Qt 主线程永不调用 `AttachThreadInput`，解绑异常也由 helper 进程退出兜底，不会污染后续快捷键或焦点。桌面客户端异步重建输入控件时会有界等待并再次核验实际前台焦点。Windows 的窗口失焦隐藏只由原生前台窗口监测负责，不再与 Qt 的通用失焦定时器竞争。
 
-剪贴板宿主是 Windows 剪贴板的唯一读写者，主界面既不调用 Qt MIME 读取，也不通过 Qt/OLE 写入。发送文本时原生写入 `CF_UNICODETEXT`，文件写入 `CF_HDROP + Preferred DropEffect(COPY)`，图片按兼容性优先级写入注册格式 `PNG` 和 `CF_DIBV5`；所有格式都先用 `GHND` 分配可移动且清零的 `HGLOBAL`，再以非空句柄一次性提交，避免依赖拥有者进程存活的延迟渲染，也不会把分配器填充字节中的旧内存带进剪贴板。宿主只有在关闭剪贴板、sequence 前进、owner/内部 request marker/必需格式全部验证后才返回 ACK；主界面收到 ACK 前不会隐藏、激活目标或发送 `Ctrl+V`，粘贴前还会再次校验同一提交。校验失败时只按同一事务语义重写一次，再失败便取消自动粘贴，不会把不完整或已被覆盖的内容发送给目标程序。该格式顺序与 Chromium/Electron 的 PNG 优先、位图回退读取路径一致，同时覆盖画图类 DIB 消费方。
+剪贴板宿主是 Windows 剪贴板的唯一读写者，主界面既不调用 Qt MIME 读取，也不通过 Qt/OLE 写入。发送文本时原生写入 `CF_UNICODETEXT`，文件写入 `CF_HDROP + Preferred DropEffect(COPY)`，图片同时 eager 写入 `PNG + CF_DIBV5 + CF_DIB`；所有格式都先用 `GHND` 分配可移动且清零的 `HGLOBAL`，再以非空句柄一次性提交，避免依赖拥有者进程存活的延迟渲染或目标客户端临时合成格式。三格式位图原始像素限制为 128 MiB，避免超大截图在 GUI 与 helper 中造成无界峰值。宿主只有在关闭剪贴板、sequence 相对写入前已推进，且 owner/内部 request marker/必需格式全部验证后才返回 ACK；主界面收到 ACK 前不会隐藏、激活目标或发送 `Ctrl+V`。桌面客户端读取兼容格式导致 sequence 合法变化时，粘贴前会在实际稳定 sequence 上重新核对同一 owner/marker/formats，不会误判为外部覆盖；真正被其他程序改写仍会失败并最多完整重写一次。Windows 的 `Ctrl+V` 由一次原生 `SendInput` 批量提交，四个事件全部进入系统时提示“已触发粘贴”，否则保留剪贴板并提示自动粘贴失败；是否被 WeLink 实际消费仍以输入框内容出现为准。
 
-剪贴板变化的采集仍由同一宿主隔离处理；ClipSoon 自身写回带内部标记，监听端不会再次读取整张图片。若外部应用的延迟渲染让原生读取卡住，用户发起发送时会优先替换宿主并以稳定 request ID 在新 session 重试。两个宿主每 500 ms 发送心跳，卡死、退出或父进程消失时会被自动替换或清理；大图在关闭系统剪贴板后继续转换落盘，重启宿主时自动回收无主临时文件。标签构建的 Windows 冻结包会实际写入文本、文件和图片，并在剪贴板宿主退出后再次读取 PNG/DIB 格式，验证 eager 数据生命周期；具体聊天客户端仍属于 Windows 真机验收项。错误统一写入主数据目录下的 `clipsoon.log`。
+剪贴板变化的采集仍由同一宿主隔离处理；ClipSoon 自身写回带内部标记，监听端不会再次读取整张图片。若外部应用的延迟渲染让原生读取卡住，用户发起发送时会优先替换宿主并以稳定 request ID 在新 session 重试。两个宿主每 500 ms 发送心跳，卡死、退出或父进程消失时会被自动替换或清理；大图在关闭系统剪贴板后继续转换落盘，重启宿主时自动回收无主临时文件。标签构建的 Windows 冻结包会实际写入文本、文件和图片，并在剪贴板宿主退出后再次读取 PNG/DIB 格式，验证 eager 数据生命周期；还会以冻结 EXE 跨进程发送 `Ctrl+V`，要求文本进入目标 EDIT、图片触发目标 `WM_PASTE` 且三种图片格式均可读。具体聊天客户端仍属于 Windows 真机验收项。错误统一写入主数据目录下的 `clipsoon.log`。
 
 文件历史只保存原路径，不复制源文件。应用启动、面板呼出以及后台每 3 秒都会异步检查文件记录；多文件记录中任一路径确定不存在时会移除整条记录。扫描结果通过记录 revision 做比较并删除，扫描期间重新复制或更新的同一条记录不会被旧结果误删。发送前也会由有并发上限的后台守护工作线程复核仓库中的最新项，避免网络盘检查卡住界面；只有对应卷、UNC 共享或映射盘根目录仍可访问时，子路径不存在才会被确认删除，权限拒绝、断开的共享、拔出的移动盘等不确定状态都会保留历史。
 
-在 PyCharm 中调试主进程时，两个 helper 是独立子进程，主进程断点不会自动附加到子进程；原生注册协议和生命周期可直接运行 `tests/test_windows_hotkey_host.py`、`tests/test_windows_clipboard_host.py` 和 `tests/test_windows_workers.py`。若使用独立 `CLIPSOON_DATA_DIR` 同时启动正式版与调试版，当前 Windows 会话只允许一个热键宿主持有全局热键，后启动的实例会明确提示占用，不会重复呼出两个窗口。
+在 PyCharm 中调试主进程时，热键和剪贴板两个常驻 helper 以及按需启动的一次性焦点/粘贴 helper 都是独立子进程，主进程断点不会自动附加到子进程；原生边界可直接运行 `tests/test_windows_hotkey_host.py`、`tests/test_windows_clipboard_host.py`、`tests/test_windows_focus_host.py`、`tests/test_windows_paste_host.py` 和 `tests/test_windows_workers.py`。若使用独立 `CLIPSOON_DATA_DIR` 同时启动正式版与调试版，当前 Windows 会话只允许一个热键宿主持有全局热键，后启动的实例会明确提示占用，不会重复呼出两个窗口。
 
 “开机时自动启动 ClipSoon”会记录当前运行形态的启动命令：打包应用记录 ClipSoon 可执行文件，源码环境记录当前 `.venv` 中的 Python。源码环境启用后不要移动或删除该虚拟环境；如需变更项目位置，移动后手动启动一次 ClipSoon 并在设置中重新保存该选项。
 
@@ -245,8 +245,8 @@ Windows 包需要在 Windows 10 / 11 主机上生成。两个脚本都使用 PyI
 发布前先将 `pyproject.toml` 和 `clipsoon/__init__.py` 中的版本保持一致，提交并推送到 `main`，然后执行：
 
 ```bash
-git tag v0.10.2
-git push origin v0.10.2
+git tag -a v0.10.3 -m "ClipSoon 0.10.3"
+git push origin v0.10.3
 ```
 
 Release 会使用标签名生成说明并附加两个平台包。工作流使用 Windows x64 runner 和 macOS 15 ARM64 runner，并在发布前校验 Git 标签、运行时版本与项目版本一致。macOS 产物当前为 ad-hoc 签名，未使用 Developer ID 且未执行 Apple 公证。
@@ -263,6 +263,8 @@ clipsoon/
 ├── windows_workers.py        # Windows helper 监督、心跳与协议校验
 ├── windows_hotkey_host.py    # RegisterHotKey 原生宿主
 ├── windows_clipboard_host.py # Win32 clipboard 原生宿主
+├── windows_focus_host.py     # 一次性前台/焦点恢复边界
+├── windows_paste_host.py     # 共享 SendInput 实现与冻结包探针入口
 └── ui.py                     # PySide6 界面
 tests/            # 自动化测试
 docs/             # 产品规格、架构、竞品调研和验收记录

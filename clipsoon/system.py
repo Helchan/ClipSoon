@@ -32,7 +32,17 @@ from clipsoon.core import (
     HistoryRepository,
     ValidatedFileItem,
 )
-from clipsoon.windows_workers import WindowsWorkerSupervisor
+from clipsoon.windows_focus_host import FOCUS_HELPER_TIMEOUT_SECONDS
+from clipsoon.windows_paste_host import (
+    _WindowsInput as _WindowsInput,
+)
+from clipsoon.windows_paste_host import (
+    _WindowsKeyboardInput as _WindowsKeyboardInput,
+)
+from clipsoon.windows_paste_host import (
+    send_windows_paste_input,
+)
+from clipsoon.windows_workers import WindowsWorkerSupervisor, windows_worker_command
 
 LOGGER = logging.getLogger(__name__)
 _MODIFIERS = {"ctrl", "shift", "alt", "meta"}
@@ -40,17 +50,55 @@ _CLIPBOARD_SETTLE_MS = 70
 _CLIPBOARD_RETRY_DELAYS_MS = (90, 180)
 _WINDOWS_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 _WINDOWS_IMAGE_MAX_BYTES = 256 * 1024 * 1024
+_WINDOWS_BITMAP_PIXEL_MAX_BYTES = 128 * 1024 * 1024
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _WINDOWS_WRITE_DEADLINE_MS = 22_000
 _WINDOWS_VERIFY_DEADLINE_MS = 5_000
 _WINDOWS_MAX_WRITE_ATTEMPTS = 2
+_WINDOWS_FOCUS_HELPER_TIMEOUT_SECONDS = FOCUS_HELPER_TIMEOUT_SECONDS
+_WINDOWS_FOCUS_RETRY_DELAYS_MS = (40, 80, 120)
 _FILE_VALIDATION_TIMEOUT_MS = 3_000
 _MAX_CONCURRENT_FILE_VALIDATIONS = 2
+_GA_ROOT = 2
+
+_WIN_BOOL = ctypes.c_int32
+_WIN_DWORD = ctypes.c_uint32
+_WIN_LONG = ctypes.c_int32
+
+
+class _WindowsRect(ctypes.Structure):
+    _fields_ = (
+        ("left", _WIN_LONG),
+        ("top", _WIN_LONG),
+        ("right", _WIN_LONG),
+        ("bottom", _WIN_LONG),
+    )
+
+
+class _WindowsGuiThreadInfo(ctypes.Structure):
+    _fields_ = (
+        ("cbSize", _WIN_DWORD),
+        ("flags", _WIN_DWORD),
+        ("hwndActive", ctypes.c_void_p),
+        ("hwndFocus", ctypes.c_void_p),
+        ("hwndCapture", ctypes.c_void_p),
+        ("hwndMenuOwner", ctypes.c_void_p),
+        ("hwndMoveSize", ctypes.c_void_p),
+        ("hwndCaret", ctypes.c_void_p),
+        ("rcCaret", _WindowsRect),
+    )
 
 
 def _windows_ipc_session(name: str) -> str | None:
     value = name.removeprefix(".")
-    prefixes = ("write-manifest-", "write-dibv5-", "write-png-", "manifest-", "clip-")
+    prefixes = (
+        "write-manifest-",
+        "write-dibv5-",
+        "write-dib-",
+        "write-png-",
+        "manifest-",
+        "clip-",
+    )
     prefix = next((candidate for candidate in prefixes if value.startswith(candidate)), None)
     if prefix is None:
         return None
@@ -81,16 +129,20 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             temporary.unlink()
 
 
-def _bitmap_v5_payload(image: QImage) -> bytes:
+def _bitmap_payloads(image: QImage) -> tuple[bytes, bytes]:
     # Windows DIBV5 consumers use native little-endian premultiplied ARGB
     # (BGRA bytes).  Convert in Qt, then flip complete rows in bulk instead of
     # visiting millions of screenshot pixels in Python.
     converted = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
     width, height = converted.width(), converted.height()
     pixel_bytes = width * height * 4
-    if width <= 0 or height <= 0 or pixel_bytes + 124 > _WINDOWS_IMAGE_MAX_BYTES:
+    if (
+        width <= 0
+        or height <= 0
+        or pixel_bytes > _WINDOWS_BITMAP_PIXEL_MAX_BYTES
+    ):
         raise ValueError("图片尺寸超出 Windows 剪贴板限制")
-    source = bytes(converted.constBits())
+    source = memoryview(converted.constBits()).cast("B")
     stride = converted.bytesPerLine()
     if len(source) < stride * height:
         raise ValueError("图片像素缓冲区不完整")
@@ -100,11 +152,40 @@ def _bitmap_v5_payload(image: QImage) -> bytes:
         for row_index in range(height - 1, -1, -1)
     )
 
-    header = bytearray(124)
-    struct.pack_into("<IiiHHIIiiII", header, 0, 124, width, height, 1, 32, 0, pixel_bytes, 0, 0, 0, 0)
+    dib_header = struct.pack(
+        "<IiiHHIIiiII",
+        40,
+        width,
+        height,
+        1,
+        32,
+        0,
+        pixel_bytes,
+        0,
+        0,
+        0,
+        0,
+    )
+    v5_header = bytearray(124)
+    struct.pack_into(
+        "<IiiHHIIiiII",
+        v5_header,
+        0,
+        124,
+        width,
+        height,
+        1,
+        32,
+        0,
+        pixel_bytes,
+        0,
+        0,
+        0,
+        0,
+    )
     struct.pack_into(
         "<IIIII",
-        header,
+        v5_header,
         40,
         0x00FF0000,
         0x0000FF00,
@@ -112,8 +193,12 @@ def _bitmap_v5_payload(image: QImage) -> bytes:
         0xFF000000,
         0x57696E20,  # LCS_WINDOWS_COLOR_SPACE
     )
-    struct.pack_into("<I", header, 108, 4)  # LCS_GM_IMAGES
-    return bytes(header) + pixels
+    struct.pack_into("<I", v5_header, 108, 4)  # LCS_GM_IMAGES
+    return dib_header + pixels, bytes(v5_header) + pixels
+
+
+def _bitmap_v5_payload(image: QImage) -> bytes:
+    return _bitmap_payloads(image)[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,20 +243,27 @@ def _prepare_windows_write_artifacts(
             image = QImage.fromData(png, "PNG")
             if image.isNull():
                 raise ValueError("剪贴板 PNG 无法解码")
-            dibv5 = _bitmap_v5_payload(image)
+            dib, dibv5 = _bitmap_payloads(image)
             png_name = f"write-png-{session_id}-{request_id}.png"
             dibv5_name = f"write-dibv5-{session_id}-{request_id}.bin"
-            png_path, dibv5_path = ipc_dir / png_name, ipc_dir / dibv5_name
+            dib_name = f"write-dib-{session_id}-{request_id}.bin"
+            png_path = ipc_dir / png_name
+            dibv5_path = ipc_dir / dibv5_name
+            dib_path = ipc_dir / dib_name
             _atomic_write(png_path, png)
             created.append(png_path)
             _atomic_write(dibv5_path, dibv5)
             created.append(dibv5_path)
+            _atomic_write(dib_path, dib)
+            created.append(dib_path)
             manifest.update(
                 {
                     "png_file": png_name,
                     "png_bytes": len(png),
                     "dibv5_file": dibv5_name,
                     "dibv5_bytes": len(dibv5),
+                    "dib_file": dib_name,
+                    "dib_bytes": len(dib),
                 }
             )
         encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -199,6 +291,131 @@ def _windows_foreground_window() -> int:
     if hasattr(value, "value"):
         value = value.value
     return int(value or 0)
+
+
+def _positive_protocol_int(value: object) -> int | None:
+    return (
+        value
+        if isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+        else None
+    )
+
+
+def _windows_window_identity(user32: object, identifier: int) -> tuple[int, int]:
+    get_identity = user32.GetWindowThreadProcessId
+    get_identity.argtypes = (ctypes.c_void_p, ctypes.POINTER(_WIN_DWORD))
+    get_identity.restype = _WIN_DWORD
+    process_id = _WIN_DWORD()
+    thread_id = int(get_identity(_windows_handle(identifier), ctypes.byref(process_id)))
+    return thread_id, int(process_id.value)
+
+
+def _windows_focus_window(user32: object, thread_id: int) -> int:
+    get_gui_thread_info = user32.GetGUIThreadInfo
+    get_gui_thread_info.argtypes = (
+        _WIN_DWORD,
+        ctypes.POINTER(_WindowsGuiThreadInfo),
+    )
+    get_gui_thread_info.restype = _WIN_BOOL
+    information = _WindowsGuiThreadInfo()
+    information.cbSize = ctypes.sizeof(_WindowsGuiThreadInfo)
+    if not get_gui_thread_info(_WIN_DWORD(thread_id), ctypes.byref(information)):
+        return 0
+    return int(information.hwndFocus or 0)
+
+
+def _windows_root_window(user32: object, identifier: int) -> int:
+    get_ancestor = user32.GetAncestor
+    get_ancestor.argtypes = (ctypes.c_void_p, _WIN_DWORD)
+    get_ancestor.restype = ctypes.c_void_p
+    value = get_ancestor(_windows_handle(identifier), _GA_ROOT)
+    if hasattr(value, "value"):
+        value = value.value
+    return int(value or 0)
+
+
+def _run_windows_focus_helper(
+    *,
+    mode: str,
+    target_window: int,
+    target_thread_id: int | None = None,
+    target_process_id: int,
+    focus_window: int | None = None,
+    focus_thread_id: int | None = None,
+    focus_process_id: int | None = None,
+) -> bool:
+    arguments = [
+        "--mode",
+        mode,
+        f"--{'panel' if mode == 'panel' else 'target'}-hwnd",
+        str(target_window),
+    ]
+    if mode == "panel":
+        arguments.extend(("--panel-process-id", str(target_process_id)))
+    elif mode == "target" and target_thread_id:
+        arguments.extend(
+            (
+                "--target-thread-id",
+                str(target_thread_id),
+                "--target-process-id",
+                str(target_process_id),
+            )
+        )
+        focus_values = (focus_window, focus_thread_id, focus_process_id)
+        if all(focus_values):
+            arguments.extend(
+                (
+                    "--focus-hwnd",
+                    str(focus_window),
+                    "--focus-thread-id",
+                    str(focus_thread_id),
+                    "--focus-process-id",
+                    str(focus_process_id),
+                )
+            )
+    else:
+        return False
+
+    program, helper_arguments = windows_worker_command("focus", arguments)
+    try:
+        completed = subprocess.run(
+            [program, *helper_arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=_WINDOWS_FOCUS_HELPER_TIMEOUT_SECONDS,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        LOGGER.error(
+            "Windows focus helper timed out; mode=%s target=%d",
+            mode,
+            target_window,
+        )
+        return False
+    except OSError:
+        LOGGER.exception(
+            "Could not start Windows focus helper; mode=%s target=%d",
+            mode,
+            target_window,
+        )
+        return False
+    if completed.returncode == 0:
+        return True
+    LOGGER.warning(
+        "Windows focus helper failed; mode=%s target=%d exit=%d detail=%s",
+        mode,
+        target_window,
+        completed.returncode,
+        (completed.stderr or "").strip(),
+    )
+    return False
 
 
 class HotkeyStateMachine:
@@ -293,6 +510,11 @@ class HotkeyActivationContext:
     """Per-trigger Windows state captured before the panel changes foreground."""
 
     target_window: int | None = None
+    target_thread_id: int | None = None
+    target_process_id: int | None = None
+    focus_window: int | None = None
+    focus_thread_id: int | None = None
+    focus_process_id: int | None = None
     foreground_granted: bool = False
 
 
@@ -396,17 +618,23 @@ class GlobalHotkeyService:
             return
         if kind != "hotkey":
             return
-        raw_target = message.get("target_hwnd")
-        target_window = (
-            raw_target
-            if isinstance(raw_target, int)
-            and not isinstance(raw_target, bool)
-            and raw_target > 0
-            else None
-        )
+        target_window = _positive_protocol_int(message.get("target_hwnd"))
         self._activated(
             HotkeyActivationContext(
                 target_window=target_window,
+                target_thread_id=_positive_protocol_int(
+                    message.get("target_thread_id")
+                ),
+                target_process_id=_positive_protocol_int(
+                    message.get("target_process_id")
+                ),
+                focus_window=_positive_protocol_int(message.get("focus_hwnd")),
+                focus_thread_id=_positive_protocol_int(
+                    message.get("focus_thread_id")
+                ),
+                focus_process_id=_positive_protocol_int(
+                    message.get("focus_process_id")
+                ),
                 foreground_granted=message.get("foreground_granted") is True,
             )
         )
@@ -1128,11 +1356,13 @@ class ClipboardController(QObject):
                     "write-manifest-",
                     "write-png-",
                     "write-dibv5-",
+                    "write-dib-",
                     ".manifest-",
                     ".clip-",
                     ".write-manifest-",
                     ".write-png-",
                     ".write-dibv5-",
+                    ".write-dib-",
                 )
             ):
                 if _windows_ipc_session(path.name) in preserved:
@@ -1553,8 +1783,16 @@ class ClipboardController(QObject):
         ):
             return
         if message.get("ok") is True:
-            if message.get("sequence") != pending.receipt.sequence:
+            sequence = _positive_protocol_int(message.get("sequence"))
+            if sequence is None:
                 return
+            # Windows may advance the sequence while synthesizing a compatible
+            # format for the target. The native broker has already revalidated
+            # the request marker, owner, and complete required format set at
+            # this returned sequence, so an exact match to the original ACK is
+            # neither necessary nor correct.
+            self._last_sequence = sequence
+            self._suppressed_sequence = sequence
             self._finish_windows_verify(request_id, True, "")
             return
         error = str(message.get("error") or message.get("code") or "剪贴板内容已变化")
@@ -1691,6 +1929,11 @@ class ForegroundTargetHandle:
     kind: str
     identifier: int
     name: str = ""
+    target_thread_id: int | None = None
+    target_process_id: int | None = None
+    focus_window: int | None = None
+    focus_thread_id: int | None = None
+    focus_process_id: int | None = None
 
     def activate(self) -> bool:
         try:
@@ -1704,16 +1947,213 @@ class ForegroundTargetHandle:
                 handle = _windows_handle(self.identifier)
                 if not user32.IsWindow(handle):
                     return False
+                target_identity = self._validated_windows_target(user32)
+                if target_identity is None:
+                    return False
+                target_thread_id, target_process_id = target_identity
+                self.target_thread_id = target_thread_id
+                self.target_process_id = target_process_id
+                focus_window = (
+                    self._validated_windows_focus(user32)
+                    if target_process_id
+                    else None
+                )
                 # SW_RESTORE also unmaximizes a maximized window. Only use it
                 # for a genuinely minimized target so sending never changes the
                 # user's chosen normal/maximized window state.
                 if user32.IsIconic(handle):
                     user32.ShowWindow(handle, 9)  # SW_RESTORE
                 user32.BringWindowToTop(handle)
-                return bool(user32.SetForegroundWindow(handle))
+                user32.SetForegroundWindow(handle)
+                foreground_ready = _windows_foreground_window() == self.identifier
+                if focus_window is None:
+                    if not foreground_ready:
+                        _run_windows_focus_helper(
+                            mode="target",
+                            target_window=self.identifier,
+                            target_thread_id=target_thread_id,
+                            target_process_id=target_process_id,
+                        )
+                        foreground_ready = (
+                            _windows_foreground_window() == self.identifier
+                        )
+                    current_focus = None
+                    if foreground_ready and target_thread_id:
+                        current_focus = self._adopt_current_windows_focus(
+                            user32,
+                            target_thread_id,
+                        )
+                    if current_focus is not None:
+                        LOGGER.info(
+                            "Windows target adopted current focus; hwnd=%d focus=%d",
+                            self.identifier,
+                            current_focus[0],
+                        )
+                        return True
+                    LOGGER.info(
+                        "Windows target restored; hwnd=%d foreground=%s focus=unavailable",
+                        self.identifier,
+                        foreground_ready,
+                    )
+                    # Apps backed by a dedicated renderer may recreate their
+                    # focused child after the top-level activation returns.
+                    # SelectionSender waits and performs a strict final check
+                    # before it injects Ctrl+V.
+                    return foreground_ready
+                focus_identifier, focus_thread_id = focus_window
+                if (
+                    foreground_ready
+                    and _windows_focus_window(user32, focus_thread_id)
+                    == focus_identifier
+                ):
+                    LOGGER.info(
+                        "Windows target and focus restored natively; hwnd=%d focus=%d",
+                        self.identifier,
+                        focus_identifier,
+                    )
+                    return True
+                restored = _run_windows_focus_helper(
+                    mode="target",
+                    target_window=self.identifier,
+                    target_thread_id=target_thread_id,
+                    target_process_id=target_process_id,
+                    focus_window=focus_identifier,
+                    focus_thread_id=focus_thread_id,
+                    focus_process_id=self.focus_process_id,
+                )
+                foreground_ready = (
+                    _windows_foreground_window() == self.identifier
+                )
+                focus_ready = (
+                    foreground_ready
+                    and _windows_focus_window(user32, focus_thread_id)
+                    == focus_identifier
+                )
+                if foreground_ready and not focus_ready:
+                    focus_ready = (
+                        self._adopt_current_windows_focus(
+                            user32,
+                            target_thread_id,
+                        )
+                        is not None
+                    )
+                LOGGER.info(
+                    "Windows target focus helper completed; target=%d focus=%d "
+                    "helper=%s foreground=%s focus_ready=%s",
+                    self.identifier,
+                    focus_identifier,
+                    restored,
+                    foreground_ready,
+                    focus_ready,
+                )
+                # A successful top-level transition is enough to enter the
+                # bounded async focus-resolution phase. No paste happens until
+                # is_active() validates a target-owned focus window.
+                return foreground_ready
         except Exception:
             LOGGER.exception("Could not restore target window")
         return False
+
+    def _validated_windows_target(
+        self,
+        user32: object,
+    ) -> tuple[int, int] | None:
+        target_thread_id, target_process_id = _windows_window_identity(
+            user32,
+            self.identifier,
+        )
+        if (
+            not target_thread_id
+            or not target_process_id
+            or (
+                self.target_thread_id is not None
+                and target_thread_id != self.target_thread_id
+            )
+            or (
+                self.target_process_id is not None
+                and target_process_id != self.target_process_id
+            )
+        ):
+            LOGGER.warning(
+                "Captured Windows target identity is stale; hwnd=%d",
+                self.identifier,
+            )
+            return None
+        return target_thread_id, target_process_id
+
+    def _validated_windows_focus(
+        self,
+        user32: object,
+    ) -> tuple[int, int] | None:
+        if (
+            self.focus_window is None
+            or self.focus_thread_id is None
+            or self.focus_process_id is None
+        ):
+            return None
+        focus_handle = _windows_handle(self.focus_window)
+        if not user32.IsWindow(focus_handle):
+            LOGGER.warning(
+                "Captured Windows focus window is no longer valid; hwnd=%d",
+                self.focus_window,
+            )
+            return None
+        focus_thread_id, focus_process_id = _windows_window_identity(
+            user32,
+            self.focus_window,
+        )
+        root_window = _windows_root_window(user32, self.focus_window)
+        if (
+            focus_thread_id != self.focus_thread_id
+            or focus_process_id != self.focus_process_id
+            or root_window != self.identifier
+        ):
+            LOGGER.warning(
+                "Captured Windows focus identity is stale; hwnd=%d",
+                self.focus_window,
+            )
+            return None
+        return self.focus_window, focus_thread_id
+
+    def _adopt_current_windows_focus(
+        self,
+        user32: object,
+        target_thread_id: int,
+    ) -> tuple[int, int] | None:
+        candidate_threads = dict.fromkeys(
+            thread_id
+            for thread_id in (0, target_thread_id, self.focus_thread_id)
+            if thread_id is not None
+        )
+        for thread_id in candidate_threads:
+            focus_identifier = _windows_focus_window(user32, thread_id)
+            if not focus_identifier or not user32.IsWindow(
+                _windows_handle(focus_identifier)
+            ):
+                continue
+            focus_thread_id, focus_process_id = _windows_window_identity(
+                user32,
+                focus_identifier,
+            )
+            expected_focus_process_id = (
+                self.focus_process_id or self.target_process_id
+            )
+            if (
+                not focus_thread_id
+                or not focus_process_id
+                or (
+                    expected_focus_process_id is not None
+                    and focus_process_id != expected_focus_process_id
+                )
+                or _windows_root_window(user32, focus_identifier)
+                != self.identifier
+            ):
+                continue
+            self.focus_window = focus_identifier
+            self.focus_thread_id = focus_thread_id
+            self.focus_process_id = focus_process_id
+            return focus_identifier, focus_thread_id
+        return None
 
     def is_active(self) -> bool:
         try:
@@ -1723,7 +2163,46 @@ class ForegroundTargetHandle:
                 app = NSWorkspace.sharedWorkspace().frontmostApplication()
                 return bool(app and int(app.processIdentifier()) == self.identifier)
             if self.kind == "windows":
-                return _windows_foreground_window() == self.identifier
+                if _windows_foreground_window() != self.identifier:
+                    return False
+                user32 = ctypes.windll.user32
+                target_thread_id = self.target_thread_id or 0
+                if (
+                    self.target_thread_id is not None
+                    or self.target_process_id is not None
+                ):
+                    target_identity = self._validated_windows_target(user32)
+                    if target_identity is None:
+                        return False
+                    target_thread_id = target_identity[0]
+                if (
+                    self.focus_window is None
+                    or self.focus_thread_id is None
+                    or self.focus_process_id is None
+                ):
+                    return bool(
+                        target_thread_id
+                        and self._adopt_current_windows_focus(
+                            user32,
+                            target_thread_id,
+                        )
+                        is not None
+                    )
+                validated = self._validated_windows_focus(user32)
+                if (
+                    validated is not None
+                    and _windows_focus_window(user32, validated[1])
+                    == validated[0]
+                ):
+                    return True
+                return bool(
+                    target_thread_id
+                    and self._adopt_current_windows_focus(
+                        user32,
+                        target_thread_id,
+                    )
+                    is not None
+                )
         except Exception:
             return False
         return False
@@ -1853,16 +2332,42 @@ class PlatformBridge:
             return ""
 
     @staticmethod
-    def target_from_window_id(identifier: int) -> ForegroundTargetHandle | None:
+    def target_from_window_id(
+        identifier: int,
+        *,
+        target_thread_id: int | None = None,
+        target_process_id: int | None = None,
+        focus_window: int | None = None,
+        focus_thread_id: int | None = None,
+        focus_process_id: int | None = None,
+    ) -> ForegroundTargetHandle | None:
         if sys.platform != "win32" or identifier <= 0:
             return None
         try:
+            user32 = ctypes.windll.user32
             handle = _windows_handle(identifier)
-            if ctypes.windll.user32.IsWindow(handle):
+            if user32.IsWindow(handle):
+                current_thread_id, current_process_id = _windows_window_identity(
+                    user32,
+                    identifier,
+                )
+                if (
+                    target_thread_id is not None
+                    and current_thread_id != target_thread_id
+                ) or (
+                    target_process_id is not None
+                    and current_process_id != target_process_id
+                ):
+                    return None
                 return ForegroundTargetHandle(
                     "windows",
                     identifier,
                     PlatformBridge.window_name(identifier),
+                    current_thread_id,
+                    current_process_id,
+                    focus_window,
+                    focus_thread_id,
+                    focus_process_id,
                 )
         except Exception:
             LOGGER.debug("Could not restore captured Windows target", exc_info=True)
@@ -1882,7 +2387,40 @@ class PlatformBridge:
             elif sys.platform == "win32":
                 hwnd = _windows_foreground_window()
                 if hwnd:
-                    return ForegroundTargetHandle("windows", hwnd, PlatformBridge.current_app_name())
+                    name = PlatformBridge.current_app_name()
+                    try:
+                        user32 = ctypes.windll.user32
+                        target_thread_id, target_process_id = (
+                            _windows_window_identity(
+                                user32,
+                                hwnd,
+                            )
+                        )
+                        focus_window = _windows_focus_window(
+                            user32,
+                            target_thread_id,
+                        )
+                        focus_thread_id = focus_process_id = None
+                        if focus_window:
+                            focus_thread_id, focus_process_id = (
+                                _windows_window_identity(user32, focus_window)
+                            )
+                        return ForegroundTargetHandle(
+                            "windows",
+                            hwnd,
+                            name,
+                            target_thread_id,
+                            target_process_id,
+                            focus_window or None,
+                            focus_thread_id,
+                            focus_process_id,
+                        )
+                    except Exception:
+                        LOGGER.debug(
+                            "Could not capture Windows input focus; using top-level target",
+                            exc_info=True,
+                        )
+                        return ForegroundTargetHandle("windows", hwnd, name)
         except Exception:
             LOGGER.exception("Could not capture foreground target")
         return None
@@ -1908,48 +2446,28 @@ class PlatformBridge:
         try:
             user32 = ctypes.windll.user32
             handle = _windows_handle(identifier)
+            if not user32.IsWindow(handle):
+                return False
+            _thread_id, process_id = _windows_window_identity(user32, identifier)
+            if not process_id or process_id != os.getpid():
+                LOGGER.warning(
+                    "Refusing to activate a panel window not owned by ClipSoon; hwnd=%d",
+                    identifier,
+                )
+                return False
             user32.ShowWindow(handle, 5)  # SW_SHOW
             user32.BringWindowToTop(handle)
             user32.SetForegroundWindow(handle)
             if _windows_foreground_window() == identifier:
                 return True
-
-            # The hotkey helper and Qt GUI are separate processes, so foreground
-            # privilege transfer can still be denied. Temporarily join the
-            # current foreground input queue and retry from the panel's GUI
-            # thread.
-            foreground = _windows_foreground_window()
-            if not foreground:
-                return False
-            kernel32 = ctypes.windll.kernel32
-            get_window_thread = user32.GetWindowThreadProcessId
-            get_window_thread.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
-            get_window_thread.restype = ctypes.c_uint32
-            get_current_thread = kernel32.GetCurrentThreadId
-            get_current_thread.argtypes = ()
-            get_current_thread.restype = ctypes.c_uint32
-            attach_thread_input = user32.AttachThreadInput
-            attach_thread_input.argtypes = (
-                ctypes.c_uint32,
-                ctypes.c_uint32,
-                ctypes.c_int32,
+            return bool(
+                _run_windows_focus_helper(
+                    mode="panel",
+                    target_window=identifier,
+                    target_process_id=process_id,
+                )
+                and _windows_foreground_window() == identifier
             )
-            attach_thread_input.restype = ctypes.c_int32
-            foreground_thread = int(
-                get_window_thread(_windows_handle(foreground), None)
-            )
-            current_thread = int(get_current_thread())
-            if not foreground_thread or foreground_thread == current_thread:
-                return False
-            attached = bool(attach_thread_input(current_thread, foreground_thread, True))
-            if not attached:
-                return False
-            try:
-                user32.BringWindowToTop(handle)
-                user32.SetForegroundWindow(handle)
-                return _windows_foreground_window() == identifier
-            finally:
-                attach_thread_input(current_thread, foreground_thread, False)
         except Exception:
             LOGGER.debug("Could not activate ClipSoon panel", exc_info=True)
             return False
@@ -2029,6 +2547,11 @@ class PlatformBridge:
 class PynputPasteAdapter:
     def paste(self) -> bool:
         try:
+            if sys.platform == "win32":
+                return send_windows_paste_input(
+                    ctypes.windll.user32,
+                    getattr(ctypes.windll, "kernel32", None),
+                )
             from pynput import keyboard
 
             controller = keyboard.Controller()
@@ -2283,12 +2806,31 @@ class SelectionSender(QObject):
         send_generation: int,
         *,
         rewrite_count: int,
+        focus_retry_count: int = 0,
     ) -> None:
         if send_generation != self._send_generation or not self._busy:
             return
         # Some macOS apps report activation asynchronously. A successful native
         # activate call is accepted, but a positively different foreground is not.
         if not target.is_active():
+            if (
+                getattr(target, "kind", "") == "windows"
+                and PlatformBridge.foreground_window_id() == target.identifier
+                and focus_retry_count < len(_WINDOWS_FOCUS_RETRY_DELAYS_MS)
+            ):
+                retry_delay = _WINDOWS_FOCUS_RETRY_DELAYS_MS[focus_retry_count]
+                QTimer.singleShot(
+                    retry_delay,
+                    lambda: self._verify_before_paste(
+                        item,
+                        target,
+                        receipt,
+                        send_generation,
+                        rewrite_count=rewrite_count,
+                        focus_retry_count=focus_retry_count + 1,
+                    ),
+                )
+                return
             self._finish_send(send_generation, "已复制，但目标窗口未激活", False)
             return
         self.clipboard.request_verify(
@@ -2338,9 +2880,14 @@ class SelectionSender(QObject):
             self._finish_send(send_generation, "已复制，但目标窗口未激活", False)
             return
         pasted = self.paste_adapter.paste()
+        success_message = (
+            "已触发粘贴"
+            if pasted and getattr(target, "kind", "") == "windows"
+            else "已发送"
+        )
         self._finish_send(
             send_generation,
-            "已发送" if pasted else "已复制，但自动粘贴失败",
+            success_message if pasted else "已复制，但自动粘贴失败",
             pasted,
         )
 

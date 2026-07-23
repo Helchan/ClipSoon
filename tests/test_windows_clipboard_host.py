@@ -397,7 +397,7 @@ def test_host_skips_internal_write_without_opening_clipboard(tmp_path: Path) -> 
     assert manifest["reason"] == "internal-write"
 
 
-def test_broker_eagerly_writes_png_dibv5_marker_and_verifies_idempotently(
+def test_broker_eagerly_writes_png_dibv5_dib_marker_and_verifies_idempotently(
     tmp_path: Path,
 ) -> None:
     session_id = "a" * 32
@@ -407,12 +407,33 @@ def test_broker_eagerly_writes_png_dibv5_marker_and_verifies_idempotently(
     ignored: list[int] = []
     store = ImagePayloadStore(tmp_path, session_id=session_id)
     png = _png(7, 9)
-    dibv5 = bytearray(124)
-    struct.pack_into("<IiiHH", dibv5, 0, 124, 7, 9, 1, 32)
+    dibv5 = bytearray(124 + 252)
+    struct.pack_into(
+        "<IiiHHIIiiII",
+        dibv5,
+        0,
+        124,
+        7,
+        9,
+        1,
+        32,
+        0,
+        252,
+        0,
+        0,
+        0,
+        0,
+    )
+    dib = (
+        struct.pack("<IiiHHIIiiII", 40, 7, 9, 1, 32, 0, 252, 0, 0, 0, 0)
+        + bytes(252)
+    )
     png_name = f"write-png-{session_id}-{request_id}.png"
     dibv5_name = f"write-dibv5-{session_id}-{request_id}.dibv5"
+    dib_name = f"write-dib-{session_id}-{request_id}.dib"
     (tmp_path / png_name).write_bytes(png)
     (tmp_path / dibv5_name).write_bytes(dibv5)
+    (tmp_path / dib_name).write_bytes(dib)
     manifest = {
         "protocol": 1,
         "session_id": session_id,
@@ -422,6 +443,8 @@ def test_broker_eagerly_writes_png_dibv5_marker_and_verifies_idempotently(
         "png_bytes": len(png),
         "dibv5_file": dibv5_name,
         "dibv5_bytes": len(dibv5),
+        "dib_file": dib_name,
+        "dib_bytes": len(dib),
     }
     manifest_name, manifest_bytes = _write_manifest(tmp_path, session_id, request_id, manifest)
     broker = WindowsClipboardBroker(
@@ -450,11 +473,13 @@ def test_broker_eagerly_writes_png_dibv5_marker_and_verifies_idempotently(
     assert [format_id for format_id, _data in api.set_calls] == [
         api.png_format,
         CF_DIBV5,
+        CF_DIB,
         api.internal_write_format,
     ]
-    assert api.calls[:4] == ["alloc", "alloc", "alloc", "open"]
+    assert api.calls[:5] == ["alloc", "alloc", "alloc", "alloc", "open"]
     assert api.payloads[api.png_format] == png
     assert api.payloads[CF_DIBV5] == dibv5
+    assert api.payloads[CF_DIB] == dib
     assert api.payloads[api.internal_write_format] == request_id.encode("ascii") + b"\0"
     assert events[-1] == {
         "type": "write_result",
@@ -485,6 +510,80 @@ def test_broker_eagerly_writes_png_dibv5_marker_and_verifies_idempotently(
     assert events[-1]["type"] == "verify_result"
     assert events[-1]["ok"] is True
     assert ignored == [11, 11, 11]
+
+
+def test_broker_derives_eager_dib_for_legacy_protocol_one_image_manifest(
+    tmp_path: Path,
+) -> None:
+    session_id = "c" * 32
+    request_id = "d" * 32
+    api = FakeClipboardApi(sequence=20)
+    png = _png(1, 1)
+    dibv5 = bytearray(128)
+    struct.pack_into(
+        "<IiiHHIIiiII",
+        dibv5,
+        0,
+        124,
+        1,
+        1,
+        1,
+        32,
+        0,
+        4,
+        0,
+        0,
+        0,
+        0,
+    )
+    dibv5[124:] = b"\x01\x02\x03\x04"
+    (tmp_path / "legacy.png").write_bytes(png)
+    (tmp_path / "legacy.dibv5").write_bytes(dibv5)
+    manifest_name, manifest_bytes = _write_manifest(
+        tmp_path,
+        session_id,
+        request_id,
+        {
+            "protocol": 1,
+            "session_id": session_id,
+            "request_id": request_id,
+            "kind": "image",
+            "png_file": "legacy.png",
+            "png_bytes": len(png),
+            "dibv5_file": "legacy.dibv5",
+            "dibv5_bytes": len(dibv5),
+        },
+    )
+    events: list[dict[str, object]] = []
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        ImagePayloadStore(tmp_path, session_id=session_id),
+        events.append,
+        sleep=lambda _delay: None,
+    )
+
+    broker.handle(
+        {
+            "type": "write_clipboard",
+            "request_id": request_id,
+            "kind": "image",
+            "manifest": manifest_name,
+            "manifest_bytes": manifest_bytes,
+        }
+    )
+
+    assert events[-1]["ok"] is True
+    assert struct.unpack_from("<IiiHHII", api.payloads[CF_DIB]) == (
+        40,
+        1,
+        1,
+        1,
+        32,
+        0,
+        4,
+    )
+    assert api.payloads[CF_DIB][40:] == b"\x01\x02\x03\x04"
 
 
 def test_broker_initial_ack_requires_matching_request_marker(
@@ -538,6 +637,191 @@ def test_broker_initial_ack_requires_matching_request_marker(
     assert api.payloads[api.internal_write_format] == request_id.encode("ascii") + b"\0"
     assert events[-1]["ok"] is False
     assert events[-1]["code"] == "verification_failed"
+
+
+def test_broker_write_ack_returns_stable_sequence_after_format_synthesis(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    session_id = "e" * 32
+    request_id = "f" * 32
+    api = FakeClipboardApi(sequence=50)
+    original_global_bytes = api.global_bytes
+    marker_reads = 0
+
+    def synthesize_on_first_marker_read(format_id: int) -> bytes:
+        nonlocal marker_reads
+        data = original_global_bytes(format_id)
+        if format_id == api.internal_write_format:
+            marker_reads += 1
+            if marker_reads == 1:
+                api.sequence += 1
+        return data
+
+    monkeypatch.setattr(api, "global_bytes", synthesize_on_first_marker_read)
+    events: list[dict[str, object]] = []
+    ignored: list[int] = []
+    store = ImagePayloadStore(tmp_path, session_id=session_id)
+    manifest_name, manifest_bytes = _write_manifest(
+        tmp_path,
+        session_id,
+        request_id,
+        {
+            "protocol": 1,
+            "session_id": session_id,
+            "request_id": request_id,
+            "kind": "text",
+            "text": "payload",
+        },
+    )
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        store,
+        events.append,
+        ignore_sequence=ignored.append,
+        sleep=lambda _delay: None,
+    )
+
+    broker.handle(
+        {
+            "type": "write_clipboard",
+            "request_id": request_id,
+            "kind": "text",
+            "manifest": manifest_name,
+            "manifest_bytes": manifest_bytes,
+        }
+    )
+
+    assert api.empty_calls == 1
+    assert marker_reads == 2
+    assert events[-1]["ok"] is True
+    assert events[-1]["sequence"] == 52
+    assert ignored == [52]
+
+
+def test_broker_initial_write_ack_still_requires_sequence_to_advance(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    session_id = "1a" * 16
+    request_id = "2b" * 16
+    api = FakeClipboardApi(sequence=60)
+    original_empty_clipboard = api.empty_clipboard
+
+    def empty_without_sequence_advance() -> bool:
+        succeeded = original_empty_clipboard()
+        api.sequence -= 1
+        return succeeded
+
+    monkeypatch.setattr(api, "empty_clipboard", empty_without_sequence_advance)
+    events: list[dict[str, object]] = []
+    store = ImagePayloadStore(tmp_path, session_id=session_id)
+    manifest_name, manifest_bytes = _write_manifest(
+        tmp_path,
+        session_id,
+        request_id,
+        {
+            "protocol": 1,
+            "session_id": session_id,
+            "request_id": request_id,
+            "kind": "text",
+            "text": "payload",
+        },
+    )
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        store,
+        events.append,
+        sleep=lambda _delay: None,
+    )
+
+    broker.handle(
+        {
+            "type": "write_clipboard",
+            "request_id": request_id,
+            "kind": "text",
+            "manifest": manifest_name,
+            "manifest_bytes": manifest_bytes,
+        }
+    )
+
+    assert events[-1]["ok"] is False
+    assert events[-1]["sequence"] == 60
+    assert events[-1]["code"] == "verification_failed"
+
+
+def test_broker_verify_accepts_old_sequence_when_content_identity_matches(
+    tmp_path: Path,
+) -> None:
+    request_id = "3c" * 16
+    api = FakeClipboardApi(sequence=72)
+    events: list[dict[str, object]] = []
+    ignored: list[int] = []
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        ImagePayloadStore(tmp_path, session_id="4d" * 16),
+        events.append,
+        ignore_sequence=ignored.append,
+        sleep=lambda _delay: None,
+    )
+    api.owner = 123
+    api.formats = [CF_UNICODETEXT, api.internal_write_format]
+    api.payloads[api.internal_write_format] = request_id.encode("ascii") + b"\0"
+
+    broker.handle(
+        {
+            "type": "verify_clipboard",
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 71,
+        }
+    )
+
+    assert events[-1]["ok"] is True
+    assert events[-1]["sequence"] == 72
+    assert ignored == [72]
+
+
+@pytest.mark.parametrize("mismatch", ["marker", "owner", "format"])
+def test_broker_verify_rejects_content_identity_mismatch(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    request_id = "5e" * 16
+    api = FakeClipboardApi(sequence=82)
+    events: list[dict[str, object]] = []
+    ignored: list[int] = []
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        ImagePayloadStore(tmp_path, session_id="6f" * 16),
+        events.append,
+        ignore_sequence=ignored.append,
+        sleep=lambda _delay: None,
+    )
+    api.owner = 123 if mismatch != "owner" else 456
+    api.formats = [CF_UNICODETEXT, api.internal_write_format]
+    if mismatch == "format":
+        api.formats.remove(CF_UNICODETEXT)
+    marker = request_id if mismatch != "marker" else "0" * 32
+    api.payloads[api.internal_write_format] = marker.encode("ascii") + b"\0"
+
+    broker.handle(
+        {
+            "type": "verify_clipboard",
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 81,
+        }
+    )
+
+    assert events[-1]["ok"] is False
+    assert events[-1]["sequence"] == 82
+    assert events[-1]["code"] == "verification_failed"
+    assert ignored == []
 
 
 def test_broker_writes_files_and_directories_as_hdrop_with_effect_and_marker(
@@ -597,9 +881,18 @@ def test_broker_failed_format_write_clears_partial_transaction_and_never_acks(
     events: list[dict[str, object]] = []
     store = ImagePayloadStore(tmp_path, session_id=session_id)
     png = _png(2, 2)
-    dibv5 = struct.pack("<IiiHH", 124, 2, 2, 1, 32) + bytes(108)
+    dibv5 = (
+        struct.pack("<IiiHHIIiiII", 124, 2, 2, 1, 32, 0, 16, 0, 0, 0, 0)
+        + bytes(84)
+        + bytes(16)
+    )
+    dib = (
+        struct.pack("<IiiHHIIiiII", 40, 2, 2, 1, 32, 0, 16, 0, 0, 0, 0)
+        + bytes(16)
+    )
     (tmp_path / "image.png").write_bytes(png)
     (tmp_path / "image.dibv5").write_bytes(dibv5)
+    (tmp_path / "image.dib").write_bytes(dib)
     manifest = {
         "protocol": 1,
         "session_id": session_id,
@@ -609,6 +902,8 @@ def test_broker_failed_format_write_clears_partial_transaction_and_never_acks(
         "png_bytes": len(png),
         "dibv5_file": "image.dibv5",
         "dibv5_bytes": len(dibv5),
+        "dib_file": "image.dib",
+        "dib_bytes": len(dib),
     }
     manifest_name, manifest_bytes = _write_manifest(tmp_path, session_id, request_id, manifest)
     broker = WindowsClipboardBroker(api, 123, store, events.append, sleep=lambda _delay: None)
@@ -627,7 +922,7 @@ def test_broker_failed_format_write_clears_partial_transaction_and_never_acks(
     assert api.formats == []
     assert api.payloads == {}
     assert api.global_handles == {}
-    assert len(api.freed_handles) == 2
+    assert len(api.freed_handles) == 3
     assert api.close_calls == 1
     assert events[-1]["ok"] is False
     assert events[-1]["code"] == "clipboard_write_failed"

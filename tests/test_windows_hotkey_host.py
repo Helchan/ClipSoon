@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import io
 import json
+import types
 
 import pytest
 
@@ -15,6 +17,8 @@ from clipsoon.windows_hotkey_host import (
     JsonLineEmitter,
     NativeHotkeyEngine,
     WindowsHotkeyHost,
+    _GuiThreadInfo,
+    _Win32Api,
     is_shutdown_command,
     parse_registered_hotkey,
 )
@@ -65,6 +69,11 @@ class _FakeWindowsApi:
         self.mutex_available = True
         self.parent_exited = False
         self.foreground = 909
+        self.focus = 808
+        self.target_thread_id = 7001
+        self.target_process_id = 8001
+        self.focus_thread_id = 7002
+        self.focus_process_id = 8001
         self.foreground_handoffs: list[int] = []
         self.activation_order: list[tuple[str, int]] = []
 
@@ -81,6 +90,19 @@ class _FakeWindowsApi:
     def foreground_window(self) -> int:
         self.activation_order.append(("target", self.foreground))
         return self.foreground
+
+    def window_thread_process_id(self, hwnd: int) -> tuple[int, int]:
+        self.activation_order.append(("identity", hwnd))
+        if hwnd == self.foreground:
+            return self.target_thread_id, self.target_process_id
+        if hwnd == self.focus:
+            return self.focus_thread_id, self.focus_process_id
+        raise OSError("unknown window")
+
+    def focus_window(self, thread_id: int) -> int:
+        self.activation_order.append(("focus", thread_id))
+        assert thread_id == self.target_thread_id
+        return self.focus
 
     def allow_set_foreground_window(self, process_id: int) -> bool:
         self.foreground_handoffs.append(process_id)
@@ -118,6 +140,36 @@ class _FakeWindowsApi:
         self.closed = True
 
 
+def test_win32_api_reads_window_identity_and_gui_thread_focus(monkeypatch) -> None:
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(ctypes, "set_last_error", lambda _value: None, raising=False)
+
+    def get_window_thread_process_id(hwnd, process_pointer) -> int:
+        calls.append(("identity", int(hwnd.value)))
+        ctypes.cast(process_pointer, ctypes.POINTER(ctypes.c_uint32)).contents.value = 8001
+        return 7001
+
+    def get_gui_thread_info(thread_id, information_pointer) -> int:
+        calls.append(("focus", int(thread_id.value)))
+        information = ctypes.cast(
+            information_pointer,
+            ctypes.POINTER(_GuiThreadInfo),
+        ).contents
+        assert information.cbSize == ctypes.sizeof(_GuiThreadInfo)
+        information.hwndFocus = 808
+        return 1
+
+    api = object.__new__(_Win32Api)
+    api.user32 = types.SimpleNamespace(
+        GetWindowThreadProcessId=get_window_thread_process_id,
+        GetGUIThreadInfo=get_gui_thread_info,
+    )
+
+    assert api.window_thread_process_id(909) == (7001, 8001)
+    assert api.focus_window(7001) == 808
+    assert calls == [("identity", 909), ("focus", 7001)]
+
+
 def test_default_hotkey_registers_and_emits_hotkey_and_heartbeat() -> None:
     output = io.StringIO()
     api = _FakeWindowsApi()
@@ -140,8 +192,19 @@ def test_default_hotkey_registers_and_emits_hotkey_and_heartbeat() -> None:
     assert {message["session_id"] for message in messages} == {"host-test"}
     assert messages[0]["hotkey"] == "combo:ctrl+shift+space"
     assert messages[1]["target_hwnd"] == 909
+    assert messages[1]["target_thread_id"] == 7001
+    assert messages[1]["target_process_id"] == 8001
+    assert messages[1]["focus_hwnd"] == 808
+    assert messages[1]["focus_thread_id"] == 7002
+    assert messages[1]["focus_process_id"] == 8001
     assert messages[1]["foreground_granted"] is True
-    assert api.activation_order[:2] == [("target", 909), ("grant", 654)]
+    assert api.activation_order[:5] == [
+        ("target", 909),
+        ("identity", 909),
+        ("focus", 7001),
+        ("identity", 808),
+        ("grant", 654),
+    ]
     assert len(api.registered_hotkeys) == 1
     hwnd, hotkey_id, modifiers, virtual_key = api.registered_hotkeys[0]
     assert (hwnd, hotkey_id, virtual_key) == (101, 1, 0x20)
@@ -151,6 +214,73 @@ def test_default_hotkey_registers_and_emits_hotkey_and_heartbeat() -> None:
     assert api.unregistered_hotkeys == [(101, 1)]
     assert api.timers == [(101, HEARTBEAT_TIMER_ID, 1_250)]
     assert api.closed
+
+
+def test_hotkey_context_omits_focus_fields_when_target_thread_has_no_focus() -> None:
+    api = _FakeWindowsApi()
+    api.focus = 0
+    host = WindowsHotkeyHost(
+        output=io.StringIO(),
+        control_input=None,
+        api=api,
+        parent_pid=654,
+    )
+
+    context = host._activation_context()
+
+    assert context == {
+        "target_hwnd": 909,
+        "target_thread_id": 7001,
+        "target_process_id": 8001,
+        "foreground_granted": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("target_identity", "gui_thread_info", "focus_identity"),
+)
+def test_hotkey_context_focus_snapshot_failure_falls_back_to_top_level_target(
+    failure_stage: str,
+) -> None:
+    api = _FakeWindowsApi()
+    original_identity = api.window_thread_process_id
+
+    if failure_stage == "target_identity":
+        api.window_thread_process_id = (  # type: ignore[method-assign]
+            lambda _hwnd: (_ for _ in ()).throw(OSError("target identity unavailable"))
+        )
+    elif failure_stage == "gui_thread_info":
+        api.focus_window = (  # type: ignore[method-assign]
+            lambda _thread_id: (_ for _ in ()).throw(OSError("GUI state unavailable"))
+        )
+    else:
+        api.window_thread_process_id = (  # type: ignore[method-assign]
+            lambda hwnd: (
+                (_ for _ in ()).throw(OSError("focus identity unavailable"))
+                if hwnd == api.focus
+                else original_identity(hwnd)
+            )
+        )
+    host = WindowsHotkeyHost(
+        output=io.StringIO(),
+        control_input=None,
+        api=api,
+        parent_pid=654,
+    )
+
+    expected: dict[str, object] = {
+        "target_hwnd": 909,
+        "foreground_granted": True,
+    }
+    if failure_stage != "target_identity":
+        expected.update(
+            {
+                "target_thread_id": 7001,
+                "target_process_id": 8001,
+            }
+        )
+    assert host._activation_context() == expected
 
 
 def test_custom_combo_hotkey_uses_register_hotkey() -> None:

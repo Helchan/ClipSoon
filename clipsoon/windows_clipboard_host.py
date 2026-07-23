@@ -70,6 +70,7 @@ _MAX_RETRY_INTERVAL_MS = 1_000
 _HEARTBEAT_INTERVAL_MS = 500
 _MAX_MATERIALIZATION_SECONDS = 120.0
 _WRITE_OPEN_RETRY_DELAYS_SECONDS = (0.0, 0.005, 0.015, 0.03)
+_IDENTITY_VERIFY_ATTEMPTS = 4
 STD_INPUT_HANDLE = -10
 STD_OUTPUT_HANDLE = -11
 ERROR_BROKEN_PIPE = 109
@@ -513,6 +514,53 @@ def _dib_to_bmp(dib: bytes) -> tuple[bytes, int, int]:
     return file_header + dib, int(width), int(height)
 
 
+def _dibv5_to_dib(dibv5: bytes) -> bytes:
+    """Build the conservative 40-byte BI_RGB form used by older consumers."""
+
+    if len(dibv5) < 124:
+        raise ClipboardDataError("DIBV5 payload is truncated")
+    (
+        header_bytes,
+        width,
+        height,
+        planes,
+        bits,
+        compression,
+        image_bytes,
+        x_pixels_per_meter,
+        y_pixels_per_meter,
+        colors_used,
+        colors_important,
+    ) = struct.unpack_from("<IiiHHIIiiII", dibv5)
+    if (
+        header_bytes < 124
+        or header_bytes > len(dibv5)
+        or width <= 0
+        or height == 0
+        or planes != 1
+        or bits != 32
+        or compression != 0
+        or image_bytes <= 0
+        or header_bytes + image_bytes > len(dibv5)
+    ):
+        raise ClipboardDataError("DIBV5 payload cannot be converted to BI_RGB DIB")
+    header = struct.pack(
+        "<IiiHHIIiiII",
+        40,
+        width,
+        height,
+        planes,
+        bits,
+        compression,
+        image_bytes,
+        x_pixels_per_meter,
+        y_pixels_per_meter,
+        colors_used,
+        colors_important,
+    )
+    return header + dibv5[header_bytes : header_bytes + image_bytes]
+
+
 class ClipboardHost:
     """Coordinates sequence de-duplication, retry timers, and protocol events."""
 
@@ -761,13 +809,13 @@ class WindowsClipboardBroker:
             )
             return
 
-        current_sequence = self.api.sequence_number()
-        if current_sequence and self._matches_current(value, current_sequence, require_owner=True):
-            self.ignore_sequence(current_sequence)
-            self._emit_result("write_result", request_id, kind, True, current_sequence)
+        matching_sequence = self._matching_current_sequence(value, require_owner=True)
+        if matching_sequence is not None:
+            self.ignore_sequence(matching_sequence)
+            self._emit_result("write_result", request_id, kind, True, matching_sequence)
             return
 
-        before_sequence = current_sequence
+        before_sequence = self.api.sequence_number()
         handles: list[int] = []
         try:
             for _format_id, data in value.formats:
@@ -858,25 +906,32 @@ class WindowsClipboardBroker:
             )
             return
 
-        sequence = self.api.sequence_number()
-        complete = (
-            bool(sequence)
-            and sequence != before_sequence
-            and self._matches_current(value, sequence, require_owner=True)
-        )
-        if not complete:
+        written_sequence = self.api.sequence_number()
+        if not written_sequence or written_sequence == before_sequence:
             self._emit_result(
                 "write_result",
                 request_id,
                 kind,
                 False,
-                sequence,
+                written_sequence,
                 "verification_failed",
-                "clipboard sequence, owner, or formats did not verify",
+                "clipboard sequence did not advance after the write",
             )
             return
-        self.ignore_sequence(sequence)
-        self._emit_result("write_result", request_id, kind, True, sequence)
+        matching_sequence = self._matching_current_sequence(value, require_owner=True)
+        if matching_sequence is None:
+            self._emit_result(
+                "write_result",
+                request_id,
+                kind,
+                False,
+                self.api.sequence_number(),
+                "verification_failed",
+                "clipboard marker, owner, or formats did not verify",
+            )
+            return
+        self.ignore_sequence(matching_sequence)
+        self._emit_result("write_result", request_id, kind, True, matching_sequence)
 
     def _verify(self, command: Mapping[str, Any]) -> None:
         request_id = self._request_id(command)
@@ -900,9 +955,16 @@ class WindowsClipboardBroker:
             )
             return
         value = self._verification_shape(request_id, kind)
-        if self._matches_current(value, sequence, require_owner=True):
-            self.ignore_sequence(sequence)
-            self._emit_result("verify_result", request_id, kind, True, sequence)
+        matching_sequence = self._matching_current_sequence(value, require_owner=True)
+        if matching_sequence is not None:
+            self.ignore_sequence(matching_sequence)
+            self._emit_result(
+                "verify_result",
+                request_id,
+                kind,
+                True,
+                matching_sequence,
+            )
             return
         self._emit_result(
             "verify_result",
@@ -911,7 +973,7 @@ class WindowsClipboardBroker:
             False,
             self.api.sequence_number(),
             "verification_failed",
-            "clipboard sequence, marker, owner, or formats did not verify",
+            "clipboard marker, owner, or formats did not verify",
         )
 
     def _load_write(
@@ -1000,12 +1062,57 @@ class WindowsClipboardBroker:
                 maximum=_MAX_IMAGE_BYTES,
                 label="DIBV5 payload",
             )
-            _png_dimensions(png)
-            if len(dibv5) < 124 or struct.unpack_from("<I", dibv5)[0] < 124:
-                raise ClipboardDataError("DIBV5 payload has an invalid header")
+            if manifest.get("dib_file") is None and manifest.get("dib_bytes") is None:
+                # Protocol 1 originally carried only DIBV5. Deriving the eager
+                # compatibility DIB keeps an old in-flight manifest usable
+                # during a helper restart while all new writers provide both.
+                dib = _dibv5_to_dib(dibv5)
+            else:
+                dib = self._read_ipc_file(
+                    manifest.get("dib_file"),
+                    manifest.get("dib_bytes"),
+                    maximum=_MAX_IMAGE_BYTES,
+                    label="DIB payload",
+                )
+            png_dimensions = _png_dimensions(png)
+            compatible_dib = _dibv5_to_dib(dibv5)
+            if len(dib) < 40:
+                raise ClipboardDataError("DIB payload has an invalid header")
+            (
+                dib_header_bytes,
+                dib_width,
+                dib_height,
+                dib_planes,
+                dib_bits,
+                dib_compression,
+                dib_image_bytes,
+            ) = struct.unpack_from("<IiiHHII", dib)
+            if (
+                dib_header_bytes != 40
+                or dib_width <= 0
+                or dib_height == 0
+                or dib_planes != 1
+                or dib_bits != 32
+                or dib_compression != 0
+                or dib_image_bytes <= 0
+                or dib_header_bytes + dib_image_bytes > len(dib)
+            ):
+                raise ClipboardDataError("DIB payload has an invalid bitmap layout")
+            compatible_width, compatible_height = struct.unpack_from(
+                "<ii",
+                compatible_dib,
+                4,
+            )
+            if (
+                (abs(dib_width), abs(dib_height)) != png_dimensions
+                or (abs(compatible_width), abs(compatible_height))
+                != png_dimensions
+            ):
+                raise ClipboardDataError("PNG, DIBV5, and DIB dimensions do not match")
             formats = (
                 (self.png_format, png),
                 (CF_DIBV5, dibv5),
+                (CF_DIB, dib),
                 (self.internal_write_format, marker),
             )
         return _ClipboardWrite(request_id, kind, formats)
@@ -1024,41 +1131,52 @@ class WindowsClipboardBroker:
             formats = (
                 (self.png_format, b""),
                 (CF_DIBV5, b""),
+                (CF_DIB, b""),
                 (self.internal_write_format, marker),
             )
         return _ClipboardWrite(request_id, kind, formats)
 
-    def _matches_current(
+    def _matching_current_sequence(
         self,
         value: _ClipboardWrite,
-        sequence: int,
         *,
         require_owner: bool,
-    ) -> bool:
-        if (
-            self.api.sequence_number() != sequence
-            or (require_owner and self.api.clipboard_owner() != self.owner)
-            or not self._formats_available(value)
-            or not self._open_with_retry()
-        ):
-            return False
-        matches = False
-        try:
-            matches = (
-                self.api.sequence_number() == sequence
-                and self.api.global_bytes(self.internal_write_format)[
-                    : len(value.request_id) + 1
-                ]
-                == value.request_id.encode("ascii") + b"\0"
-            )
-        except Exception:
-            matches = False
-        closed = self.api.close_clipboard()
-        return bool(closed and matches and self.api.sequence_number() == sequence)
+    ) -> int | None:
+        expected_marker = value.request_id.encode("ascii") + b"\0"
+        for _attempt in range(_IDENTITY_VERIFY_ATTEMPTS):
+            before_sequence = self.api.sequence_number()
+            if (
+                before_sequence <= 0
+                or (require_owner and self.api.clipboard_owner() != self.owner)
+                or not self._formats_available(value)
+                or not self._open_with_retry()
+            ):
+                return None
+            marker_matches = False
+            try:
+                marker_matches = (
+                    self.api.global_bytes(self.internal_write_format)[
+                        : len(expected_marker)
+                    ]
+                    == expected_marker
+                )
+            except Exception:
+                marker_matches = False
+            closed = self.api.close_clipboard()
+            if not closed or not marker_matches:
+                return None
+            after_sequence = self.api.sequence_number()
+            if after_sequence == before_sequence:
+                return after_sequence
+            # Reading or synthesizing a compatible clipboard format may
+            # legitimately advance the system sequence.  Revalidate the full
+            # content identity at the new sequence; an external overwrite will
+            # fail the owner, marker, or required-format checks on that pass.
+        return None
 
     def _formats_available(self, value: _ClipboardWrite) -> bool:
         required = [format_id for format_id, _data in value.formats]
-        if value.kind == "image":
+        if value.kind == "image" and CF_DIB not in required:
             required.append(CF_DIB)
         return all(self.api.is_format_available(format_id) for format_id in required)
 

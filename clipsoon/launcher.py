@@ -35,6 +35,10 @@ def run_windows_helper(role: str, arguments: list[str]) -> int:
         from clipsoon.windows_hotkey_host import main as worker_main
     elif role == "clipboard":
         from clipsoon.windows_clipboard_host import main as worker_main
+    elif role == "focus":
+        from clipsoon.windows_focus_host import main as worker_main
+    elif role == "paste":
+        from clipsoon.windows_paste_host import main as worker_main
     else:
         return 64
     return int(worker_main(arguments))

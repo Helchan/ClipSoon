@@ -236,13 +236,26 @@ def test_hotkey_context_preserves_target_across_panel_activation_retry(
     application.clipboard.start()
     activation_results = iter((False, True))
     activation_requests: list[int] = []
+    captured_target_arguments: list[tuple[int, dict[str, int | None]]] = []
     foreground = [303]
     monkeypatch.setattr(PlatformBridge, "accessibility_permission_status", lambda: None)
     monkeypatch.setattr(PlatformBridge, "is_windows", lambda: True)
     monkeypatch.setattr(
         PlatformBridge,
         "target_from_window_id",
-        lambda identifier: ForegroundTargetHandle("windows", identifier, "Editor"),
+        lambda identifier, **details: (
+            captured_target_arguments.append((identifier, details))
+            or ForegroundTargetHandle(
+                "windows",
+                identifier,
+                "Editor",
+                details["target_thread_id"],
+                details["target_process_id"],
+                details["focus_window"],
+                details["focus_thread_id"],
+                details["focus_process_id"],
+            )
+        ),
     )
     monkeypatch.setattr(
         PlatformBridge,
@@ -260,12 +273,41 @@ def test_hotkey_context_preserves_target_across_panel_activation_retry(
 
     monkeypatch.setattr(PlatformBridge, "request_window_activation", request_activation)
     application.show_panel(
-        HotkeyActivationContext(target_window=303, foreground_granted=True)
+        HotkeyActivationContext(
+            target_window=303,
+            target_thread_id=7001,
+            target_process_id=8001,
+            focus_window=304,
+            focus_thread_id=7002,
+            focus_process_id=8001,
+            foreground_granted=True,
+        )
     )
 
     qtbot.waitUntil(lambda: len(activation_requests) == 2, timeout=500)
     panel_window = int(application.panel.winId())
-    assert application.target == ForegroundTargetHandle("windows", 303, "Editor")
+    assert application.target == ForegroundTargetHandle(
+        "windows",
+        303,
+        "Editor",
+        7001,
+        8001,
+        304,
+        7002,
+        8001,
+    )
+    assert captured_target_arguments == [
+        (
+            303,
+            {
+                "target_thread_id": 7001,
+                "target_process_id": 8001,
+                "focus_window": 304,
+                "focus_thread_id": 7002,
+                "focus_process_id": 8001,
+            },
+        )
+    ]
     assert activation_requests == [panel_window, panel_window]
     assert application._panel_guard.initial_foreground == 303
     assert application._panel_guard.saw_panel_foreground
