@@ -439,6 +439,28 @@ def test_file_missing_probe_preserves_items_when_storage_root_is_unavailable(
     assert not core_module._file_path_is_definitively_missing(file_path)
 
 
+@pytest.mark.parametrize(
+    ("file_path", "storage_root"),
+    [
+        (r"Z:\projects\missing.txt", "Z:\\"),
+        (r"\\server\share\projects\missing.txt", "\\\\server\\share\\"),
+        ("/Volumes/Archive/projects/missing.txt", "/Volumes/Archive"),
+        ("/home/user/missing.txt", "/"),
+        ("relative/missing.txt", None),
+    ],
+)
+def test_file_storage_root_uses_the_paths_own_flavor(
+    file_path: str,
+    storage_root: str | None,
+) -> None:
+    assert core_module._file_storage_root(file_path) == storage_root
+
+
+def test_same_storage_path_keeps_posix_case_semantics() -> None:
+    assert core_module._same_storage_path("/Volumes/Archive", "/Volumes/Archive")
+    assert not core_module._same_storage_path("/Volumes/archive", "/Volumes/Archive")
+
+
 def test_file_missing_probe_removes_unc_child_when_share_is_reachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

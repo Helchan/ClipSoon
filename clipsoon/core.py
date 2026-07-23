@@ -6,6 +6,7 @@ import hashlib
 import json
 import ntpath
 import os
+import posixpath
 import sqlite3
 import threading
 import time
@@ -796,11 +797,19 @@ def _file_storage_root(path: str) -> str | None:
     if windows_drive:
         return f"{windows_drive}\\"
 
-    candidate = Path(path)
-    parts = candidate.parts
-    if len(parts) >= 3 and parts[0] == os.path.sep and parts[1] == "Volumes":
-        return str(Path(os.path.sep, "Volumes", parts[2]))
-    return candidate.anchor or None
+    # Stored clipboard paths can outlive the OS that captured them (for
+    # example, when a database is copied from macOS to Windows).  Parse POSIX
+    # paths with POSIX rules instead of the current host's ``Path`` flavour;
+    # otherwise Windows rewrites ``/Volumes/Archive`` to
+    # ``\Volumes\Archive`` and probes a different path.
+    if path.startswith("/"):
+        normalized = posixpath.normpath(path)
+        parts = normalized.split("/")
+        if len(parts) >= 3 and parts[1] == "Volumes" and parts[2]:
+            return posixpath.join("/", "Volumes", parts[2])
+        return "/"
+
+    return Path(path).anchor or None
 
 
 def _storage_root_is_reachable(storage_root: str) -> bool:
@@ -817,6 +826,8 @@ def _same_storage_path(path: str, storage_root: str) -> bool:
         return ntpath.normcase(ntpath.normpath(path)) == ntpath.normcase(
             ntpath.normpath(storage_root)
         )
+    if path.startswith("/") or storage_root.startswith("/"):
+        return posixpath.normpath(path) == posixpath.normpath(storage_root)
     return os.path.normcase(os.path.normpath(path)) == os.path.normcase(
         os.path.normpath(storage_root)
     )

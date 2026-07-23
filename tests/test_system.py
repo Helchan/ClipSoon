@@ -41,7 +41,11 @@ from clipsoon.system import (
 )
 
 
-def test_windows_ipc_cleanup_preserves_only_live_helper_sessions(tmp_path: Path) -> None:
+def test_windows_ipc_cleanup_preserves_only_live_helper_sessions(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
     clipboard = FakeClipboard()
     controller, repository = make_controller(tmp_path, clipboard)
     controller._windows_ipc_dir.mkdir(parents=True, exist_ok=True)
@@ -71,6 +75,7 @@ def test_windows_ipc_cleanup_preserves_only_live_helper_sessions(tmp_path: Path)
     assert not stale_payload.exists()
     assert not stale_dib.exists()
     assert not legacy.exists()
+    controller.stop()
     repository.close()
 
 
@@ -240,7 +245,12 @@ def make_controller(tmp_path: Path, clipboard: FakeClipboard) -> tuple[Clipboard
     return controller, repository
 
 
-def test_clipboard_capture_precedence_and_self_write(qtbot, tmp_path: Path) -> None:
+def test_clipboard_capture_precedence_and_self_write(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
     clipboard = FakeClipboard()
     controller, repository = make_controller(tmp_path, clipboard)
     captured: list[ClipItem] = []
@@ -1011,7 +1021,8 @@ def test_windows_verify_reports_changed_sequence_without_waiting_for_timeout(
     repository.close()
 
 
-def test_async_image_capture(qtbot, tmp_path: Path) -> None:
+def test_async_image_capture(qtbot, monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
     clipboard = FakeClipboard()
     controller, repository = make_controller(tmp_path, clipboard)
     captured: list[ClipItem] = []
@@ -1145,7 +1156,12 @@ def test_native_windows_manifest_task_converts_image_and_cleans_payload(tmp_path
     repository.close()
 
 
-def test_clipboard_capture_waits_for_owner_and_retries_without_losing_item(qtbot, tmp_path: Path) -> None:
+def test_clipboard_capture_waits_for_owner_and_retries_without_losing_item(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
     clipboard = FlakyClipboard(failures=2)
     controller, repository = make_controller(tmp_path, clipboard)
     captured: list[ClipItem] = []
@@ -1165,7 +1181,12 @@ def test_clipboard_capture_waits_for_owner_and_retries_without_losing_item(qtbot
     repository.close()
 
 
-def test_clipboard_capture_coalesces_rapid_changes_to_latest_sequence(qtbot, tmp_path: Path) -> None:
+def test_clipboard_capture_coalesces_rapid_changes_to_latest_sequence(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
     clipboard = FakeClipboard()
     controller, repository = make_controller(tmp_path, clipboard)
     captured: list[ClipItem] = []
@@ -1184,7 +1205,12 @@ def test_clipboard_capture_coalesces_rapid_changes_to_latest_sequence(qtbot, tmp
     repository.close()
 
 
-def test_delayed_clipboard_capture_keeps_source_from_change_notification(qtbot, tmp_path: Path) -> None:
+def test_delayed_clipboard_capture_keeps_source_from_change_notification(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
     clipboard = FakeClipboard()
     source = ["Copying app"]
     repository = HistoryRepository(tmp_path)
@@ -1204,7 +1230,12 @@ def test_delayed_clipboard_capture_keeps_source_from_change_notification(qtbot, 
     repository.close()
 
 
-def test_clipboard_pause_secret_poll_and_write_formats(qtbot, tmp_path: Path) -> None:
+def test_clipboard_pause_secret_poll_and_write_formats(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
     clipboard = FakeClipboard()
     settings = AppSettings(capture_enabled=False)
     repository = HistoryRepository(tmp_path)
@@ -1258,6 +1289,7 @@ def test_sensitive_clipboard_opt_out_always_wins() -> None:
 
 
 def test_hotkey_service_listener_lifecycle_and_failure(monkeypatch) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
     events: list[str] = []
 
     class FakeListener:
@@ -1308,6 +1340,8 @@ def test_hotkey_service_listener_lifecycle_and_failure(monkeypatch) -> None:
 
 
 def test_hotkey_service_detects_listener_that_stopped_after_start(monkeypatch) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
+
     class FakeListener:
         IS_TRUSTED = True
 
@@ -1336,6 +1370,8 @@ def test_hotkey_service_detects_listener_that_stopped_after_start(monkeypatch) -
 
 
 def test_hotkey_service_detects_listener_thread_that_died_with_running_flag(monkeypatch) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "linux")
+
     class FakeListener:
         running = True
 

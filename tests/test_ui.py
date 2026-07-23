@@ -228,7 +228,8 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
     ]
     if dialog.hotkey_mode is not None:
         controls.insert(0, dialog.hotkey_mode)
-    assert len({control.width() for control in controls}) == 1
+    visible_controls = [control for control in controls if not control.isHidden()]
+    assert len({control.width() for control in visible_controls}) == 1
 
 
 def test_state_memory_setting_is_an_optional_three_second_default(qtbot) -> None:
