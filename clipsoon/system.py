@@ -20,7 +20,15 @@ from pathlib import Path
 from PySide6.QtCore import QBuffer, QIODevice, QMimeData, QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QClipboard, QImage
 
-from clipsoon.core import AppSettings, ClipItem, ClipKind, HistoryRepository
+from clipsoon.core import (
+    WINDOWS_DEFAULT_HOTKEY,
+    AppSettings,
+    ClipItem,
+    ClipKind,
+    FileItemClaimStatus,
+    HistoryRepository,
+    ValidatedFileItem,
+)
 from clipsoon.windows_workers import WindowsWorkerSupervisor
 
 LOGGER = logging.getLogger(__name__)
@@ -29,6 +37,11 @@ _CLIPBOARD_SETTLE_MS = 70
 _CLIPBOARD_RETRY_DELAYS_MS = (90, 180)
 _WINDOWS_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 _WINDOWS_IMAGE_MAX_BYTES = 256 * 1024 * 1024
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_WINDOWS_PNG_MIME = 'application/x-qt-windows-mime;value="PNG"'
+_WINDOWS_INTERNAL_WRITE_MIME = 'application/x-qt-windows-mime;value="ClipSoon.InternalWrite"'
+_FILE_VALIDATION_TIMEOUT_MS = 3_000
+_MAX_CONCURRENT_FILE_VALIDATIONS = 2
 
 
 def _windows_ipc_session(name: str) -> str | None:
@@ -158,28 +171,40 @@ class GlobalHotkeyService:
         self,
         activated: Callable[[HotkeyActivationContext | None], None],
         failed: Callable[[str], None],
+        ready: Callable[[str], None] | None = None,
+        registration_failed: Callable[[str, str], None] | None = None,
     ) -> None:
         self._activated = activated
         self._failed = failed
+        self._ready = ready
+        self._registration_failed = registration_failed
         self._listener = None
         self._machine: HotkeyStateMachine | None = None
         self._windows_worker: WindowsWorkerSupervisor | None = None
+        self._windows_hotkey = ""
+        self._suppressed_windows_failure: str | None = None
 
     def start(self, settings: AppSettings) -> None:
         self.stop()
         if sys.platform == "win32":
+            hotkey = settings.hotkey
+            if not hotkey.startswith("combo:"):
+                hotkey = WINDOWS_DEFAULT_HOTKEY
+                self._failed(
+                    "Windows 已停用不可靠的双修饰键监听，"
+                    "当前使用 Ctrl+Shift+Space；可在设置中修改组合键。"
+                )
             worker = WindowsWorkerSupervisor(
                 "hotkey",
                 lambda: [
                     "--hotkey",
-                    settings.hotkey,
-                    "--interval-ms",
-                    str(settings.double_tap_interval_ms),
+                    hotkey,
                 ],
             )
             worker.message.connect(self._on_windows_message)
-            worker.failed.connect(self._failed)
+            worker.failed.connect(self._on_windows_failure)
             self._windows_worker = worker
+            self._windows_hotkey = hotkey
             worker.start()
             return
         self._machine = HotkeyStateMachine(
@@ -203,6 +228,8 @@ class GlobalHotkeyService:
         if self._windows_worker is not None:
             self._windows_worker.stop()
             self._windows_worker = None
+        self._windows_hotkey = ""
+        self._suppressed_windows_failure = None
         if self._listener is not None:
             try:
                 self._listener.stop()
@@ -224,21 +251,41 @@ class GlobalHotkeyService:
         return not callable(is_alive) or bool(is_alive())
 
     def _on_windows_message(self, message: object) -> None:
-        if isinstance(message, dict) and message.get("type") == "hotkey":
-            raw_target = message.get("target_hwnd")
-            target_window = (
-                raw_target
-                if isinstance(raw_target, int)
-                and not isinstance(raw_target, bool)
-                and raw_target > 0
-                else None
+        if not isinstance(message, dict):
+            return
+        kind = message.get("type")
+        if kind == "ready":
+            if self._ready is not None:
+                self._ready(self._windows_hotkey)
+            return
+        if kind == "error" and message.get("code") == "registration_failed":
+            text = str(message.get("message") or "Windows 热键注册失败")
+            if self._registration_failed is not None:
+                self._suppressed_windows_failure = text
+                self._registration_failed(self._windows_hotkey, text)
+            return
+        if kind != "hotkey":
+            return
+        raw_target = message.get("target_hwnd")
+        target_window = (
+            raw_target
+            if isinstance(raw_target, int)
+            and not isinstance(raw_target, bool)
+            and raw_target > 0
+            else None
+        )
+        self._activated(
+            HotkeyActivationContext(
+                target_window=target_window,
+                foreground_granted=message.get("foreground_granted") is True,
             )
-            self._activated(
-                HotkeyActivationContext(
-                    target_window=target_window,
-                    foreground_granted=message.get("foreground_granted") is True,
-                )
-            )
+        )
+
+    def _on_windows_failure(self, message: str) -> None:
+        if message == self._suppressed_windows_failure:
+            self._suppressed_windows_failure = None
+            return
+        self._failed(message)
 
     def _on_press(self, key: object) -> None:
         if self._machine is not None:
@@ -258,6 +305,26 @@ class _NativeClipboardSignals(QObject):
     stored = Signal(object, int)
     consumed = Signal(int)
     failed = Signal(str, int)
+
+
+class _FileItemValidationSignals(QObject):
+    finished = Signal(object, str)
+
+
+class _FileItemValidationTask:
+    def __init__(self, repository: HistoryRepository, item_id: str) -> None:
+        self.repository = repository
+        self.item_id = item_id
+        self.signals = _FileItemValidationSignals()
+
+    def run(self) -> None:
+        try:
+            item = self.repository.validate_file_item(self.item_id)
+        except Exception as exc:
+            LOGGER.exception("File history validation failed")
+            self.signals.finished.emit(None, str(exc))
+            return
+        self.signals.finished.emit(item, "")
 
 
 class _ImageStoreTask(QRunnable):
@@ -855,7 +922,22 @@ class ClipboardController(QObject):
             image = QImage(item.image_path)
             if image.isNull():
                 return False
+            try:
+                png = Path(item.image_path).read_bytes()
+            except OSError:
+                return False
+            if not png.startswith(_PNG_SIGNATURE):
+                buffer = QBuffer()
+                buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+                if not image.save(buffer, "PNG"):
+                    return False
+                png = bytes(buffer.data())
             mime.setImageData(image)
+            mime.setData("image/png", png)
+            if sys.platform == "win32":
+                mime.setData(_WINDOWS_PNG_MIME, png)
+        if sys.platform == "win32":
+            mime.setData(_WINDOWS_INTERNAL_WRITE_MIME, b"1")
         try:
             self._self_write = True
             self.clipboard.setMimeData(mime, QClipboard.Mode.Clipboard)
@@ -1124,10 +1206,10 @@ class PlatformBridge:
             if _windows_foreground_window() == identifier:
                 return True
 
-            # Raw Input with RIDEV_INPUTSINK does not guarantee that the helper
-            # owns Windows' "last input" foreground privilege. If the normal
-            # request is denied, temporarily join the current foreground input
-            # queue and retry from the Qt GUI thread that owns the panel.
+            # The hotkey helper and Qt GUI are separate processes, so foreground
+            # privilege transfer can still be denied. Temporarily join the
+            # current foreground input queue and retry from the panel's GUI
+            # thread.
             foreground = _windows_foreground_window()
             if not foreground:
                 return False
@@ -1262,21 +1344,131 @@ class SelectionSender(QObject):
         paste_adapter: PynputPasteAdapter,
         settings: Callable[[], AppSettings],
         hide_panel: Callable[[], None],
+        *,
+        file_validation_timeout_ms: int = _FILE_VALIDATION_TIMEOUT_MS,
     ) -> None:
         super().__init__()
         self.clipboard, self.repository = clipboard, repository
         self.paste_adapter, self._settings = paste_adapter, settings
         self._hide_panel = hide_panel
         self._busy = False
+        self._validation_tasks: set[_FileItemValidationTask] = set()
+        self._validation_generation = 0
+        self._file_validation_timeout_ms = max(50, int(file_validation_timeout_ms))
 
     def send(self, item: ClipItem, target: ForegroundTargetHandle | None) -> None:
         if self._busy:
             return
         self._busy = True
+        if item.kind is ClipKind.FILES:
+            if any(task.item_id == item.id for task in self._validation_tasks):
+                self._busy = False
+                self.finished.emit("原文件仍在验证，请稍后重试", False)
+                return
+            if len(self._validation_tasks) >= _MAX_CONCURRENT_FILE_VALIDATIONS:
+                self._busy = False
+                self.finished.emit("后台文件验证繁忙，请稍后重试", False)
+                return
+            self._validation_generation += 1
+            generation = self._validation_generation
+            self._start_file_item_validation(item.id, target, generation)
+            QTimer.singleShot(
+                self._file_validation_timeout_ms,
+                lambda: self._file_item_validation_timed_out(generation),
+            )
+            return
+        self._write_and_dispatch(item, target)
+
+    def _start_file_item_validation(
+        self,
+        item_id: str,
+        target: ForegroundTargetHandle | None,
+        generation: int,
+    ) -> None:
+        task = _FileItemValidationTask(self.repository, item_id)
+        self._validation_tasks.add(task)
+        task.signals.finished.connect(
+            lambda validated, error, task=task, target=target: self._file_item_validated(
+                task, validated, error, target, generation
+            )
+        )
+        threading.Thread(
+            target=task.run,
+            name=f"ClipSoon-file-validation-{generation}",
+            daemon=True,
+        ).start()
+
+    def _file_item_validation_timed_out(self, generation: int) -> None:
+        if generation != self._validation_generation or not self._busy:
+            return
+        self._validation_generation += 1
+        self._busy = False
+        self.finished.emit("原文件验证超时，请重试", False)
+
+    def _file_item_validated(
+        self,
+        task: _FileItemValidationTask,
+        validated: object,
+        error: str,
+        target: ForegroundTargetHandle | None,
+        generation: int,
+    ) -> None:
+        self._validation_tasks.discard(task)
+        if generation != self._validation_generation or not self._busy:
+            return
+        if error:
+            self._validation_generation += 1
+            self._busy = False
+            self.finished.emit(f"无法验证原文件：{error}", False)
+            return
+        if not isinstance(validated, ValidatedFileItem):
+            self._validation_generation += 1
+            self._busy = False
+            self.finished.emit("原文件已不存在，已从历史移除", False)
+            return
+        try:
+            claim = self.repository.consume_validated_file_item(
+                validated,
+                self.clipboard.write_item,
+            )
+        except Exception as exc:
+            LOGGER.exception("Validated file clipboard write failed")
+            self._validation_generation += 1
+            self._busy = False
+            self.finished.emit(f"无法写入系统剪贴板：{exc}", False)
+            return
+        if claim.status is FileItemClaimStatus.MISSING:
+            self._validation_generation += 1
+            self._busy = False
+            self.finished.emit("原文件已不存在，已从历史移除", False)
+            return
+        if claim.status is FileItemClaimStatus.REFRESHED:
+            item_id = claim.item.id if claim.item is not None else validated.item.id
+            self._start_file_item_validation(item_id, target, generation)
+            return
+        self._validation_generation += 1
+        if claim.status is FileItemClaimStatus.REJECTED or claim.item is None:
+            self._busy = False
+            self.finished.emit("无法写入系统剪贴板", False)
+            return
+        self._dispatch_written(claim.item, target)
+
+    def _write_and_dispatch(
+        self,
+        item: ClipItem,
+        target: ForegroundTargetHandle | None,
+    ) -> None:
         if not self.clipboard.write_item(item):
             self._busy = False
             self.finished.emit("无法写入系统剪贴板", False)
             return
+        self._dispatch_written(item, target)
+
+    def _dispatch_written(
+        self,
+        item: ClipItem,
+        target: ForegroundTargetHandle | None,
+    ) -> None:
         self.repository.mark_used(item.id)
         self._hide_panel()
         settings = self._settings()

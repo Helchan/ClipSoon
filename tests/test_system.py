@@ -4,14 +4,17 @@ import json
 import plistlib
 import subprocess
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, QObject, QUrl, Signal
+from PySide6.QtCore import QMimeData, QObject, QRunnable, QThreadPool, QUrl, Signal
 from PySide6.QtGui import QClipboard, QImage
 
+import clipsoon.core as core_module
 import clipsoon.system as system_module
-from clipsoon.core import AppSettings, ClipItem, ClipKind, HistoryRepository
+from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, ClipItem, ClipKind, HistoryRepository
 from clipsoon.system import (
     ClipboardController,
     ForegroundTargetHandle,
@@ -215,6 +218,43 @@ def test_clipboard_capture_precedence_and_self_write(qtbot, tmp_path: Path) -> N
     assert controller.write_item(captured[-1])
     assert len(repository.list_items()) == before
     controller.stop()
+    repository.close()
+
+
+def test_windows_image_write_publishes_bitmap_png_and_internal_marker(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    clipboard = FakeClipboard()
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(clipboard, repository, AppSettings, lambda: "Source")
+    controller._sequence_number = lambda: clipboard.sequence  # type: ignore[method-assign]
+    image_path = tmp_path / "outgoing.png"
+    image = QImage(3, 2, QImage.Format.Format_ARGB32)
+    image.fill(0x88FF0000)
+    assert image.save(str(image_path), "PNG")
+    png = image_path.read_bytes()
+    item = ClipItem(
+        "image",
+        ClipKind.IMAGE,
+        "hash",
+        1,
+        1,
+        image_path=str(image_path),
+        width=3,
+        height=2,
+        byte_size=len(png),
+    )
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+
+    assert controller.write_item(item)
+
+    windows_png = 'application/x-qt-windows-mime;value="PNG"'
+    internal_write = 'application/x-qt-windows-mime;value="ClipSoon.InternalWrite"'
+    assert clipboard.mime.hasImage()
+    assert bytes(clipboard.mime.data("image/png")) == png
+    assert bytes(clipboard.mime.data(windows_png)) == png
+    assert bytes(clipboard.mime.data(internal_write))
     repository.close()
 
 
@@ -570,6 +610,49 @@ def test_hotkey_service_detects_listener_thread_that_died_with_running_flag(monk
     service.stop()
 
 
+def test_windows_hotkey_service_reports_ready_and_structured_registration_failure(
+    monkeypatch,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    ready_specs: list[str] = []
+    structured_failures: list[tuple[str, str]] = []
+    display_failures: list[str] = []
+    service = GlobalHotkeyService(
+        lambda _context: None,
+        display_failures.append,
+        ready_specs.append,
+        lambda spec, message: structured_failures.append((spec, message)),
+    )
+    service.start(AppSettings(hotkey="combo:ctrl+alt+k"))
+    worker = FakeWorkerSupervisor.instances[-1]
+
+    worker.message.emit({"type": "ready"})
+    worker.message.emit(
+        {
+            "type": "error",
+            "fatal": True,
+            "code": "registration_failed",
+            "message": "shortcut already registered",
+        }
+    )
+    worker.failed.emit("shortcut already registered")
+
+    assert ready_specs == ["combo:ctrl+alt+k"]
+    assert structured_failures == [
+        ("combo:ctrl+alt+k", "shortcut already registered"),
+    ]
+    assert display_failures == []
+
+    # The supervisor emits the same fatal error through its display-only
+    # channel after the structured message. Only that paired duplicate is
+    # suppressed; a later independent failure must still reach the user.
+    worker.failed.emit("shortcut already registered")
+    assert display_failures == ["shortcut already registered"]
+    service.stop()
+
+
 def test_windows_services_use_supervised_native_workers(monkeypatch, tmp_path: Path) -> None:
     FakeWorkerSupervisor.instances.clear()
     monkeypatch.setattr(system_module.sys, "platform", "win32")
@@ -582,7 +665,10 @@ def test_windows_services_use_supervised_native_workers(monkeypatch, tmp_path: P
 
     hotkey_worker = FakeWorkerSupervisor.instances[-1]
     assert hotkey_worker.role == "hotkey"
-    assert hotkey_worker.arguments() == ["--hotkey", "double:shift", "--interval-ms", "360"]
+    assert hotkey_worker.arguments() == ["--hotkey", WINDOWS_DEFAULT_HOTKEY]
+    assert len(failures) == 1
+    assert "双修饰键" in failures[0]
+    assert "Ctrl+Shift+Space" in failures[0]
     hotkey_worker.message.emit(
         {
             "type": "hotkey",
@@ -592,6 +678,13 @@ def test_windows_services_use_supervised_native_workers(monkeypatch, tmp_path: P
     )
     assert contexts == [HotkeyActivationContext(target_window=404, foreground_granted=True)]
     assert hotkey.is_running
+
+    failure_count = len(failures)
+    hotkey.start(AppSettings(hotkey="combo:alt+space", double_tap_interval_ms=777))
+    custom_hotkey_worker = FakeWorkerSupervisor.instances[-1]
+    assert custom_hotkey_worker.role == "hotkey"
+    assert custom_hotkey_worker.arguments() == ["--hotkey", "combo:alt+space"]
+    assert len(failures) == failure_count
 
     monkeypatch.setattr(ClipboardController, "_sequence_number", lambda _self: 77)
     clipboard = FakeClipboard()
@@ -611,6 +704,7 @@ def test_windows_services_use_supervised_native_workers(monkeypatch, tmp_path: P
     hotkey.stop()
     assert clipboard_worker.stopped == 1
     assert hotkey_worker.stopped == 1
+    assert custom_hotkey_worker.stopped == 1
     repository.close()
 
 
@@ -815,6 +909,9 @@ class FakeRepository:
     def __init__(self) -> None:
         self.used: list[str] = []
 
+    def validate_file_item(self, _item_id: str) -> ClipItem | None:
+        return None
+
     def mark_used(self, item_id: str) -> None:
         self.used.append(item_id)
 
@@ -877,6 +974,312 @@ def test_selection_sender_copy_only_write_failure_and_inactive(qtbot) -> None:
     sender.send(clip, InactiveTarget())  # type: ignore[arg-type]
     qtbot.waitUntil(lambda: len(finished) == 3, timeout=1_000)
     assert finished[-1] == ("已复制，但目标窗口未激活", False)
+
+
+def test_selection_sender_removes_file_item_deleted_before_send(qtbot, tmp_path: Path) -> None:
+    repository = HistoryRepository(tmp_path)
+    path = tmp_path / "deleted-before-send.txt"
+    path.write_text("gone", encoding="utf-8")
+    item = repository.add_files((str(path),))
+    path.unlink()
+    writer, paste = FakeWriter(), FakePaste()
+    hidden: list[bool] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: hidden.append(True),
+    )
+    finished: list[tuple[str, bool]] = []
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send(item, FakeTarget())  # type: ignore[arg-type]
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert finished == [("原文件已不存在，已从历史移除", False)]
+    assert repository.get(item.id) is None
+    assert writer.writes == []
+    assert paste.count == 0
+    assert hidden == []
+    repository.close()
+
+
+def test_selection_sender_rejects_row_already_removed_by_background_sweep(
+    qtbot, tmp_path: Path
+) -> None:
+    repository = HistoryRepository(tmp_path)
+    path = tmp_path / "stale-ui-item.txt"
+    path.write_text("stale", encoding="utf-8")
+    stale_ui_item = repository.add_files((str(path),))
+    assert repository.delete(stale_ui_item.id)
+    writer, paste = FakeWriter(), FakePaste()
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: None,
+    )
+    finished: list[tuple[str, bool]] = []
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send(stale_ui_item, FakeTarget())  # type: ignore[arg-type]
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert finished == [("原文件已不存在，已从历史移除", False)]
+    assert writer.writes == []
+    assert paste.count == 0
+    repository.close()
+
+
+def test_selection_sender_rejects_row_deleted_after_worker_validation(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = HistoryRepository(tmp_path)
+    path = tmp_path / "deleted-before-validation-callback.txt"
+    path.write_text("available", encoding="utf-8")
+    item = repository.add_files((str(path),))
+    validation_finished = threading.Event()
+    original_validate = repository.validate_file_item
+
+    def tracked_validate(item_id: str):
+        result = original_validate(item_id)
+        validation_finished.set()
+        return result
+
+    monkeypatch.setattr(repository, "validate_file_item", tracked_validate)
+    writer = FakeWriter()
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        FakePaste(),  # type: ignore[arg-type]
+        AppSettings,
+        lambda: None,
+    )
+    finished: list[tuple[str, bool]] = []
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send(item, None)
+    assert validation_finished.wait(1)
+    assert repository.delete(item.id)
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert finished == [("原文件已不存在，已从历史移除", False)]
+    assert writer.writes == []
+    repository.close()
+
+
+def test_selection_sender_revalidates_row_refreshed_before_validation_callback(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = HistoryRepository(tmp_path)
+    path = tmp_path / "refreshed-before-validation-callback.txt"
+    path.write_text("available", encoding="utf-8")
+    item = repository.add_files((str(path),), "old source")
+    first_validation_finished = threading.Event()
+    original_validate = repository.validate_file_item
+    calls = 0
+
+    def tracked_validate(item_id: str):
+        nonlocal calls
+        result = original_validate(item_id)
+        calls += 1
+        if calls == 1:
+            first_validation_finished.set()
+        return result
+
+    monkeypatch.setattr(repository, "validate_file_item", tracked_validate)
+    writer = FakeWriter()
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        FakePaste(),  # type: ignore[arg-type]
+        AppSettings,
+        lambda: None,
+    )
+    finished: list[tuple[str, bool]] = []
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send(item, None)
+    assert first_validation_finished.wait(1)
+    refreshed = repository.add_files((str(path),), "fresh source")
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert calls == 2
+    assert writer.writes == [refreshed]
+    assert finished == [("已复制到剪贴板", True)]
+    repository.close()
+
+
+def test_selection_sender_checks_file_paths_off_the_gui_thread(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = HistoryRepository(tmp_path)
+    path = tmp_path / "slow-network-path.txt"
+    path.write_text("available", encoding="utf-8")
+    item = repository.add_files((str(path),))
+    writer = FakeWriter()
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        FakePaste(),  # type: ignore[arg-type]
+        AppSettings,
+        lambda: None,
+    )
+    finished: list[tuple[str, bool]] = []
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+    gui_thread = threading.get_ident()
+    stat_threads: list[int] = []
+    write_threads: list[int] = []
+    stat_started = threading.Event()
+    release_stat = threading.Event()
+    original_missing = core_module._file_path_is_definitively_missing
+    original_write = writer.write_item
+
+    def delayed_stat(value: str) -> bool:
+        stat_threads.append(threading.get_ident())
+        stat_started.set()
+        assert release_stat.wait(2)
+        return original_missing(value)
+
+    def tracked_write(value: ClipItem) -> bool:
+        write_threads.append(threading.get_ident())
+        return original_write(value)
+
+    monkeypatch.setattr(core_module, "_file_path_is_definitively_missing", delayed_stat)
+    monkeypatch.setattr(writer, "write_item", tracked_write)
+
+    started = time.perf_counter()
+    sender.send(item, None)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.1
+    assert stat_started.wait(1)
+    assert stat_threads and all(thread_id != gui_thread for thread_id in stat_threads)
+    assert writer.writes == []
+    assert finished == []
+
+    release_stat.set()
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert writer.writes == [item]
+    assert write_threads == [gui_thread]
+    assert finished == [("已复制到剪贴板", True)]
+    repository.close()
+
+
+def test_selection_sender_file_validation_timeout_releases_busy_and_ignores_late_result(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = HistoryRepository(tmp_path)
+    path = tmp_path / "hung-network-path.txt"
+    path.write_text("available", encoding="utf-8")
+    file_item = repository.add_files((str(path),))
+    stat_started = threading.Event()
+    release_stat = threading.Event()
+    original_missing = core_module._file_path_is_definitively_missing
+
+    def blocked_stat(value: str) -> bool:
+        stat_started.set()
+        assert release_stat.wait(2)
+        return original_missing(value)
+
+    monkeypatch.setattr(core_module, "_file_path_is_definitively_missing", blocked_stat)
+    writer = FakeWriter()
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        FakePaste(),  # type: ignore[arg-type]
+        AppSettings,
+        lambda: None,
+        file_validation_timeout_ms=50,
+    )
+    finished: list[tuple[str, bool]] = []
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send(file_item, None)
+    assert stat_started.wait(1)
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert finished == [("原文件验证超时，请重试", False)]
+    assert writer.writes == []
+
+    sender.send(file_item, None)
+    assert finished[-1] == ("原文件仍在验证，请稍后重试", False)
+    text_item = ClipItem("text", ClipKind.TEXT, "text", 1, 1, text="still responsive")
+    sender.send(text_item, None)
+    assert writer.writes == [text_item]
+    assert finished[-1] == ("已复制到剪贴板", True)
+
+    release_stat.set()
+    qtbot.waitUntil(lambda: not sender._validation_tasks, timeout=1_000)
+    assert writer.writes == [text_item]
+    repository.close()
+
+
+def test_hung_file_validations_are_bounded_and_do_not_consume_global_pool(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = HistoryRepository(tmp_path)
+    items: list[ClipItem] = []
+    for index in range(3):
+        path = tmp_path / f"hung-network-path-{index}.txt"
+        path.write_text("available", encoding="utf-8")
+        items.append(repository.add_files((str(path),)))
+    release_stats = threading.Event()
+    started_lock = threading.Lock()
+    started_count = 0
+
+    def blocked_stat(_value: str) -> bool:
+        nonlocal started_count
+        with started_lock:
+            started_count += 1
+        assert release_stats.wait(2)
+        return False
+
+    monkeypatch.setattr(core_module, "_file_path_is_definitively_missing", blocked_stat)
+    sender = SelectionSender(
+        FakeWriter(),  # type: ignore[arg-type]
+        repository,
+        FakePaste(),  # type: ignore[arg-type]
+        AppSettings,
+        lambda: None,
+        file_validation_timeout_ms=50,
+    )
+    finished: list[tuple[str, bool]] = []
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send(items[0], None)
+    qtbot.waitUntil(lambda: len(finished) == 1, timeout=1_000)
+    sender.send(items[1], None)
+    qtbot.waitUntil(lambda: len(finished) == 2, timeout=1_000)
+    qtbot.waitUntil(lambda: started_count == 2, timeout=1_000)
+    sender.send(items[2], None)
+
+    assert finished[-1] == ("后台文件验证繁忙，请稍后重试", False)
+    assert len(sender._validation_tasks) == 2
+
+    global_pool_ran = threading.Event()
+
+    class MarkerTask(QRunnable):
+        def run(self) -> None:
+            global_pool_ran.set()
+
+    QThreadPool.globalInstance().start(MarkerTask())
+    assert global_pool_ran.wait(1)
+
+    release_stats.set()
+    qtbot.waitUntil(lambda: not sender._validation_tasks, timeout=1_000)
+    repository.close()
 
 
 def test_platform_reveal_failure(monkeypatch, tmp_path: Path) -> None:

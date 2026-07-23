@@ -305,6 +305,7 @@ class WindowsWorkerSupervisor(QObject):
     def _handle_message(self, message: dict[str, Any]) -> None:
         now = self._clock()
         kind = message.get("type")
+        failure_text: str | None = None
         allowed_types = {"ready", "heartbeat", "error"}
         allowed_types.add("hotkey" if self.role == "hotkey" else "clipboard")
         if self.role == "clipboard":
@@ -339,8 +340,13 @@ class WindowsWorkerSupervisor(QObject):
                     self._desired = False
                 if code not in self._reported_error_codes:
                     self._reported_error_codes.add(code)
-                    self.failed.emit(text)
+                    failure_text = text
+        # Structured listeners need the error code before the display-only
+        # failure signal so they can roll back an unavailable hotkey without
+        # briefly presenting it as the active configuration.
         self.message.emit(message)
+        if failure_text is not None:
+            self.failed.emit(failure_text)
 
     def _read_stderr(self) -> None:
         output = bytes(self._process.readAllStandardError()).decode("utf-8", errors="replace").strip()
@@ -352,6 +358,11 @@ class WindowsWorkerSupervisor(QObject):
         if state == QProcess.ProcessState.NotRunning:
             self._set_reported_health(False)
             return
+        # The Qt GUI thread can legitimately be busy while the child continues
+        # writing heartbeats.  Drain already-buffered output before evaluating
+        # elapsed time; otherwise the health timer may run before the queued
+        # readyRead signal and kill a healthy hotkey host.
+        self._read_stdout()
         running = state in {QProcess.ProcessState.Starting, QProcess.ProcessState.Running}
         now = self._clock()
         reason = self._unhealthy_reason(running=running, at=now)

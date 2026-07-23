@@ -107,6 +107,30 @@ def test_supervisor_retries_stale_mutex_once_but_stops_invalid_configuration(qap
     assert failures[-1] == "invalid shortcut"
 
 
+def test_supervisor_emits_structured_fatal_error_before_display_failure(qapp) -> None:
+    del qapp
+    supervisor = WindowsWorkerSupervisor("hotkey", lambda: [])
+    events: list[tuple[str, object]] = []
+    supervisor.message.connect(lambda message: events.append(("message", message)))
+    supervisor.failed.connect(lambda message: events.append(("failed", message)))
+    supervisor._desired = True
+    supervisor._accept_events = True
+    error = {
+        "type": "error",
+        "fatal": True,
+        "code": "registration_failed",
+        "message": "shortcut already registered",
+    }
+
+    supervisor._handle_message(error)
+
+    assert events == [
+        ("message", error),
+        ("failed", "shortcut already registered"),
+    ]
+    assert not supervisor._desired
+
+
 def test_clipboard_native_capture_has_a_separate_bounded_timeout(qapp) -> None:
     del qapp
     now = [20.0]

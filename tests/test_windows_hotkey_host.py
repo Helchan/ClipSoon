@@ -9,99 +9,23 @@ from clipsoon.windows_hotkey_host import (
     HEARTBEAT_TIMER_ID,
     MOD_CONTROL,
     MOD_SHIFT,
-    RI_KEY_BREAK,
-    RI_KEY_E0,
-    RIDEV_INPUTSINK,
-    VK_CONTROL,
-    VK_LCONTROL,
-    VK_RCONTROL,
     WM_CLOSE,
     WM_HOTKEY,
-    WM_INPUT,
     WM_TIMER,
-    DoubleCtrlDetector,
-    DoubleModifierDetector,
     JsonLineEmitter,
-    RawInputHotkeyEngine,
-    RawKeyboardEvent,
+    NativeHotkeyEngine,
     WindowsHotkeyHost,
     is_shutdown_command,
     parse_registered_hotkey,
 )
 
 
-def test_double_ctrl_accepts_left_right_taps_and_ignores_auto_repeat() -> None:
-    hits: list[float] = []
-    detector = DoubleCtrlDetector(420, hits.append)
-
-    detector.feed(RawKeyboardEvent(VK_LCONTROL, 0), 0.00)
-    detector.feed(RawKeyboardEvent(VK_LCONTROL, 0), 0.01)  # auto-repeat
-    detector.feed(RawKeyboardEvent(VK_LCONTROL, RI_KEY_BREAK), 0.05)
-    detector.feed(RawKeyboardEvent(VK_CONTROL, RI_KEY_E0), 0.25)
-    detector.feed(RawKeyboardEvent(VK_CONTROL, RI_KEY_E0 | RI_KEY_BREAK), 0.30)
-
-    assert hits == [0.30]
-
-
-def test_double_ctrl_rejects_chords_long_holds_and_slow_pairs() -> None:
-    hits: list[float] = []
-    detector = DoubleCtrlDetector(420, hits.append)
-
-    # A non-Control key already held makes the Control press a chord.
-    detector.feed(RawKeyboardEvent(ord("C"), 0), 0.00)
-    detector.feed(RawKeyboardEvent(VK_LCONTROL, 0), 0.01)
-    detector.feed(RawKeyboardEvent(VK_LCONTROL, RI_KEY_BREAK), 0.04)
-    detector.feed(RawKeyboardEvent(ord("C"), RI_KEY_BREAK), 0.05)
-
-    # A non-Control key pressed during Control also makes it a chord.
-    detector.feed(RawKeyboardEvent(VK_LCONTROL, 0), 1.00)
-    detector.feed(RawKeyboardEvent(ord("V"), 0), 1.01)
-    detector.feed(RawKeyboardEvent(ord("V"), RI_KEY_BREAK), 1.02)
-    detector.feed(RawKeyboardEvent(VK_LCONTROL, RI_KEY_BREAK), 1.03)
-
-    # A long hold and a pair outside the configured interval are invalid.
-    detector.feed(RawKeyboardEvent(VK_RCONTROL, 0), 2.00)
-    detector.feed(RawKeyboardEvent(VK_RCONTROL, RI_KEY_BREAK), 2.50)
-    detector.feed(RawKeyboardEvent(VK_RCONTROL, 0), 3.00)
-    detector.feed(RawKeyboardEvent(VK_RCONTROL, RI_KEY_BREAK), 3.03)
-    detector.feed(RawKeyboardEvent(VK_RCONTROL, 0), 3.60)
-    detector.feed(RawKeyboardEvent(VK_RCONTROL, RI_KEY_BREAK), 3.63)
-
-    assert hits == []
-
-
-def test_double_ctrl_recovers_from_a_missing_release_after_stale_timeout() -> None:
-    hits: list[float] = []
-    detector = DoubleCtrlDetector(420, hits.append, stale_after_ms=1_000)
-
-    detector.feed(RawKeyboardEvent(ord("C"), 0), 0.00)
-    detector.expire(1.10)
-    detector.feed(RawKeyboardEvent(VK_LCONTROL, 0), 1.20)
-    detector.feed(RawKeyboardEvent(VK_LCONTROL, RI_KEY_BREAK), 1.23)
-    detector.feed(RawKeyboardEvent(VK_RCONTROL, 0), 1.40)
-    detector.feed(RawKeyboardEvent(VK_RCONTROL, RI_KEY_BREAK), 1.43)
-
-    assert hits == [1.43]
-
-
-def test_other_configured_double_modifiers_use_the_same_raw_input_detector() -> None:
-    hits: list[float] = []
-    detector = DoubleModifierDetector("shift", 420, hits.append)
-
-    detector.feed(RawKeyboardEvent(0x10, 0, make_code=0x2A), 0.00)  # left Shift
-    detector.feed(RawKeyboardEvent(0x10, RI_KEY_BREAK, make_code=0x2A), 0.03)
-    detector.feed(RawKeyboardEvent(0x10, 0, make_code=0x36), 0.20)  # right Shift
-    detector.feed(RawKeyboardEvent(0x10, RI_KEY_BREAK, make_code=0x36), 0.23)
-
-    assert hits == [0.23]
-
-
 def test_json_protocol_emits_ready_heartbeat_and_hotkey_with_monotonic_ids() -> None:
     output = io.StringIO()
-    times = iter((10.0, 11.0, 12.0))
-    engine = RawInputHotkeyEngine(
+    times = iter((10.0, 11.0))
+    engine = NativeHotkeyEngine(
         JsonLineEmitter(output),
-        interval_ms=420,
+        hotkey="combo:ctrl+shift+space",
         clock=lambda: next(times),
         process_id=321,
         session_id="session-test",
@@ -109,10 +33,7 @@ def test_json_protocol_emits_ready_heartbeat_and_hotkey_with_monotonic_ids() -> 
 
     engine.ready()
     engine.heartbeat()
-    engine.feed_keyboard(RawKeyboardEvent(VK_LCONTROL, 0), 20.00)
-    engine.feed_keyboard(RawKeyboardEvent(VK_LCONTROL, RI_KEY_BREAK), 20.03)
-    engine.feed_keyboard(RawKeyboardEvent(VK_RCONTROL, 0), 20.20)
-    engine.feed_keyboard(RawKeyboardEvent(VK_RCONTROL, RI_KEY_BREAK), 20.23)
+    engine.activate(20.23)
 
     messages = [json.loads(line) for line in output.getvalue().splitlines()]
     assert [message["event_id"] for message in messages] == [1, 2, 3]
@@ -121,7 +42,7 @@ def test_json_protocol_emits_ready_heartbeat_and_hotkey_with_monotonic_ids() -> 
     assert {message["protocol"] for message in messages} == {1}
     assert {message["role"] for message in messages} == {"hotkey"}
     assert messages[0]["pid"] == 321
-    assert messages[2]["hotkey"] == "double:ctrl"
+    assert messages[2]["hotkey"] == "combo:ctrl+shift+space"
     assert messages[2]["monotonic_ms"] == 20_230
 
 
@@ -136,7 +57,6 @@ def test_shutdown_command_supports_plain_and_json_lines() -> None:
 class _FakeWindowsApi:
     def __init__(self) -> None:
         self.wndproc = None
-        self.registered: list[tuple[int, int]] = []
         self.registered_hotkeys: list[tuple[int, int, int, int]] = []
         self.unregistered_hotkeys: list[tuple[int, int]] = []
         self.timers: list[tuple[int, int, int]] = []
@@ -147,14 +67,6 @@ class _FakeWindowsApi:
         self.foreground = 909
         self.foreground_handoffs: list[int] = []
         self.activation_order: list[tuple[str, int]] = []
-        self._packets = iter(
-            (
-                RawKeyboardEvent(VK_LCONTROL, 0),
-                RawKeyboardEvent(VK_LCONTROL, RI_KEY_BREAK),
-                RawKeyboardEvent(VK_RCONTROL, 0),
-                RawKeyboardEvent(VK_RCONTROL, RI_KEY_BREAK),
-            )
-        )
 
     def create_message_window(self, wndproc) -> int:
         self.wndproc = wndproc
@@ -175,9 +87,6 @@ class _FakeWindowsApi:
         self.activation_order.append(("grant", process_id))
         return True
 
-    def register_keyboard(self, hwnd: int, flags: int) -> None:
-        self.registered.append((hwnd, flags))
-
     def register_hotkey(self, hwnd: int, hotkey_id: int, modifiers: int, virtual_key: int) -> None:
         self.registered_hotkeys.append((hwnd, hotkey_id, modifiers, virtual_key))
 
@@ -187,13 +96,9 @@ class _FakeWindowsApi:
     def set_timer(self, hwnd: int, timer_id: int, interval_ms: int) -> None:
         self.timers.append((hwnd, timer_id, interval_ms))
 
-    def read_keyboard(self, _lparam: int) -> RawKeyboardEvent:
-        return next(self._packets)
-
     def message_loop(self) -> int:
         assert self.wndproc is not None
-        for index in range(4):
-            self.wndproc(101, WM_INPUT, 0, index + 1)
+        self.wndproc(101, WM_HOTKEY, 1, 0)
         self.wndproc(101, WM_TIMER, HEARTBEAT_TIMER_ID, 0)
         return 0
 
@@ -213,11 +118,10 @@ class _FakeWindowsApi:
         self.closed = True
 
 
-def test_host_is_platform_independent_with_injected_windows_api() -> None:
+def test_default_hotkey_registers_and_emits_hotkey_and_heartbeat() -> None:
     output = io.StringIO()
     api = _FakeWindowsApi()
     host = WindowsHotkeyHost(
-        interval_ms=420,
         heartbeat_interval_ms=1_250,
         output=output,
         control_input=None,
@@ -234,15 +138,22 @@ def test_host_is_platform_independent_with_injected_windows_api() -> None:
     assert [message["type"] for message in messages] == ["ready", "hotkey", "heartbeat"]
     assert [message["event_id"] for message in messages] == [1, 2, 3]
     assert {message["session_id"] for message in messages} == {"host-test"}
+    assert messages[0]["hotkey"] == "combo:ctrl+shift+space"
     assert messages[1]["target_hwnd"] == 909
     assert messages[1]["foreground_granted"] is True
     assert api.activation_order[:2] == [("target", 909), ("grant", 654)]
-    assert api.registered == [(101, RIDEV_INPUTSINK)]
+    assert len(api.registered_hotkeys) == 1
+    hwnd, hotkey_id, modifiers, virtual_key = api.registered_hotkeys[0]
+    assert (hwnd, hotkey_id, virtual_key) == (101, 1, 0x20)
+    assert modifiers & MOD_CONTROL
+    assert modifiers & MOD_SHIFT
+    assert modifiers & 0x4000  # MOD_NOREPEAT
+    assert api.unregistered_hotkeys == [(101, 1)]
     assert api.timers == [(101, HEARTBEAT_TIMER_ID, 1_250)]
     assert api.closed
 
 
-def test_combo_hotkey_uses_register_hotkey_instead_of_raw_input() -> None:
+def test_custom_combo_hotkey_uses_register_hotkey() -> None:
     output = io.StringIO()
     api = _FakeWindowsApi()
 
@@ -265,7 +176,6 @@ def test_combo_hotkey_uses_register_hotkey_instead_of_raw_input() -> None:
 
     messages = [json.loads(line) for line in output.getvalue().splitlines()]
     assert [message["type"] for message in messages] == ["ready", "hotkey"]
-    assert api.registered == []
     assert len(api.registered_hotkeys) == 1
     _, hotkey_id, modifiers, virtual_key = api.registered_hotkeys[0]
     assert hotkey_id == 1
@@ -273,6 +183,41 @@ def test_combo_hotkey_uses_register_hotkey_instead_of_raw_input() -> None:
     assert modifiers & 0x0004  # MOD_SHIFT
     assert modifiers & 0x4000  # MOD_NOREPEAT
     assert virtual_key == ord("V")
+
+
+def test_register_hotkey_remains_stable_across_250_activations() -> None:
+    output = io.StringIO()
+    api = _FakeWindowsApi()
+
+    def repeated_hotkey_loop() -> int:
+        assert api.wndproc is not None
+        for _ in range(250):
+            api.wndproc(101, WM_HOTKEY, 1, 0)
+        api.wndproc(101, WM_TIMER, HEARTBEAT_TIMER_ID, 0)
+        return 0
+
+    api.message_loop = repeated_hotkey_loop  # type: ignore[method-assign]
+    host = WindowsHotkeyHost(
+        output=output,
+        control_input=None,
+        api=api,
+        clock=lambda: 7.0,
+        session_id="repeated-hotkey-test",
+        parent_pid=654,
+    )
+
+    assert host.run() == 0
+
+    messages = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert [message["type"] for message in messages] == [
+        "ready",
+        *(["hotkey"] * 250),
+        "heartbeat",
+    ]
+    assert [message["event_id"] for message in messages] == list(range(1, 253))
+    assert len(api.foreground_handoffs) == 250
+    assert api.unregistered_hotkeys == [(101, 1)]
+    assert api.closed
 
 
 def test_host_control_reader_posts_close_for_shutdown_or_eof() -> None:
@@ -393,19 +338,25 @@ def test_invalid_custom_hotkey_is_reported_without_restart_loop() -> None:
     assert api.wndproc is None
 
 
-def test_raw_input_startup_failure_is_reported_and_can_be_retried() -> None:
+@pytest.mark.parametrize(
+    "legacy_hotkey",
+    ("double:ctrl", "double:shift", "double:alt", "double:meta"),
+)
+def test_double_modifier_hotkeys_are_rejected_as_invalid(legacy_hotkey: str) -> None:
     output = io.StringIO()
     api = _FakeWindowsApi()
-    api.register_keyboard = lambda *_args: (_ for _ in ()).throw(OSError("raw input unavailable"))  # type: ignore[method-assign]
     host = WindowsHotkeyHost(
+        hotkey=legacy_hotkey,
         output=output,
         control_input=None,
         api=api,
-        session_id="startup-test",
+        session_id="legacy-hotkey-test",
     )
 
-    assert host.run() == 6
+    assert host.run() == 5
     message = json.loads(output.getvalue())
-    assert message["code"] == "startup_failed"
+    assert message["code"] == "invalid_hotkey"
     assert message["fatal"] is True
-    assert "raw input unavailable" in message["message"]
+    assert legacy_hotkey in message["message"]
+    assert api.wndproc is None
+    assert api.registered_hotkeys == []

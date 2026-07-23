@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import sqlite3
 import threading
@@ -85,6 +86,25 @@ class ClipItem:
         return replace(self, pinned=pinned)
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedFileItem:
+    item: ClipItem
+    revision: int
+
+
+class FileItemClaimStatus(StrEnum):
+    MISSING = "missing"
+    REFRESHED = "refreshed"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True, slots=True)
+class FileItemClaim:
+    status: FileItemClaimStatus
+    item: ClipItem | None = None
+
+
 def format_bytes(size: int) -> str:
     value = float(max(size, 0))
     for unit in ("B", "KB", "MB", "GB"):
@@ -121,6 +141,18 @@ class HistoryStore(Protocol):
 
     def delete(self, item_id: str) -> None: ...
 
+    def prune_missing_file_items(
+        self, item_ids: Sequence[str] | None = None
+    ) -> tuple[str, ...]: ...
+
+    def validate_file_item(self, item_id: str) -> ValidatedFileItem | None: ...
+
+    def consume_validated_file_item(
+        self,
+        validated: ValidatedFileItem,
+        consumer: Callable[[ClipItem], bool],
+    ) -> FileItemClaim: ...
+
     def cleanup(self, max_items: int, retention_days: int) -> int: ...
 
 
@@ -137,6 +169,8 @@ class PasteAdapter(Protocol):
 
 
 # Settings -----------------------------------------------------------------
+
+WINDOWS_DEFAULT_HOTKEY = "combo:ctrl+shift+space"
 
 
 @dataclass(slots=True)
@@ -216,8 +250,9 @@ class ObservableSettings:
     def update(self, **changes: Any) -> AppSettings:
         values = asdict(self._value)
         values.update(changes)
-        self._value = AppSettings(**values).validated()
-        self._store.save(self._value)
+        updated = AppSettings(**values).validated()
+        self._store.save(updated)
+        self._value = updated
         for listener in tuple(self._listeners):
             listener(self._value)
         return self._value
@@ -295,13 +330,22 @@ class HistoryRepository:
                     updated_at REAL NOT NULL,
                     pinned INTEGER NOT NULL DEFAULT 0,
                     use_count INTEGER NOT NULL DEFAULT 0,
-                    last_used_at REAL NOT NULL DEFAULT 0
+                    last_used_at REAL NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_clips_recent
                     ON clips(pinned DESC, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_clips_kind ON clips(kind);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(clips)").fetchall()
+            }
+            if "revision" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE clips ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+                )
 
     def list_items(self, limit: int | None = None) -> list[ClipItem]:
         sql = "SELECT * FROM clips ORDER BY pinned DESC, updated_at DESC, created_at DESC"
@@ -416,7 +460,8 @@ class HistoryRepository:
                     """
                     UPDATE clips
                     SET updated_at = ?, source_app = ?, text_content = ?, file_paths = ?,
-                        image_name = ?, mime_type = ?, width = ?, height = ?, byte_size = ?
+                        image_name = ?, mime_type = ?, width = ?, height = ?, byte_size = ?,
+                        revision = revision + 1
                     WHERE id = ?
                     """,
                     (
@@ -466,14 +511,19 @@ class HistoryRepository:
     def mark_used(self, item_id: str) -> None:
         with self._lock, self._connection:
             self._connection.execute(
-                "UPDATE clips SET use_count = use_count + 1, last_used_at = ? WHERE id = ?",
+                """
+                UPDATE clips
+                SET use_count = use_count + 1, last_used_at = ?, revision = revision + 1
+                WHERE id = ?
+                """,
                 (self._clock.now(), item_id),
             )
 
     def set_pinned(self, item_id: str, pinned: bool) -> None:
         with self._lock, self._connection:
             self._connection.execute(
-                "UPDATE clips SET pinned = ? WHERE id = ?", (int(pinned), item_id)
+                "UPDATE clips SET pinned = ?, revision = revision + 1 WHERE id = ?",
+                (int(pinned), item_id),
             )
 
     def delete(self, item_id: str) -> bool:
@@ -492,6 +542,106 @@ class HistoryRepository:
         for image_name in {str(row["image_name"]) for row in rows if row["image_name"]}:
             self._delete_image_if_orphan(image_name)
         return len(rows)
+
+    def prune_missing_file_items(
+        self, item_ids: Sequence[str] | None = None
+    ) -> tuple[str, ...]:
+        selected_ids = None if item_ids is None else tuple(dict.fromkeys(item_ids))
+        if selected_ids == ():
+            return ()
+        sql = "SELECT id, file_paths, revision FROM clips WHERE kind = ?"
+        parameters: list[object] = [ClipKind.FILES.value]
+        if selected_ids is not None:
+            placeholders = ",".join("?" for _ in selected_ids)
+            sql += f" AND id IN ({placeholders})"
+            parameters.extend(selected_ids)
+        sql += " ORDER BY pinned DESC, updated_at DESC, created_at DESC"
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+
+        missing_rows: list[tuple[str, int]] = []
+        for row in rows:
+            paths = _stored_file_paths(row)
+            if paths is None:
+                continue
+            if any(_file_path_is_definitively_missing(path) for path in paths):
+                missing_rows.append((str(row["id"]), int(row["revision"])))
+        if not missing_rows:
+            return ()
+
+        deleted_ids: list[str] = []
+        with self._lock, self._connection:
+            for item_id, revision in missing_rows:
+                cursor = self._connection.execute(
+                    "DELETE FROM clips WHERE id = ? AND kind = ? AND revision = ?",
+                    (item_id, ClipKind.FILES.value, revision),
+                )
+                if cursor.rowcount:
+                    deleted_ids.append(item_id)
+        return tuple(deleted_ids)
+
+    def validate_file_item(self, item_id: str) -> ValidatedFileItem | None:
+        # A revision compare-and-swap prevents an old filesystem scan from
+        # deleting or returning a row refreshed by a concurrent clipboard
+        # capture. The filesystem probe intentionally runs outside the DB lock.
+        for _attempt in range(8):
+            with self._lock:
+                row = self._connection.execute(
+                    "SELECT * FROM clips WHERE id = ? AND kind = ?",
+                    (item_id, ClipKind.FILES.value),
+                ).fetchone()
+            if row is None:
+                return None
+            paths = _stored_file_paths(row)
+            if paths is None:
+                return None
+            revision = int(row["revision"])
+            missing = any(_file_path_is_definitively_missing(path) for path in paths)
+
+            with self._lock, self._connection:
+                current = self._connection.execute(
+                    "SELECT * FROM clips WHERE id = ? AND kind = ?",
+                    (item_id, ClipKind.FILES.value),
+                ).fetchone()
+                if current is None:
+                    return None
+                if int(current["revision"]) != revision:
+                    continue
+                if missing:
+                    cursor = self._connection.execute(
+                        "DELETE FROM clips WHERE id = ? AND kind = ? AND revision = ?",
+                        (item_id, ClipKind.FILES.value, revision),
+                    )
+                    if cursor.rowcount:
+                        return None
+                    continue
+                return ValidatedFileItem(self._row_to_item(current), revision)
+        # Continuous mutation is not a safe basis for emitting CF_HDROP.
+        return None
+
+    def consume_validated_file_item(
+        self,
+        validated: ValidatedFileItem,
+        consumer: Callable[[ClipItem], bool],
+    ) -> FileItemClaim:
+        # This short critical section is intentionally filesystem-free. It
+        # closes the queued-signal window by preventing repository deletion or
+        # refresh between the revision check and the clipboard write.
+        with self._lock:
+            current = self._connection.execute(
+                "SELECT * FROM clips WHERE id = ? AND kind = ?",
+                (validated.item.id, ClipKind.FILES.value),
+            ).fetchone()
+            if current is None:
+                return FileItemClaim(FileItemClaimStatus.MISSING)
+            item = self._row_to_item(current)
+            if int(current["revision"]) != validated.revision:
+                return FileItemClaim(FileItemClaimStatus.REFRESHED, item)
+            accepted = consumer(item)
+            return FileItemClaim(
+                FileItemClaimStatus.ACCEPTED if accepted else FileItemClaimStatus.REJECTED,
+                item,
+            )
 
     def cleanup(self, max_items: int, retention_days: int) -> int:
         max_items, retention_days = max(1, int(max_items)), max(0, int(retention_days))
@@ -594,3 +744,74 @@ def _safe_file_size(path: Path) -> int:
         return path.stat().st_size if path.is_file() else 0
     except OSError:
         return 0
+
+
+def _file_path_is_definitively_missing(path: str) -> bool:
+    try:
+        Path(path).stat()
+    except (FileNotFoundError, NotADirectoryError):
+        storage_root = _file_storage_root(path)
+        if storage_root is None or _same_storage_path(path, storage_root):
+            return False
+        if not _storage_root_is_reachable(storage_root):
+            # A disconnected UNC share, mapped/removable Windows drive, or
+            # unmounted macOS volume can report FileNotFoundError for every
+            # child.  Preserve history until the storage root is reachable
+            # and the individual path can be confirmed missing.
+            return False
+        try:
+            Path(path).stat()
+        except (FileNotFoundError, NotADirectoryError):
+            # Confirm the root again after the second child probe. This closes
+            # the race where a share briefly recovers between the first child
+            # failure and root probe, then disconnects again.
+            return _storage_root_is_reachable(storage_root)
+        except OSError:
+            return False
+        return False
+    except OSError:
+        # Access denial, a temporarily unavailable device, or another
+        # indeterminate I/O failure must not permanently erase history.
+        return False
+    return False
+
+
+def _file_storage_root(path: str) -> str | None:
+    windows_drive, _tail = ntpath.splitdrive(path)
+    if windows_drive:
+        return f"{windows_drive}\\"
+
+    candidate = Path(path)
+    parts = candidate.parts
+    if len(parts) >= 3 and parts[0] == os.path.sep and parts[1] == "Volumes":
+        return str(Path(os.path.sep, "Volumes", parts[2]))
+    return candidate.anchor or None
+
+
+def _storage_root_is_reachable(storage_root: str) -> bool:
+    try:
+        Path(storage_root).stat()
+    except OSError:
+        return False
+    return True
+
+
+def _same_storage_path(path: str, storage_root: str) -> bool:
+    windows_drive, _tail = ntpath.splitdrive(path)
+    if windows_drive:
+        return ntpath.normcase(ntpath.normpath(path)) == ntpath.normcase(
+            ntpath.normpath(storage_root)
+        )
+    return os.path.normcase(os.path.normpath(path)) == os.path.normcase(
+        os.path.normpath(storage_root)
+    )
+
+
+def _stored_file_paths(row: sqlite3.Row) -> tuple[str, ...] | None:
+    try:
+        paths = json.loads(str(row["file_paths"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(paths, list) or not paths or not all(isinstance(path, str) for path in paths):
+        return None
+    return tuple(paths)

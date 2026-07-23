@@ -6,8 +6,9 @@ import faulthandler
 import logging
 import os
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -17,7 +18,13 @@ from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QDialog, QSystemTrayIcon
 
 from clipsoon import __version__
-from clipsoon.core import HistoryRepository, JsonSettingsStore, ObservableSettings
+from clipsoon.core import (
+    WINDOWS_DEFAULT_HOTKEY,
+    AppSettings,
+    HistoryRepository,
+    JsonSettingsStore,
+    ObservableSettings,
+)
 from clipsoon.system import (
     ClipboardController,
     ForegroundTargetHandle,
@@ -35,11 +42,27 @@ _CRASH_LOG_STREAM = None
 _PANEL_WATCH_INTERVAL_MS = 35
 _HOTKEY_HEALTH_INTERVAL_MS = 2_000
 _HOTKEY_RESTART_BACKOFF_SECONDS = 15.0
+_FILE_HISTORY_SWEEP_INTERVAL_MS = 3_000
 
 
 class _Signals(QObject):
     hotkey = Signal(object)
     hotkey_failed = Signal(str)
+    file_history_sweep_finished = Signal(object, str)
+
+
+class _FileHistorySweepTask:
+    def __init__(self, repository: HistoryRepository, completed: Signal) -> None:
+        self.repository = repository
+        self.completed = completed
+
+    def run(self) -> None:
+        try:
+            removed = self.repository.prune_missing_file_items()
+        except Exception as exc:
+            self.completed.emit((), str(exc))
+            return
+        self.completed.emit(removed, "")
 
 
 @dataclass(slots=True)
@@ -92,6 +115,22 @@ class ClipSoonApplication(QObject):
         super().__init__()
         self.qt_app, self.data_dir = qt_app, data_dir
         self.settings = ObservableSettings(JsonSettingsStore(data_dir / "settings.json"))
+        self._windows_hotkey_migrated = False
+        windows_hotkey_is_valid = True
+        if PlatformBridge.is_windows():
+            from clipsoon.windows_hotkey_host import parse_registered_hotkey
+
+            try:
+                parse_registered_hotkey(self.settings.value.hotkey)
+            except ValueError:
+                windows_hotkey_is_valid = False
+        if PlatformBridge.is_windows() and not windows_hotkey_is_valid:
+            try:
+                self.settings.update(hotkey=WINDOWS_DEFAULT_HOTKEY)
+            except OSError:
+                LOGGER.exception("Could not persist the Windows hotkey migration")
+            else:
+                self._windows_hotkey_migrated = True
         self.repository = HistoryRepository(data_dir)
         self.launch_at_login = LaunchAtLoginManager()
         self.signals = _Signals()
@@ -103,7 +142,15 @@ class ClipSoonApplication(QObject):
         self._hotkey_health_timer = QTimer(self)
         self._hotkey_health_timer.setInterval(_HOTKEY_HEALTH_INTERVAL_MS)
         self._hotkey_health_timer.timeout.connect(self._ensure_hotkey_listener)
+        self._file_history_sweep_timer = QTimer(self)
+        self._file_history_sweep_timer.setInterval(_FILE_HISTORY_SWEEP_INTERVAL_MS)
+        self._file_history_sweep_timer.timeout.connect(self._schedule_file_history_sweep)
+        self._file_history_sweep_active = False
         self._next_hotkey_restart_at = 0.0
+        self._panel_show_generation = 0
+        self._confirmed_windows_hotkey: AppSettings | None = None
+        self._pending_hotkey_rollback: AppSettings | None = None
+        self._pending_hotkey_candidate = ""
 
         self.panel = ClipPanel(lambda: self.settings.value)
         self.panel.set_items(self.repository.list_items())
@@ -120,7 +167,12 @@ class ClipSoonApplication(QObject):
             lambda: self.settings.value,
             self.panel.hide_panel,
         )
-        self.hotkey = GlobalHotkeyService(self.signals.hotkey.emit, self.signals.hotkey_failed.emit)
+        self.hotkey = GlobalHotkeyService(
+            self.signals.hotkey.emit,
+            self.signals.hotkey_failed.emit,
+            self._hotkey_ready,
+            self._hotkey_registration_failed,
+        )
         self.tray, self.tray_menu, self.tray_actions = create_tray_icon(self.panel)
         self._connect()
 
@@ -133,6 +185,21 @@ class ClipSoonApplication(QObject):
         # Permission failures can be emitted synchronously, so the tray must
         # already be visible for the first-launch warning to reach the user.
         self.hotkey.start(self.settings.value)
+        if self._windows_hotkey_migrated:
+            migration_message = (
+                "Windows 呼出快捷键已更新为 Ctrl+Shift+Space；"
+                "可在设置中修改为其他组合键。"
+            )
+            self.panel.set_status(migration_message)
+            if self.tray.isVisible():
+                self.tray.showMessage(
+                    "ClipSoon 快捷键已更新",
+                    migration_message,
+                    QSystemTrayIcon.MessageIcon.Information,
+                    6_000,
+                )
+        self._file_history_sweep_timer.start()
+        self._schedule_file_history_sweep()
         if not PlatformBridge.is_windows():
             self._hotkey_health_timer.start()
         if self.settings.value.launch_at_login:
@@ -144,6 +211,7 @@ class ClipSoonApplication(QObject):
     def _connect(self) -> None:
         self.signals.hotkey.connect(self.toggle_panel)
         self.signals.hotkey_failed.connect(self._hotkey_failed)
+        self.signals.file_history_sweep_finished.connect(self._file_history_sweep_finished)
         self.clipboard.captured.connect(self._captured)
         self.clipboard.failed.connect(self._notify_error)
         self.panel.send_requested.connect(lambda item: self.sender.send(item, self.target))
@@ -161,12 +229,21 @@ class ClipSoonApplication(QObject):
         self.qt_app.aboutToQuit.connect(self.shutdown)
 
     def toggle_panel(self, context: HotkeyActivationContext | None = None) -> None:
-        if self.panel.isVisible():
+        windows = PlatformBridge.is_windows()
+        panel_is_foreground = (
+            windows
+            and self.panel.isVisible()
+            and PlatformBridge.foreground_window_id() == int(self.panel.winId())
+        )
+        if self.panel.isVisible() and (not windows or panel_is_foreground):
             self.panel.hide_panel()
         else:
             self.show_panel(context)
 
     def show_panel(self, context: HotkeyActivationContext | None = None) -> None:
+        self._schedule_file_history_sweep()
+        windows = PlatformBridge.is_windows()
+        self.panel.set_native_deactivation_managed(windows)
         if (
             PlatformBridge.accessibility_permission_status() is True
             and self.panel.has_accessibility_warning()
@@ -174,7 +251,7 @@ class ClipSoonApplication(QObject):
             self.panel.clear_status()
         captured_target = (
             PlatformBridge.target_from_window_id(context.target_window)
-            if PlatformBridge.is_windows()
+            if windows
             and isinstance(context, HotkeyActivationContext)
             and context.target_window is not None
             else None
@@ -186,7 +263,9 @@ class ClipSoonApplication(QObject):
             else PlatformBridge.foreground_window_id()
         )
         elapsed = self.panel.show_panel()
-        if PlatformBridge.is_windows():
+        if windows:
+            self._panel_show_generation += 1
+            generation = self._panel_show_generation
             panel_window = int(self.panel.winId())
             self._panel_guard.arm(
                 initial_foreground=initial_foreground,
@@ -194,15 +273,19 @@ class ClipSoonApplication(QObject):
                 primary_button_down=PlatformBridge.primary_button_down(),
             )
             self._panel_watch_timer.start()
-            QTimer.singleShot(0, lambda: self._activate_windows_panel(0))
+            QTimer.singleShot(0, lambda: self._activate_windows_panel(0, generation))
             if isinstance(context, HotkeyActivationContext) and not context.foreground_granted:
                 LOGGER.debug("Windows hotkey helper could not pre-authorize foreground activation")
         LOGGER.info("Panel visible in %.1f ms; target=%s", elapsed, self.target.name if self.target else "none")
         if elapsed > 100:
             LOGGER.warning("Hotkey-to-visible budget exceeded: %.1f ms", elapsed)
 
-    def _activate_windows_panel(self, attempt: int) -> None:
-        if not PlatformBridge.is_windows() or not self.panel.isVisible():
+    def _activate_windows_panel(self, attempt: int, generation: int) -> None:
+        if (
+            not PlatformBridge.is_windows()
+            or generation != self._panel_show_generation
+            or not self.panel.isVisible()
+        ):
             return
         panel_window = int(self.panel.winId())
         if (
@@ -213,8 +296,12 @@ class ClipSoonApplication(QObject):
             self.panel.activateWindow()
             self.panel.search.setFocus()
             return
-        if attempt == 0:
-            QTimer.singleShot(45, lambda: self._activate_windows_panel(1))
+        retry_delays = (45, 120)
+        if attempt < len(retry_delays):
+            QTimer.singleShot(
+                retry_delays[attempt],
+                lambda: self._activate_windows_panel(attempt + 1, generation),
+            )
 
     def _watch_windows_panel(self) -> None:
         if not self.panel.isVisible():
@@ -251,6 +338,31 @@ class ClipSoonApplication(QObject):
         self._next_hotkey_restart_at = now + _HOTKEY_RESTART_BACKOFF_SECONDS
         self.hotkey.start(self.settings.value)
 
+    def _schedule_file_history_sweep(self) -> None:
+        if self._file_history_sweep_active:
+            return
+        self._file_history_sweep_active = True
+        task = _FileHistorySweepTask(
+            self.repository,
+            self.signals.file_history_sweep_finished,
+        )
+        threading.Thread(
+            target=task.run,
+            name="ClipSoon-file-history-sweep",
+            daemon=True,
+        ).start()
+
+    def _file_history_sweep_finished(self, removed: object, error: str) -> None:
+        self._file_history_sweep_active = False
+        if error:
+            LOGGER.warning("File history validity sweep failed: %s", error)
+            return
+        removed_ids = tuple(value for value in removed if isinstance(value, str)) if isinstance(removed, tuple) else ()
+        if not removed_ids:
+            return
+        self._reload_history()
+        self.panel.set_status(f"已移除 {len(removed_ids)} 条源文件不存在的记录")
+
     def show_settings(self) -> None:
         self.panel.keep_open(True)
         dialog = SettingsDialog(
@@ -273,7 +385,15 @@ class ClipSoonApplication(QObject):
                     values["launch_at_login"] = old.launch_at_login
             new = self.settings.update(**values)
             self.panel.apply_theme()
-            if old.hotkey != new.hotkey or old.double_tap_interval_ms != new.double_tap_interval_ms:
+            hotkey_changed = old.hotkey != new.hotkey
+            hotkey_restart_required = hotkey_changed or (
+                not PlatformBridge.is_windows()
+                and old.double_tap_interval_ms != new.double_tap_interval_ms
+            )
+            if hotkey_restart_required:
+                if PlatformBridge.is_windows() and hotkey_changed:
+                    self._pending_hotkey_rollback = self._confirmed_windows_hotkey or old
+                    self._pending_hotkey_candidate = new.hotkey
                 self.hotkey.start(new)
             if old.capture_enabled != new.capture_enabled:
                 self.clipboard.sync_cursor()
@@ -344,12 +464,96 @@ class ClipSoonApplication(QObject):
             self.tray.showMessage("ClipSoon", message, QSystemTrayIcon.MessageIcon.Warning, 3_000)
 
     def _hotkey_failed(self, message: str) -> None:
-        if sys.platform == "darwin" and "辅助功能" in message:
+        permission_failure = sys.platform == "darwin" and "辅助功能" in message
+        if permission_failure:
             self.panel.set_accessibility_warning()
         else:
             self.panel.set_status(message)
         if self.tray.isVisible():
-            self.tray.showMessage("ClipSoon 需要权限", message, QSystemTrayIcon.MessageIcon.Warning, 6_000)
+            title = "ClipSoon 需要权限" if permission_failure else "ClipSoon 快捷键不可用"
+            self.tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Warning, 6_000)
+
+    def _hotkey_ready(self, hotkey: str) -> None:
+        if not PlatformBridge.is_windows() or self.settings.value.hotkey != hotkey:
+            return
+        self._confirmed_windows_hotkey = self.settings.value
+        if self._pending_hotkey_candidate == hotkey:
+            self._pending_hotkey_rollback = None
+            self._pending_hotkey_candidate = ""
+
+    def _hotkey_registration_failed(self, hotkey: str, message: str) -> None:
+        rollback = self._pending_hotkey_rollback
+        if rollback is None or hotkey != self._pending_hotkey_candidate:
+            if hotkey != WINDOWS_DEFAULT_HOTKEY:
+                QTimer.singleShot(
+                    0,
+                    lambda: self._activate_default_windows_hotkey(hotkey, message),
+                )
+                return
+            self._hotkey_failed(message)
+            return
+        self._pending_hotkey_rollback = None
+        self._pending_hotkey_candidate = ""
+        QTimer.singleShot(
+            0,
+            lambda: self._restore_previous_windows_hotkey(hotkey, rollback, message),
+        )
+
+    def _restore_previous_windows_hotkey(
+        self,
+        failed_hotkey: str,
+        rollback: AppSettings,
+        failure_message: str,
+    ) -> None:
+        if self.settings.value.hotkey != failed_hotkey:
+            return
+        persistence_error = ""
+        try:
+            restored = self.settings.update(
+                hotkey=rollback.hotkey,
+                double_tap_interval_ms=rollback.double_tap_interval_ms,
+            )
+        except OSError as exc:
+            LOGGER.exception("Could not persist the previous Windows hotkey")
+            restored = rollback
+            persistence_error = f"；但无法保存恢复结果：{exc}"
+        self.hotkey.start(restored)
+        restored_message = f"{failure_message}；已恢复上一个快捷键{persistence_error}"
+        self.panel.set_status(restored_message)
+        if self.tray.isVisible():
+            self.tray.showMessage(
+                "ClipSoon 快捷键已恢复",
+                restored_message,
+                QSystemTrayIcon.MessageIcon.Warning,
+                6_000,
+            )
+
+    def _activate_default_windows_hotkey(
+        self,
+        failed_hotkey: str,
+        failure_message: str,
+    ) -> None:
+        if self.settings.value.hotkey != failed_hotkey:
+            return
+        fallback = replace(self.settings.value, hotkey=WINDOWS_DEFAULT_HOTKEY)
+        persistence_error = ""
+        try:
+            fallback = self.settings.update(hotkey=WINDOWS_DEFAULT_HOTKEY)
+        except OSError as exc:
+            LOGGER.exception("Could not persist the fallback Windows hotkey")
+            persistence_error = f"；但无法保存替代配置：{exc}"
+        self.hotkey.start(fallback)
+        fallback_message = (
+            f"{failure_message}；已改用 Ctrl+Shift+Space{persistence_error}"
+        )
+        self.panel.set_status(fallback_message)
+        if self.tray.isVisible():
+            self.tray.showMessage(
+                "ClipSoon 快捷键已切换",
+                fallback_message,
+                QSystemTrayIcon.MessageIcon.Warning,
+                6_000,
+            )
 
     def _notify_error(self, message: str) -> None:
         LOGGER.warning(message)
@@ -358,6 +562,7 @@ class ClipSoonApplication(QObject):
     def shutdown(self) -> None:
         self._panel_watch_timer.stop()
         self._hotkey_health_timer.stop()
+        self._file_history_sweep_timer.stop()
         self.hotkey.stop()
         self.clipboard.stop()
         QThreadPool.globalInstance().waitForDone(3_000)

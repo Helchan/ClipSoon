@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import statistics
 import sys
 import threading
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import clipsoon.core as core_module
 from clipsoon.core import (
     AppSettings,
     ClipItem,
@@ -15,6 +17,7 @@ from clipsoon.core import (
     HistoryRepository,
     JsonSettingsStore,
     ObservableSettings,
+    ValidatedFileItem,
     format_bytes,
     valid_hotkey,
 )
@@ -234,6 +237,44 @@ def test_repository_rejects_empty_inputs_and_removes_startup_orphan(tmp_path: Pa
     repo.close()
 
 
+def test_repository_migrates_existing_history_with_revision_column(tmp_path: Path) -> None:
+    database = sqlite3.connect(tmp_path / "history.sqlite3")
+    database.execute(
+        """
+        CREATE TABLE clips (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            content_hash TEXT NOT NULL UNIQUE,
+            text_content TEXT NOT NULL DEFAULT '',
+            file_paths TEXT NOT NULL DEFAULT '[]',
+            image_name TEXT NOT NULL DEFAULT '',
+            mime_type TEXT NOT NULL DEFAULT '',
+            width INTEGER NOT NULL DEFAULT 0,
+            height INTEGER NOT NULL DEFAULT 0,
+            byte_size INTEGER NOT NULL DEFAULT 0,
+            source_app TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            last_used_at REAL NOT NULL DEFAULT 0
+        )
+        """
+    )
+    database.commit()
+    database.close()
+
+    repo = HistoryRepository(tmp_path)
+    columns = {
+        str(row["name"])
+        for row in repo._connection.execute("PRAGMA table_info(clips)").fetchall()
+    }
+
+    assert "revision" in columns
+    assert repo.add_text("after migration").text == "after migration"
+    repo.close()
+
+
 def test_image_write_failure_does_not_leave_orphan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = HistoryRepository(tmp_path)
 
@@ -288,6 +329,260 @@ def test_batch_delete_and_clear_all(tmp_path: Path) -> None:
     assert repo.get(first.id) is None
     assert repo.clear_all() == 1
     assert repo.list_items() == []
+    repo.close()
+
+
+def test_prune_missing_file_items_keeps_complete_files_and_directories(tmp_path: Path) -> None:
+    repo = HistoryRepository(tmp_path)
+    file_path = tmp_path / "available.txt"
+    file_path.write_text("available", encoding="utf-8")
+    directory = tmp_path / "available-directory"
+    directory.mkdir()
+    complete = repo.add_files((str(file_path), str(directory)))
+    text = repo.add_text("unrelated")
+
+    assert repo.prune_missing_file_items() == ()
+    assert repo.get(complete.id) == complete
+    assert repo.get(text.id) == text
+    repo.close()
+
+
+def test_prune_missing_file_items_removes_pinned_missing_file(tmp_path: Path) -> None:
+    repo = HistoryRepository(tmp_path)
+    file_path = tmp_path / "deleted.txt"
+    file_path.write_text("deleted", encoding="utf-8")
+    missing = repo.add_files((str(file_path),))
+    repo.set_pinned(missing.id, True)
+    file_path.unlink()
+
+    assert repo.prune_missing_file_items() == (missing.id,)
+    assert repo.get(missing.id) is None
+    repo.close()
+
+
+def test_prune_missing_file_items_removes_whole_multi_file_record(tmp_path: Path) -> None:
+    repo = HistoryRepository(tmp_path)
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    batch = repo.add_files((str(first), str(second)))
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("unrelated", encoding="utf-8")
+    preserved = repo.add_files((str(unrelated),))
+    second.unlink()
+
+    assert repo.prune_missing_file_items((batch.id,)) == (batch.id,)
+    assert repo.get(batch.id) is None
+    assert repo.get(preserved.id) == preserved
+    repo.close()
+
+
+def test_prune_missing_file_items_treats_not_a_directory_as_missing(tmp_path: Path) -> None:
+    repo = HistoryRepository(tmp_path)
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    file_path = parent / "child.txt"
+    file_path.write_text("child", encoding="utf-8")
+    item = repo.add_files((str(file_path),))
+    file_path.unlink()
+    parent.rmdir()
+    parent.write_text("no longer a directory", encoding="utf-8")
+
+    assert repo.prune_missing_file_items() == (item.id,)
+    assert repo.get(item.id) is None
+    repo.close()
+
+
+def test_prune_missing_file_items_keeps_indeterminate_os_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = HistoryRepository(tmp_path)
+    file_path = tmp_path / "temporarily-unavailable.txt"
+    file_path.write_text("available", encoding="utf-8")
+    item = repo.add_files((str(file_path),))
+    original_stat = Path.stat
+
+    def guarded_stat(path: Path, *args, **kwargs):
+        if path == file_path:
+            raise PermissionError("temporarily unavailable")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", guarded_stat)
+
+    assert repo.prune_missing_file_items() == ()
+    assert repo.get(item.id) == item
+    repo.close()
+
+
+@pytest.mark.parametrize(
+    ("file_path", "storage_root"),
+    [
+        (r"Z:\projects\missing.txt", "Z:\\"),
+        (r"\\server\share\projects\missing.txt", "\\\\server\\share\\"),
+        ("/Volumes/Archive/projects/missing.txt", "/Volumes/Archive"),
+    ],
+)
+def test_file_missing_probe_preserves_items_when_storage_root_is_unavailable(
+    file_path: str,
+    storage_root: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable_stat(path: Path, *_args, **_kwargs):
+        if str(path) in {file_path, storage_root}:
+            raise FileNotFoundError(str(path))
+        raise AssertionError(f"unexpected path probe: {path}")
+
+    monkeypatch.setattr(Path, "stat", unavailable_stat)
+
+    assert not core_module._file_path_is_definitively_missing(file_path)
+
+
+def test_file_missing_probe_removes_unc_child_when_share_is_reachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = r"\\server\share\projects\deleted.txt"
+    storage_root = "\\\\server\\share\\"
+    probes: list[str] = []
+
+    def reachable_root_stat(path: Path, *_args, **_kwargs):
+        probes.append(str(path))
+        if str(path) == file_path:
+            raise FileNotFoundError(str(path))
+        if str(path) == storage_root:
+            return object()
+        raise AssertionError(f"unexpected path probe: {path}")
+
+    monkeypatch.setattr(Path, "stat", reachable_root_stat)
+
+    assert core_module._file_path_is_definitively_missing(file_path)
+    assert probes == [file_path, storage_root, file_path, storage_root]
+
+
+def test_file_missing_probe_preserves_child_that_recovers_on_second_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = r"\\server\share\projects\available.txt"
+    storage_root = "\\\\server\\share\\"
+    file_probes = 0
+
+    def recovered_stat(path: Path, *_args, **_kwargs):
+        nonlocal file_probes
+        if str(path) == file_path:
+            file_probes += 1
+            if file_probes == 1:
+                raise FileNotFoundError(str(path))
+            return object()
+        if str(path) == storage_root:
+            return object()
+        raise AssertionError(f"unexpected path probe: {path}")
+
+    monkeypatch.setattr(Path, "stat", recovered_stat)
+
+    assert not core_module._file_path_is_definitively_missing(file_path)
+    assert file_probes == 2
+
+
+def test_file_missing_probe_preserves_child_if_root_disconnects_during_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = r"\\server\share\projects\unknown.txt"
+    storage_root = "\\\\server\\share\\"
+    root_probes = 0
+
+    def disconnecting_stat(path: Path, *_args, **_kwargs):
+        nonlocal root_probes
+        if str(path) == file_path:
+            raise FileNotFoundError(str(path))
+        if str(path) == storage_root:
+            root_probes += 1
+            if root_probes == 2:
+                raise FileNotFoundError(str(path))
+            return object()
+        raise AssertionError(f"unexpected path probe: {path}")
+
+    monkeypatch.setattr(Path, "stat", disconnecting_stat)
+
+    assert not core_module._file_path_is_definitively_missing(file_path)
+    assert root_probes == 2
+
+
+def test_prune_missing_file_items_does_not_delete_concurrently_refreshed_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    repo = HistoryRepository(tmp_path, clock=clock)
+    file_path = tmp_path / "recreated.txt"
+    file_path.write_text("old", encoding="utf-8")
+    item = repo.add_files((str(file_path),), "old source")
+    file_path.unlink()
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+
+    def delayed_missing(_path: str) -> bool:
+        scan_started.set()
+        assert release_scan.wait(2)
+        return True
+
+    monkeypatch.setattr(core_module, "_file_path_is_definitively_missing", delayed_missing)
+    removed: list[tuple[str, ...]] = []
+    sweep = threading.Thread(target=lambda: removed.append(repo.prune_missing_file_items()))
+    sweep.start()
+    assert scan_started.wait(1)
+
+    file_path.write_text("fresh", encoding="utf-8")
+    refreshed = repo.add_files((str(file_path),), "fresh source")
+    release_scan.set()
+    sweep.join(2)
+
+    assert not sweep.is_alive()
+    assert refreshed.id == item.id
+    assert removed == [()]
+    assert repo.get(item.id) == refreshed
+    repo.close()
+
+
+def test_validate_file_item_retries_after_concurrent_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    repo = HistoryRepository(tmp_path, clock=clock)
+    file_path = tmp_path / "validated-after-refresh.txt"
+    file_path.write_text("old", encoding="utf-8")
+    item = repo.add_files((str(file_path),), "old source")
+    file_path.unlink()
+    first_scan_started = threading.Event()
+    release_first_scan = threading.Event()
+    original_missing = core_module._file_path_is_definitively_missing
+    calls = 0
+
+    def delayed_first_scan(path: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_scan_started.set()
+            assert release_first_scan.wait(2)
+            return True
+        return original_missing(path)
+
+    monkeypatch.setattr(core_module, "_file_path_is_definitively_missing", delayed_first_scan)
+    validated: list[ValidatedFileItem | None] = []
+    validation = threading.Thread(
+        target=lambda: validated.append(repo.validate_file_item(item.id))
+    )
+    validation.start()
+    assert first_scan_started.wait(1)
+
+    file_path.write_text("fresh", encoding="utf-8")
+    refreshed = repo.add_files((str(file_path),), "fresh source")
+    release_first_scan.set()
+    validation.join(2)
+
+    assert not validation.is_alive()
+    assert len(validated) == 1
+    assert validated[0] is not None
+    assert validated[0].item == refreshed
+    assert repo.get(item.id) == refreshed
     repo.close()
 
 

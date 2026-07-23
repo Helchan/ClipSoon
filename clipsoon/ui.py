@@ -80,7 +80,7 @@ from PySide6.QtWidgets import (
 )
 
 from clipsoon import __version__
-from clipsoon.core import AppSettings, ClipItem, ClipKind, format_bytes
+from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, ClipItem, ClipKind, format_bytes
 from clipsoon.search import SearchEngine
 
 LOGGER = logging.getLogger(__name__)
@@ -716,7 +716,7 @@ class SettingsDialog(QDialog):
             grid.setColumnStretch(1, 1)
             return grid
 
-        def add_row(grid: QGridLayout, row: int, text: str, control: QWidget) -> None:
+        def add_row(grid: QGridLayout, row: int, text: str, control: QWidget) -> QLabel:
             label = QLabel(text)
             label.setObjectName("settingsFieldLabel")
             label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -724,20 +724,31 @@ class SettingsDialog(QDialog):
             control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             grid.addWidget(label, row, 0)
             grid.addWidget(control, row, 1)
+            return label
 
         shortcut_section, shortcut_layout = section("快捷键")
         shortcut_form = form_grid()
         shortcut_layout.addLayout(shortcut_form)
 
+        self._available_hotkeys = (
+            {"自定义组合键": "custom"} if sys.platform == "win32" else self._HOTKEYS
+        )
         self.hotkey_mode = QComboBox()
-        self.hotkey_mode.addItems(self._HOTKEYS)
-        current = next((label for label, value in self._HOTKEYS.items() if value == settings.hotkey), "自定义组合键")
+        self.hotkey_mode.addItems(self._available_hotkeys)
+        current = next(
+            (
+                label
+                for label, value in self._available_hotkeys.items()
+                if value == settings.hotkey
+            ),
+            "自定义组合键",
+        )
         self.hotkey_mode.setCurrentText(current)
         add_row(shortcut_form, 0, "呼出方式", self.hotkey_mode)
         self.custom_hotkey = QKeySequenceEdit()
         self.custom_hotkey.setMaximumSequenceLength(1)
         self.custom_hotkey.setClearButtonEnabled(True)
-        default_custom = "combo:ctrl+shift+v"
+        default_custom = WINDOWS_DEFAULT_HOTKEY
         hotkey_text = _hotkey_display(settings.hotkey if settings.hotkey.startswith("combo:") else default_custom)
         self.custom_hotkey.setKeySequence(QKeySequence(hotkey_text))
         self.custom_hotkey.setEnabled(current == "自定义组合键")
@@ -748,7 +759,10 @@ class SettingsDialog(QDialog):
 
         self.interval = _spin(settings.double_tap_interval_ms, 180, 900, " ms")
         self.interval.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        add_row(shortcut_form, 2, "双击间隔", self.interval)
+        interval_label = add_row(shortcut_form, 2, "双击间隔", self.interval)
+        if sys.platform == "win32":
+            interval_label.hide()
+            self.interval.hide()
         layout.addWidget(shortcut_section)
 
         history_section, history_layout = section("历史与行为")
@@ -812,8 +826,8 @@ class SettingsDialog(QDialog):
             platform_message = "macOS 需要辅助功能权限，才能监听全局快捷键并自动粘贴到其他应用。"
         elif sys.platform == "win32":
             platform_message = (
-                "Windows 无需开启辅助功能权限；向管理员身份运行的应用自动粘贴时，"
-                "ClipSoon 也需要以管理员身份运行。"
+                "Windows 使用系统注册的组合快捷键，不使用双击修饰键监听。"
+                "向管理员身份运行的应用自动粘贴时，ClipSoon 也需要以管理员身份运行。"
             )
         if platform_message:
             platform_note = QFrame()
@@ -864,7 +878,7 @@ class SettingsDialog(QDialog):
         layout.addLayout(footer)
 
     def values(self) -> dict[str, object]:
-        selected = self._HOTKEYS[self.hotkey_mode.currentText()]
+        selected = self._available_hotkeys[self.hotkey_mode.currentText()]
         if selected == "custom":
             recorded = self.custom_hotkey.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
             selected = _parse_hotkey(recorded)
@@ -885,7 +899,7 @@ class SettingsDialog(QDialog):
 
     def _validate_accept(self) -> None:
         recorded = self.custom_hotkey.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
-        custom = self._HOTKEYS[self.hotkey_mode.currentText()] == "custom"
+        custom = self._available_hotkeys[self.hotkey_mode.currentText()] == "custom"
         parsed = _parse_hotkey(recorded) if custom else ""
         if custom and not parsed:
             QMessageBox.warning(self, "快捷键无效", "组合键必须包含 Ctrl/Shift/Alt/Command 和一个普通键。")
@@ -930,6 +944,7 @@ class ClipPanel(QWidget):
         self._engine = SearchEngine()
         self._kind: ClipKind | None = None
         self._keep_open = False
+        self._native_deactivation_managed = sys.platform == "win32"
         self._selection_anchor = 0
         self._remembered_search_text = ""
         self._remembered_kind: ClipKind | None = None
@@ -1429,6 +1444,7 @@ class ClipPanel(QWidget):
         super().changeEvent(event)
         if (
             event.type() == QEvent.Type.ActivationChange
+            and not self._native_deactivation_managed
             and not self.isActiveWindow()
             and self.isVisible()
             and not self._keep_open
@@ -1442,6 +1458,9 @@ class ClipPanel(QWidget):
 
     def keep_open(self, value: bool) -> None:
         self._keep_open = value
+
+    def set_native_deactivation_managed(self, value: bool) -> None:
+        self._native_deactivation_managed = bool(value)
 
     def _filter(self, kind: ClipKind | None, active: QToolButton) -> None:
         del active

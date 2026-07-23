@@ -21,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     if not executable.is_file():
         raise FileNotFoundError(executable)
     with tempfile.TemporaryDirectory(prefix="clipsoon-helper-smoke-") as temporary:
-        _smoke_role(executable, "hotkey", ["--hotkey", "double:ctrl"])
+        _smoke_role(executable, "hotkey", ["--hotkey", "combo:ctrl+shift+space"])
         _smoke_role(executable, "clipboard", ["--ipc-dir", temporary])
     return 0
 

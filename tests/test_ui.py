@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 
 import clipsoon.ui as ui_module
 from clipsoon import __version__
-from clipsoon.core import AppSettings, ClipItem, ClipKind
+from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, ClipItem, ClipKind
 from clipsoon.ui import (
     ClipDelegate,
     ClipPanel,
@@ -135,8 +135,48 @@ def test_settings_and_custom_hotkey_validation(qtbot) -> None:
     assert dialog.findChildren(QFrame, "settingsSection")
     assert dialog.findChild(QFrame, "settingsSection") is not None
     assert not hasattr(dialog, "version_label")
-    dialog.hotkey_mode.setCurrentText("双击 Shift")
+
+
+def test_windows_settings_only_offer_registered_combo_and_hide_double_interval(
+    qtbot,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    dialog = SettingsDialog(
+        AppSettings(hotkey="double:ctrl", double_tap_interval_ms=650),
+        accessibility_granted=True,
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.hotkey_mode.count() == 1
+    assert dialog.hotkey_mode.itemText(0) == "自定义组合键"
+    assert dialog.hotkey_mode.currentText() == "自定义组合键"
+    assert dialog.custom_hotkey.isEnabled()
+    assert _hotkey_display(WINDOWS_DEFAULT_HOTKEY).casefold() == "ctrl+shift+space"
+    assert dialog.values()["hotkey"] == WINDOWS_DEFAULT_HOTKEY
+    assert dialog.interval.isHidden()
+    interval_labels = [
+        label
+        for label in dialog.findChildren(QLabel, "settingsFieldLabel")
+        if label.text() == "双击间隔"
+    ]
+    assert len(interval_labels) == 1
+    assert interval_labels[0].isHidden()
+
+
+def test_non_windows_settings_retain_double_modifier_modes(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "linux")
+    dialog = SettingsDialog(
+        AppSettings(hotkey="double:shift", double_tap_interval_ms=360),
+        accessibility_granted=True,
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.hotkey_mode.count() == len(SettingsDialog._HOTKEYS)
+    assert dialog.hotkey_mode.currentText() == "双击 Shift"
     assert dialog.values()["hotkey"] == "double:shift"
+    assert not dialog.interval.isHidden()
+    assert dialog.interval.value() == 360
 
 
 def test_windows_rejects_custom_keys_not_supported_by_register_hotkey(monkeypatch) -> None:

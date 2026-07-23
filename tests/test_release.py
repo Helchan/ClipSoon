@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def test_release_version_is_consistent() -> None:
     project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert __version__ == "0.10.0"
+    assert __version__ == "0.10.1"
     assert project["project"]["version"] == __version__
 
 
@@ -29,3 +29,10 @@ def test_tag_release_workflow_builds_requested_platforms() -> None:
     assert "contents: write" in workflow
     assert "gh release create" in workflow
     assert "scripts\\smoke_windows_helpers.py dist\\ClipSoon\\ClipSoon.exe" in workflow
+
+
+def test_windows_helper_smoke_uses_only_registered_combo_hotkeys() -> None:
+    smoke = (PROJECT_ROOT / "scripts/smoke_windows_helpers.py").read_text(encoding="utf-8")
+
+    assert "combo:ctrl+shift+space" in smoke
+    assert "double:" not in smoke

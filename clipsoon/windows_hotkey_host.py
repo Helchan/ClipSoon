@@ -1,9 +1,15 @@
-"""Out-of-process Windows hotkey host based on Raw Input and RegisterHotKey.
+"""Out-of-process Windows hotkey host backed only by ``RegisterHotKey``.
 
-The host is intentionally independent from Qt and pynput.  A frozen
-``--windowed`` executable can have ``sys.stdin`` and ``sys.stdout`` set to
-``None``; in that case the helper reads and writes the inherited standard pipe
-handles directly through ``ReadFile`` and ``WriteFile``.
+Windows owns the registration and posts ``WM_HOTKEY`` to this helper's message
+queue.  There is deliberately no Raw Input device, low-level keyboard hook, or
+sampled modifier state whose local health can diverge from the operating
+system.  If the helper exits, the supervisor starts a fresh process and the
+registration is acquired again.
+
+The host is independent from Qt and pynput.  A frozen ``--windowed`` executable
+can have ``sys.stdin`` and ``sys.stdout`` set to ``None``; in that case the
+helper reads and writes the inherited standard pipe handles directly through
+``ReadFile`` and ``WriteFile``.
 """
 
 from __future__ import annotations
@@ -21,30 +27,11 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Protocol, TextIO
 
-# Raw keyboard constants.
-RIM_TYPEKEYBOARD = 1
-RID_INPUT = 0x10000003
-RIDEV_INPUTSINK = 0x00000100
-RI_KEY_BREAK = 0x0001
-RI_KEY_E0 = 0x0002
-RI_KEY_E1 = 0x0004
-
-VK_CONTROL = 0x11
-VK_LCONTROL = 0xA2
-VK_RCONTROL = 0xA3
-VK_SHIFT = 0x10
-VK_LSHIFT = 0xA0
-VK_RSHIFT = 0xA1
-VK_MENU = 0x12
-VK_LMENU = 0xA4
-VK_RMENU = 0xA5
-VK_LWIN = 0x5B
-VK_RWIN = 0x5C
+from clipsoon.core import WINDOWS_DEFAULT_HOTKEY
 
 # Window messages and timer identifiers.
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
-WM_INPUT = 0x00FF
 WM_HOTKEY = 0x0312
 WM_TIMER = 0x0113
 HEARTBEAT_TIMER_ID = 0xC501
@@ -67,7 +54,6 @@ _STD_OUTPUT_HANDLE = -11
 _ERROR_BROKEN_PIPE = 109
 _ERROR_ALREADY_EXISTS = 183
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-_UINT_ERROR = 0xFFFFFFFF
 _SYNCHRONIZE = 0x00100000
 _INFINITE = 0xFFFFFFFF
 _WAIT_OBJECT_0 = 0x00000000
@@ -86,35 +72,6 @@ _WPARAM = ctypes.c_size_t
 _LPARAM = ctypes.c_ssize_t
 _LRESULT = ctypes.c_ssize_t
 _WNDPROC_FACTORY = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
-
-
-class _RawInputHeader(ctypes.Structure):
-    _fields_ = (
-        ("dwType", _DWORD),
-        ("dwSize", _DWORD),
-        ("hDevice", _HANDLE),
-        ("wParam", _WPARAM),
-    )
-
-
-class _RawKeyboard(ctypes.Structure):
-    _fields_ = (
-        ("MakeCode", _WORD),
-        ("Flags", _WORD),
-        ("Reserved", _WORD),
-        ("VKey", _WORD),
-        ("Message", _UINT),
-        ("ExtraInformation", _DWORD),
-    )
-
-
-class _RawInputDevice(ctypes.Structure):
-    _fields_ = (
-        ("usUsagePage", _WORD),
-        ("usUsage", _WORD),
-        ("dwFlags", _DWORD),
-        ("hwndTarget", _HWND),
-    )
 
 
 class _Point(ctypes.Structure):
@@ -149,167 +106,6 @@ class _WindowClass(ctypes.Structure):
         ("lpszMenuName", ctypes.c_wchar_p),
         ("lpszClassName", ctypes.c_wchar_p),
     )
-
-
-@dataclass(frozen=True, slots=True)
-class RawKeyboardEvent:
-    """The stable subset of ``RAWKEYBOARD`` needed by the detector."""
-
-    virtual_key: int
-    flags: int
-    make_code: int = 0
-    message: int = 0
-
-    @property
-    def is_break(self) -> bool:
-        return bool(self.flags & RI_KEY_BREAK)
-
-    @property
-    def is_extended(self) -> bool:
-        return bool(self.flags & (RI_KEY_E0 | RI_KEY_E1))
-
-
-def _modifier_key(event: RawKeyboardEvent) -> str | None:
-    if event.virtual_key == VK_LCONTROL:
-        return "ctrl_l"
-    if event.virtual_key == VK_RCONTROL:
-        return "ctrl_r"
-    if event.virtual_key == VK_CONTROL:
-        return "ctrl_r" if event.flags & RI_KEY_E0 else "ctrl_l"
-    if event.virtual_key == VK_LSHIFT:
-        return "shift_l"
-    if event.virtual_key == VK_RSHIFT:
-        return "shift_r"
-    if event.virtual_key == VK_SHIFT:
-        return "shift_r" if event.make_code == 0x36 else "shift_l"
-    if event.virtual_key == VK_LMENU:
-        return "alt_l"
-    if event.virtual_key == VK_RMENU:
-        return "alt_r"
-    if event.virtual_key == VK_MENU:
-        return "alt_r" if event.flags & RI_KEY_E0 else "alt_l"
-    if event.virtual_key == VK_LWIN:
-        return "meta_l"
-    if event.virtual_key == VK_RWIN:
-        return "meta_r"
-    return None
-
-
-def _key_identity(event: RawKeyboardEvent) -> str:
-    modifier = _modifier_key(event)
-    if modifier is not None:
-        return modifier
-    return f"vk:{event.virtual_key}:{int(event.is_extended)}"
-
-
-class DoubleModifierDetector:
-    """Pure Raw Input state machine for a left/right modifier double tap."""
-
-    def __init__(
-        self,
-        modifier: str,
-        interval_ms: int,
-        activated: Callable[[float], None],
-        *,
-        clock: Callable[[], float] = time.monotonic,
-        stale_after_ms: int | None = None,
-    ) -> None:
-        if modifier not in {"ctrl", "shift", "alt", "meta"}:
-            raise ValueError(f"不支持的双修饰键：{modifier}")
-        self.modifier = modifier
-        self.interval = max(0.18, min(0.9, interval_ms / 1_000))
-        default_stale = max(2.0, self.interval * 3)
-        self.stale_after = default_stale if stale_after_ms is None else max(0.2, stale_after_ms / 1_000)
-        self._activated = activated
-        self._clock = clock
-        self._down: set[str] = set()
-        self._active_modifier: str | None = None
-        self._press_started: float | None = None
-        self._last_tap: float | None = None
-        self._chorded = False
-        self._last_event_at: float | None = None
-
-    def reset(self) -> None:
-        self._down.clear()
-        self._active_modifier = None
-        self._press_started = None
-        self._last_tap = None
-        self._chorded = False
-        self._last_event_at = None
-
-    def expire(self, at: float | None = None) -> bool:
-        """Clear an impossible, quiet pressed-state left by a lost break event."""
-
-        at = self._clock() if at is None else at
-        if self._last_event_at is None or at - self._last_event_at < self.stale_after:
-            return False
-        self.reset()
-        return True
-
-    def feed(self, event: RawKeyboardEvent, at: float | None = None) -> None:
-        at = self._clock() if at is None else at
-        if event.virtual_key in (0, 0xFF):
-            return
-        if self._last_event_at is not None and (
-            at < self._last_event_at or at - self._last_event_at >= self.stale_after
-        ):
-            self.reset()
-        self._last_event_at = at
-        key = _key_identity(event)
-        modifier = _modifier_key(event)
-        target = modifier if modifier is not None and modifier.startswith(f"{self.modifier}_") else None
-        if event.is_break:
-            self._release(key, target, at)
-        else:
-            self._press(key, target, at)
-
-    def _press(self, key: str, target: str | None, at: float) -> None:
-        if key in self._down:  # Raw Input repeats are make events without a break.
-            return
-        if target is not None:
-            if self._active_modifier is None:
-                self._active_modifier = target
-                self._press_started = at
-                self._chorded = bool(self._down)
-            else:
-                self._chorded = True
-        else:
-            if self._active_modifier is not None:
-                self._chorded = True
-            self._last_tap = None
-        self._down.add(key)
-
-    def _release(self, key: str, target: str | None, at: float) -> None:
-        if key not in self._down:
-            return
-        self._down.discard(key)
-        if target is None or key != self._active_modifier:
-            return
-        duration = at - self._press_started if self._press_started is not None else self.interval + 1
-        valid_tap = not self._chorded and 0 <= duration <= self.interval
-        triggered = valid_tap and self._last_tap is not None and at - self._last_tap <= self.interval
-        self._last_tap = None if triggered or not valid_tap else at
-        self._active_modifier = None
-        self._press_started = None
-        self._chorded = False
-        # Cleanup precedes the callback so a consumer exception cannot wedge
-        # this state machine in a permanently pressed state.
-        if triggered:
-            self._activated(at)
-
-
-class DoubleCtrlDetector(DoubleModifierDetector):
-    """Compatibility facade for the default ``double:ctrl`` detector."""
-
-    def __init__(
-        self,
-        interval_ms: int,
-        activated: Callable[[float], None],
-        *,
-        clock: Callable[[], float] = time.monotonic,
-        stale_after_ms: int | None = None,
-    ) -> None:
-        super().__init__("ctrl", interval_ms, activated, clock=clock, stale_after_ms=stale_after_ms)
 
 
 class _LineWriter(Protocol):
@@ -356,15 +152,14 @@ class JsonLineEmitter:
             return message
 
 
-class RawInputHotkeyEngine:
-    """Protocol layer shared by the Raw Input and RegisterHotKey transports."""
+class NativeHotkeyEngine:
+    """Protocol layer for ready, heartbeat, and registered-hotkey events."""
 
     def __init__(
         self,
         emitter: JsonLineEmitter,
         *,
-        hotkey: str = "double:ctrl",
-        interval_ms: int = 420,
+        hotkey: str = WINDOWS_DEFAULT_HOTKEY,
         clock: Callable[[], float] = time.monotonic,
         process_id: int | None = None,
         session_id: str | None = None,
@@ -377,8 +172,6 @@ class RawInputHotkeyEngine:
         self._clock = clock
         self._process_id = os.getpid() if process_id is None else process_id
         self._activation_context = activation_context
-        modifier = hotkey.removeprefix("double:") if hotkey.startswith("double:") else "ctrl"
-        self.detector = DoubleModifierDetector(modifier, interval_ms, self._activated, clock=clock)
 
     @staticmethod
     def _milliseconds(value: float) -> int:
@@ -394,11 +187,7 @@ class RawInputHotkeyEngine:
 
     def heartbeat(self) -> None:
         now = self._clock()
-        self.detector.expire(now)
         self.emitter.emit("heartbeat", monotonic_ms=self._milliseconds(now))
-
-    def feed_keyboard(self, event: RawKeyboardEvent, at: float | None = None) -> None:
-        self.detector.feed(event, at)
 
     def activate(self, at: float | None = None) -> None:
         self._activated(self._clock() if at is None else at)
@@ -531,15 +320,11 @@ class _WindowsApiProtocol(Protocol):
 
     def create_message_window(self, wndproc: Callable[[int, int, int, int], int]) -> int: ...
 
-    def register_keyboard(self, hwnd: int, flags: int) -> None: ...
-
     def register_hotkey(self, hwnd: int, hotkey_id: int, modifiers: int, virtual_key: int) -> None: ...
 
     def unregister_hotkey(self, hwnd: int, hotkey_id: int) -> None: ...
 
     def set_timer(self, hwnd: int, timer_id: int, interval_ms: int) -> None: ...
-
-    def read_keyboard(self, lparam: int) -> RawKeyboardEvent | None: ...
 
     def message_loop(self) -> int: ...
 
@@ -559,7 +344,7 @@ class _Win32Api:
 
     def __init__(self) -> None:
         if sys.platform != "win32":
-            raise OSError("Windows Raw Input 仅可在 Windows 上启动")
+            raise OSError("Windows 原生快捷键宿主仅可在 Windows 上启动")
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._configure_signatures()
@@ -621,20 +406,6 @@ class _Win32Api:
         self.user32.TranslateMessage.restype = _BOOL
         self.user32.DispatchMessageW.argtypes = (ctypes.POINTER(_Message),)
         self.user32.DispatchMessageW.restype = _LRESULT
-        self.user32.RegisterRawInputDevices.argtypes = (
-            ctypes.POINTER(_RawInputDevice),
-            _UINT,
-            _UINT,
-        )
-        self.user32.RegisterRawInputDevices.restype = _BOOL
-        self.user32.GetRawInputData.argtypes = (
-            _HANDLE,
-            _UINT,
-            ctypes.c_void_p,
-            ctypes.POINTER(_UINT),
-            _UINT,
-        )
-        self.user32.GetRawInputData.restype = _UINT
         self.user32.RegisterHotKey.argtypes = (_HWND, ctypes.c_int32, _UINT, _UINT)
         self.user32.RegisterHotKey.restype = _BOOL
         self.user32.UnregisterHotKey.argtypes = (_HWND, ctypes.c_int32)
@@ -717,11 +488,6 @@ class _Win32Api:
         self._hwnd = int(value)
         return self._hwnd
 
-    def register_keyboard(self, hwnd: int, flags: int) -> None:
-        device = _RawInputDevice(0x01, 0x06, flags, self._as_hwnd(hwnd))
-        if not self.user32.RegisterRawInputDevices(ctypes.byref(device), 1, ctypes.sizeof(_RawInputDevice)):
-            raise self._error("RegisterRawInputDevices")
-
     def register_hotkey(self, hwnd: int, hotkey_id: int, modifiers: int, virtual_key: int) -> None:
         if not self.user32.RegisterHotKey(self._as_hwnd(hwnd), hotkey_id, modifiers, virtual_key):
             raise self._error("RegisterHotKey")
@@ -732,47 +498,6 @@ class _Win32Api:
     def set_timer(self, hwnd: int, timer_id: int, interval_ms: int) -> None:
         if not self.user32.SetTimer(self._as_hwnd(hwnd), timer_id, interval_ms, None):
             raise self._error("SetTimer")
-
-    def read_keyboard(self, lparam: int) -> RawKeyboardEvent | None:
-        size = _UINT()
-        raw_handle = _HANDLE(lparam)
-        result = int(
-            self.user32.GetRawInputData(
-                raw_handle,
-                RID_INPUT,
-                None,
-                ctypes.byref(size),
-                ctypes.sizeof(_RawInputHeader),
-            )
-        )
-        if result == _UINT_ERROR:
-            raise self._error("GetRawInputData(size)")
-        required = ctypes.sizeof(_RawInputHeader) + ctypes.sizeof(_RawKeyboard)
-        if size.value < required:
-            return None
-        buffer = ctypes.create_string_buffer(size.value)
-        result = int(
-            self.user32.GetRawInputData(
-                raw_handle,
-                RID_INPUT,
-                buffer,
-                ctypes.byref(size),
-                ctypes.sizeof(_RawInputHeader),
-            )
-        )
-        if result == _UINT_ERROR:
-            raise self._error("GetRawInputData")
-        header = _RawInputHeader.from_buffer_copy(buffer.raw)
-        if header.dwType != RIM_TYPEKEYBOARD:
-            return None
-        offset = ctypes.sizeof(_RawInputHeader)
-        keyboard = _RawKeyboard.from_buffer_copy(buffer.raw[offset : offset + ctypes.sizeof(_RawKeyboard)])
-        return RawKeyboardEvent(
-            int(keyboard.VKey),
-            int(keyboard.Flags),
-            int(keyboard.MakeCode),
-            int(keyboard.Message),
-        )
 
     def message_loop(self) -> int:
         message = _Message()
@@ -892,8 +617,7 @@ class WindowsHotkeyHost:
     def __init__(
         self,
         *,
-        hotkey: str = "double:ctrl",
-        interval_ms: int = 420,
+        hotkey: str = WINDOWS_DEFAULT_HOTKEY,
         heartbeat_interval_ms: int = DEFAULT_HEARTBEAT_INTERVAL_MS,
         output: TextIO | _LineWriter | None = None,
         control_input: TextIO | _LineReader | None = None,
@@ -910,30 +634,24 @@ class WindowsHotkeyHost:
         self._control_input = control_input
         self._heartbeat_interval_ms = max(100, heartbeat_interval_ms)
         self._parent_pid = parent_pid
-        self._engine = RawInputHotkeyEngine(
+        self._engine = NativeHotkeyEngine(
             JsonLineEmitter(output, session_id),
             hotkey=hotkey,
-            interval_ms=interval_ms,
             clock=clock,
             process_id=process_id,
             session_id=session_id,
             activation_context=self._activation_context,
         )
         self._clock = clock
-        self._hotkey = hotkey
         self._hard_exit = hard_exit
         self._registered_combo: RegisteredHotkey | None = None
         self._configuration_error = ""
         try:
-            if hotkey.startswith("combo:"):
-                self._registered_combo = parse_registered_hotkey(hotkey)
-            elif hotkey not in {
-                "double:ctrl",
-                "double:shift",
-                "double:alt",
-                "double:meta",
-            }:
-                raise ValueError(f"Windows 原生宿主当前不支持：{hotkey}")
+            if not hotkey.startswith("combo:"):
+                raise ValueError(
+                    f"Windows 仅支持由系统注册的组合快捷键，不支持：{hotkey}"
+                )
+            self._registered_combo = parse_registered_hotkey(hotkey)
         except ValueError as exc:
             self._configuration_error = str(exc)
         self._hwnd = 0
@@ -955,25 +673,23 @@ class WindowsHotkeyHost:
                 self._engine.emitter.emit("error", fatal=True, code="already_active")
                 return 3
             self._hwnd = self._api.create_message_window(self._window_proc)
-            if self._registered_combo is None:
-                self._api.register_keyboard(self._hwnd, RIDEV_INPUTSINK)
-            else:
-                try:
-                    self._api.register_hotkey(
-                        self._hwnd,
-                        REGISTERED_HOTKEY_ID,
-                        self._registered_combo.modifiers,
-                        self._registered_combo.virtual_key,
-                    )
-                except OSError as exc:
-                    self._engine.emitter.emit(
-                        "error",
-                        fatal=True,
-                        code="registration_failed",
-                        message=f"无法注册全局快捷键：{exc}",
-                    )
-                    return 4
-                self._combo_is_registered = True
+            assert self._registered_combo is not None
+            try:
+                self._api.register_hotkey(
+                    self._hwnd,
+                    REGISTERED_HOTKEY_ID,
+                    self._registered_combo.modifiers,
+                    self._registered_combo.virtual_key,
+                )
+            except OSError as exc:
+                self._engine.emitter.emit(
+                    "error",
+                    fatal=True,
+                    code="registration_failed",
+                    message=f"无法注册全局快捷键：{exc}",
+                )
+                return 4
+            self._combo_is_registered = True
             self._api.set_timer(self._hwnd, HEARTBEAT_TIMER_ID, self._heartbeat_interval_ms)
             self._engine.ready()
             self._start_control_reader()
@@ -996,17 +712,6 @@ class WindowsHotkeyHost:
 
     def _window_proc(self, hwnd: int, message: int, wparam: int, lparam: int) -> int:
         hwnd_value = int(hwnd or 0)
-        if message == WM_INPUT:
-            try:
-                event = self._api.read_keyboard(int(lparam))
-                if event is not None:
-                    self._engine.feed_keyboard(event)
-            except (BrokenPipeError, OSError):
-                self._api.post_message(hwnd_value, WM_CLOSE)
-            except (TypeError, ValueError):
-                # A malformed device packet must not escape a ctypes callback.
-                pass
-            return self._api.def_window_proc(hwnd_value, message, int(wparam), int(lparam))
         if message == WM_HOTKEY and int(wparam) == REGISTERED_HOTKEY_ID:
             try:
                 self._engine.activate(self._clock())
@@ -1098,8 +803,7 @@ def _default_control_input() -> TextIO | _LineReader:
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ClipSoon Windows native hotkey helper")
-    parser.add_argument("--hotkey", default="double:ctrl")
-    parser.add_argument("--interval-ms", type=int, default=420)
+    parser.add_argument("--hotkey", default=WINDOWS_DEFAULT_HOTKEY)
     parser.add_argument("--heartbeat-ms", type=int, default=DEFAULT_HEARTBEAT_INTERVAL_MS)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--parent-pid", type=int, default=None)
@@ -1116,7 +820,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         host = WindowsHotkeyHost(
             hotkey=arguments.hotkey,
-            interval_ms=arguments.interval_ms,
             heartbeat_interval_ms=arguments.heartbeat_ms,
             control_input=_default_control_input(),
             session_id=arguments.session_id,

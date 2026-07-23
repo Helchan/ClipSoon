@@ -275,11 +275,15 @@ def test_dib_is_wrapped_as_loadable_bmp_payload(tmp_path: Path) -> None:
     assert payload[14:] == dib
 
 
-def test_private_marker_suppresses_payload_read(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "marker",
+    ["ExcludeClipboardContentFromMonitorProcessing", "ClipSoon.InternalWrite"],
+)
+def test_private_marker_suppresses_payload_read(tmp_path: Path, marker: str) -> None:
     api = FakeClipboardApi()
     private_format = 50_001
     api.formats = [private_format, CF_UNICODETEXT]
-    api.names[private_format] = "ExcludeClipboardContentFromMonitorProcessing"
+    api.names[private_format] = marker
     api.payloads[CF_UNICODETEXT] = "secret\0".encode("utf-16-le")
 
     snapshot = make_reader(tmp_path, api).read(1)

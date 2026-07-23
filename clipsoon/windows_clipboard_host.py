@@ -69,6 +69,7 @@ SYNCHRONIZE = 0x00100000
 WAIT_OBJECT_0 = 0
 INFINITE = 0xFFFFFFFF
 _PRIVATE_FORMAT_MARKERS = (
+    "clipsoon.internalwrite",
     "concealed",
     "transient",
     "excludeclipboardcontentfrommonitorprocessing",
