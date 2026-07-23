@@ -36,6 +36,7 @@ from PySide6.QtGui import (
     QIcon,
     QImage,
     QImageReader,
+    QInputMethodEvent,
     QKeyEvent,
     QKeySequence,
     QMouseEvent,
@@ -936,6 +937,7 @@ class ClipPanel(QWidget):
         self._remembered_current_id: str | None = None
         self._selection_hidden_at: float | None = None
         self._selection_hide_prepared = False
+        self._search_ime_composing = False
         self._selection_memory_timer = QTimer(self)
         self._selection_memory_timer.setSingleShot(True)
         self._selection_memory_timer.timeout.connect(self._expire_selection_memory)
@@ -1181,6 +1183,7 @@ class ClipPanel(QWidget):
             self._refresh_results()
         self._select_for_show(restore=restore_state)
         self._selection_hide_prepared = False
+        self._search_ime_composing = False
         self.show()
         self.raise_()
         self.activateWindow()
@@ -1377,6 +1380,14 @@ class ClipPanel(QWidget):
         self.search_box.setFixedHeight(text_height * 2 + 4)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.search and event.type() == QEvent.Type.InputMethod:
+            input_event = event if isinstance(event, QInputMethodEvent) else None
+            if input_event is not None:
+                self._search_ime_composing = bool(input_event.preeditString())
+            return super().eventFilter(watched, event)
+        if watched is self.search and event.type() == QEvent.Type.FocusOut:
+            self._search_ime_composing = False
+            return super().eventFilter(watched, event)
         if event.type() != QEvent.Type.KeyPress:
             return super().eventFilter(watched, event)
         key_event = event if isinstance(event, QKeyEvent) else None
@@ -1394,7 +1405,7 @@ class ClipPanel(QWidget):
             self.hide_panel()
             return True
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            if watched is self.search and QApplication.inputMethod().isVisible():
+            if watched is self.search and self._search_ime_composing:
                 return False
             self._send(self.list.currentIndex().row())
             return True

@@ -145,10 +145,18 @@ class HotkeyStateMachine:
             self._combo_latched = False
 
 
+@dataclass(frozen=True, slots=True)
+class HotkeyActivationContext:
+    """Per-trigger Windows state captured before the panel changes foreground."""
+
+    target_window: int | None = None
+    foreground_granted: bool = False
+
+
 class GlobalHotkeyService:
     def __init__(
         self,
-        activated: Callable[[], None],
+        activated: Callable[[HotkeyActivationContext | None], None],
         failed: Callable[[str], None],
     ) -> None:
         self._activated = activated
@@ -175,7 +183,9 @@ class GlobalHotkeyService:
             worker.start()
             return
         self._machine = HotkeyStateMachine(
-            settings.hotkey, settings.double_tap_interval_ms, self._activated
+            settings.hotkey,
+            settings.double_tap_interval_ms,
+            lambda: self._activated(None),
         )
         try:
             from pynput import keyboard
@@ -215,7 +225,20 @@ class GlobalHotkeyService:
 
     def _on_windows_message(self, message: object) -> None:
         if isinstance(message, dict) and message.get("type") == "hotkey":
-            self._activated()
+            raw_target = message.get("target_hwnd")
+            target_window = (
+                raw_target
+                if isinstance(raw_target, int)
+                and not isinstance(raw_target, bool)
+                and raw_target > 0
+                else None
+            )
+            self._activated(
+                HotkeyActivationContext(
+                    target_window=target_window,
+                    foreground_granted=message.get("foreground_granted") is True,
+                )
+            )
 
     def _on_press(self, key: object) -> None:
         if self._machine is not None:
@@ -1019,16 +1042,41 @@ class PlatformBridge:
                 app = NSWorkspace.sharedWorkspace().frontmostApplication()
                 return str(app.localizedName() or "") if app else ""
             if sys.platform == "win32":
-                user32 = ctypes.windll.user32
-                hwnd = _windows_foreground_window()
-                handle = _windows_handle(hwnd)
-                length = user32.GetWindowTextLengthW(handle)
-                buffer = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(handle, buffer, len(buffer))
-                return buffer.value
+                return PlatformBridge.window_name(_windows_foreground_window())
         except Exception:
             LOGGER.debug("Current app name unavailable", exc_info=True)
         return ""
+
+    @staticmethod
+    def window_name(identifier: int) -> str:
+        if sys.platform != "win32" or identifier <= 0:
+            return ""
+        try:
+            user32 = ctypes.windll.user32
+            handle = _windows_handle(identifier)
+            length = user32.GetWindowTextLengthW(handle)
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(handle, buffer, len(buffer))
+            return buffer.value
+        except Exception:
+            LOGGER.debug("Windows window title unavailable", exc_info=True)
+            return ""
+
+    @staticmethod
+    def target_from_window_id(identifier: int) -> ForegroundTargetHandle | None:
+        if sys.platform != "win32" or identifier <= 0:
+            return None
+        try:
+            handle = _windows_handle(identifier)
+            if ctypes.windll.user32.IsWindow(handle):
+                return ForegroundTargetHandle(
+                    "windows",
+                    identifier,
+                    PlatformBridge.window_name(identifier),
+                )
+        except Exception:
+            LOGGER.debug("Could not restore captured Windows target", exc_info=True)
+        return None
 
     @staticmethod
     def capture_target() -> ForegroundTargetHandle | None:
@@ -1073,7 +1121,45 @@ class PlatformBridge:
             user32.ShowWindow(handle, 5)  # SW_SHOW
             user32.BringWindowToTop(handle)
             user32.SetForegroundWindow(handle)
-            return _windows_foreground_window() == identifier
+            if _windows_foreground_window() == identifier:
+                return True
+
+            # Raw Input with RIDEV_INPUTSINK does not guarantee that the helper
+            # owns Windows' "last input" foreground privilege. If the normal
+            # request is denied, temporarily join the current foreground input
+            # queue and retry from the Qt GUI thread that owns the panel.
+            foreground = _windows_foreground_window()
+            if not foreground:
+                return False
+            kernel32 = ctypes.windll.kernel32
+            get_window_thread = user32.GetWindowThreadProcessId
+            get_window_thread.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+            get_window_thread.restype = ctypes.c_uint32
+            get_current_thread = kernel32.GetCurrentThreadId
+            get_current_thread.argtypes = ()
+            get_current_thread.restype = ctypes.c_uint32
+            attach_thread_input = user32.AttachThreadInput
+            attach_thread_input.argtypes = (
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_int32,
+            )
+            attach_thread_input.restype = ctypes.c_int32
+            foreground_thread = int(
+                get_window_thread(_windows_handle(foreground), None)
+            )
+            current_thread = int(get_current_thread())
+            if not foreground_thread or foreground_thread == current_thread:
+                return False
+            attached = bool(attach_thread_input(current_thread, foreground_thread, True))
+            if not attached:
+                return False
+            try:
+                user32.BringWindowToTop(handle)
+                user32.SetForegroundWindow(handle)
+                return _windows_foreground_window() == identifier
+            finally:
+                attach_thread_input(current_thread, foreground_thread, False)
         except Exception:
             LOGGER.debug("Could not activate ClipSoon panel", exc_info=True)
             return False

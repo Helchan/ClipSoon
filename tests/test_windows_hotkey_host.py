@@ -144,6 +144,9 @@ class _FakeWindowsApi:
         self.closed = False
         self.mutex_available = True
         self.parent_exited = False
+        self.foreground = 909
+        self.foreground_handoffs: list[int] = []
+        self.activation_order: list[tuple[str, int]] = []
         self._packets = iter(
             (
                 RawKeyboardEvent(VK_LCONTROL, 0),
@@ -162,6 +165,15 @@ class _FakeWindowsApi:
 
     def wait_for_process_exit(self, _process_id: int) -> bool:
         return self.parent_exited
+
+    def foreground_window(self) -> int:
+        self.activation_order.append(("target", self.foreground))
+        return self.foreground
+
+    def allow_set_foreground_window(self, process_id: int) -> bool:
+        self.foreground_handoffs.append(process_id)
+        self.activation_order.append(("grant", process_id))
+        return True
 
     def register_keyboard(self, hwnd: int, flags: int) -> None:
         self.registered.append((hwnd, flags))
@@ -213,6 +225,7 @@ def test_host_is_platform_independent_with_injected_windows_api() -> None:
         clock=lambda: 5.0,
         process_id=456,
         session_id="host-test",
+        parent_pid=654,
     )
 
     assert host.run() == 0
@@ -221,6 +234,9 @@ def test_host_is_platform_independent_with_injected_windows_api() -> None:
     assert [message["type"] for message in messages] == ["ready", "hotkey", "heartbeat"]
     assert [message["event_id"] for message in messages] == [1, 2, 3]
     assert {message["session_id"] for message in messages} == {"host-test"}
+    assert messages[1]["target_hwnd"] == 909
+    assert messages[1]["foreground_granted"] is True
+    assert api.activation_order[:2] == [("target", 909), ("grant", 654)]
     assert api.registered == [(101, RIDEV_INPUTSINK)]
     assert api.timers == [(101, HEARTBEAT_TIMER_ID, 1_250)]
     assert api.closed

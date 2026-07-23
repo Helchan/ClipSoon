@@ -16,6 +16,7 @@ from clipsoon.system import (
     ClipboardController,
     ForegroundTargetHandle,
     GlobalHotkeyService,
+    HotkeyActivationContext,
     HotkeyStateMachine,
     LaunchAtLoginManager,
     PlatformBridge,
@@ -481,7 +482,7 @@ def test_hotkey_service_listener_lifecycle_and_failure(monkeypatch) -> None:
 
     keyboard = types.SimpleNamespace(Listener=FakeListener)
     monkeypatch.setitem(sys.modules, "pynput", types.SimpleNamespace(keyboard=keyboard))
-    service = GlobalHotkeyService(lambda: events.append("hit"), events.append)
+    service = GlobalHotkeyService(lambda _context: events.append("hit"), events.append)
     service.start(AppSettings())
     listener = service._listener
     assert service.is_running
@@ -531,7 +532,7 @@ def test_hotkey_service_detects_listener_that_stopped_after_start(monkeypatch) -
         "pynput",
         types.SimpleNamespace(keyboard=types.SimpleNamespace(Listener=FakeListener)),
     )
-    service = GlobalHotkeyService(lambda: None, lambda _message: None)
+    service = GlobalHotkeyService(lambda _context: None, lambda _message: None)
     service.start(AppSettings())
     assert service.is_running
 
@@ -562,7 +563,7 @@ def test_hotkey_service_detects_listener_thread_that_died_with_running_flag(monk
         "pynput",
         types.SimpleNamespace(keyboard=types.SimpleNamespace(Listener=FakeListener)),
     )
-    service = GlobalHotkeyService(lambda: None, lambda _message: None)
+    service = GlobalHotkeyService(lambda _context: None, lambda _message: None)
     service.start(AppSettings())
 
     assert not service.is_running
@@ -573,16 +574,23 @@ def test_windows_services_use_supervised_native_workers(monkeypatch, tmp_path: P
     FakeWorkerSupervisor.instances.clear()
     monkeypatch.setattr(system_module.sys, "platform", "win32")
     monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
-    hits: list[str] = []
-    hotkey = GlobalHotkeyService(lambda: hits.append("hit"), hits.append)
+    failures: list[str] = []
+    contexts: list[HotkeyActivationContext | None] = []
+    hotkey = GlobalHotkeyService(contexts.append, failures.append)
 
     hotkey.start(AppSettings(hotkey="double:shift", double_tap_interval_ms=360))
 
     hotkey_worker = FakeWorkerSupervisor.instances[-1]
     assert hotkey_worker.role == "hotkey"
     assert hotkey_worker.arguments() == ["--hotkey", "double:shift", "--interval-ms", "360"]
-    hotkey_worker.message.emit({"type": "hotkey"})
-    assert hits == ["hit"]
+    hotkey_worker.message.emit(
+        {
+            "type": "hotkey",
+            "target_hwnd": 404,
+            "foreground_granted": True,
+        }
+    )
+    assert contexts == [HotkeyActivationContext(target_window=404, foreground_granted=True)]
     assert hotkey.is_running
 
     monkeypatch.setattr(ClipboardController, "_sequence_number", lambda _self: 77)
@@ -642,6 +650,75 @@ def test_windows_panel_activation_uses_and_verifies_foreground_window(monkeypatc
     assert PlatformBridge.request_window_activation(202)
     assert PlatformBridge.foreground_window_id() == 202
     assert calls == [("show", 202), ("top", 202), ("foreground", 202)]
+
+
+def test_windows_panel_activation_attaches_to_foreground_input_on_denial(monkeypatch) -> None:
+    foreground = [101]
+    foreground_attempts = [False, True]
+    attach_allowed = [True]
+    calls: list[tuple[str, int, int | bool | None]] = []
+
+    def handle_value(value) -> int:
+        return int(value.value if hasattr(value, "value") else value)
+
+    def set_foreground(hwnd) -> int:
+        identifier = handle_value(hwnd)
+        accepted = foreground_attempts.pop(0)
+        calls.append(("foreground", identifier, accepted))
+        if accepted:
+            foreground[0] = identifier
+        return int(accepted)
+
+    def attach_thread(current: int, target: int, attach: bool) -> int:
+        calls.append(("attach", current, target if attach else -target))
+        return int(attach_allowed[0] if attach else True)
+
+    user32 = types.SimpleNamespace(
+        ShowWindow=lambda handle, command: calls.append(
+            ("show", handle_value(handle), command)
+        )
+        or 1,
+        BringWindowToTop=lambda handle: calls.append(
+            ("top", handle_value(handle), None)
+        )
+        or 1,
+        SetForegroundWindow=set_foreground,
+        GetForegroundWindow=lambda: foreground[0],
+        GetWindowThreadProcessId=lambda _handle, _pid: 11,
+        AttachThreadInput=attach_thread,
+    )
+    kernel32 = types.SimpleNamespace(GetCurrentThreadId=lambda: 22)
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        system_module.ctypes,
+        "windll",
+        types.SimpleNamespace(user32=user32, kernel32=kernel32),
+        raising=False,
+    )
+
+    assert PlatformBridge.request_window_activation(202)
+    assert calls == [
+        ("show", 202, 5),
+        ("top", 202, None),
+        ("foreground", 202, False),
+        ("attach", 22, 11),
+        ("top", 202, None),
+        ("foreground", 202, True),
+        ("attach", 22, -11),
+    ]
+
+    foreground[0] = 101
+    foreground_attempts.extend((False, False))
+    calls.clear()
+    assert not PlatformBridge.request_window_activation(202)
+    assert calls[-1] == ("attach", 22, -11)
+
+    foreground[0] = 101
+    foreground_attempts.append(False)
+    attach_allowed[0] = False
+    calls.clear()
+    assert not PlatformBridge.request_window_activation(202)
+    assert calls[-1] == ("attach", 22, 11)
 
 
 def test_windows_target_activation_preserves_non_minimized_window_state(monkeypatch) -> None:

@@ -16,10 +16,10 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Protocol, TextIO
+from typing import Any, Protocol, TextIO
 
 # Raw keyboard constants.
 RIM_TYPEKEYBOARD = 1
@@ -368,6 +368,7 @@ class RawInputHotkeyEngine:
         clock: Callable[[], float] = time.monotonic,
         process_id: int | None = None,
         session_id: str | None = None,
+        activation_context: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.emitter = emitter
         if session_id is not None:
@@ -375,6 +376,7 @@ class RawInputHotkeyEngine:
         self.hotkey = hotkey
         self._clock = clock
         self._process_id = os.getpid() if process_id is None else process_id
+        self._activation_context = activation_context
         modifier = hotkey.removeprefix("double:") if hotkey.startswith("double:") else "ctrl"
         self.detector = DoubleModifierDetector(modifier, interval_ms, self._activated, clock=clock)
 
@@ -402,10 +404,12 @@ class RawInputHotkeyEngine:
         self._activated(self._clock() if at is None else at)
 
     def _activated(self, at: float) -> None:
+        context = dict(self._activation_context()) if self._activation_context is not None else {}
         self.emitter.emit(
             "hotkey",
             hotkey=self.hotkey,
             monotonic_ms=self._milliseconds(at),
+            **context,
         )
 
 
@@ -521,6 +525,10 @@ class _WindowsApiProtocol(Protocol):
 
     def wait_for_process_exit(self, process_id: int) -> bool: ...
 
+    def foreground_window(self) -> int: ...
+
+    def allow_set_foreground_window(self, process_id: int) -> bool: ...
+
     def create_message_window(self, wndproc: Callable[[int, int, int, int], int]) -> int: ...
 
     def register_keyboard(self, hwnd: int, flags: int) -> None: ...
@@ -633,6 +641,10 @@ class _Win32Api:
         self.user32.UnregisterHotKey.restype = _BOOL
         self.user32.SetTimer.argtypes = (_HWND, _WPARAM, _UINT, ctypes.c_void_p)
         self.user32.SetTimer.restype = _WPARAM
+        self.user32.GetForegroundWindow.argtypes = ()
+        self.user32.GetForegroundWindow.restype = _HWND
+        self.user32.AllowSetForegroundWindow.argtypes = (_DWORD,)
+        self.user32.AllowSetForegroundWindow.restype = _BOOL
 
     @staticmethod
     def _as_hwnd(hwnd: int) -> _HWND:
@@ -661,6 +673,12 @@ class _Win32Api:
             return result == _WAIT_OBJECT_0
         finally:
             self.kernel32.CloseHandle(handle)
+
+    def foreground_window(self) -> int:
+        return int(self.user32.GetForegroundWindow() or 0)
+
+    def allow_set_foreground_window(self, process_id: int) -> bool:
+        return bool(self.user32.AllowSetForegroundWindow(_DWORD(process_id)))
 
     def create_message_window(self, wndproc: Callable[[int, int, int, int], int]) -> int:
         self._window_procedure = _WindowProcedure(wndproc)
@@ -891,6 +909,7 @@ class WindowsHotkeyHost:
         self._api = api or _Win32Api()
         self._control_input = control_input
         self._heartbeat_interval_ms = max(100, heartbeat_interval_ms)
+        self._parent_pid = parent_pid
         self._engine = RawInputHotkeyEngine(
             JsonLineEmitter(output, session_id),
             hotkey=hotkey,
@@ -898,10 +917,10 @@ class WindowsHotkeyHost:
             clock=clock,
             process_id=process_id,
             session_id=session_id,
+            activation_context=self._activation_context,
         )
         self._clock = clock
         self._hotkey = hotkey
-        self._parent_pid = parent_pid
         self._hard_exit = hard_exit
         self._registered_combo: RegisteredHotkey | None = None
         self._configuration_error = ""
@@ -1043,6 +1062,22 @@ class WindowsHotkeyHost:
                     return
         except (BrokenPipeError, OSError, ValueError):
             self._hard_exit(0)
+
+    def _activation_context(self) -> dict[str, object]:
+        try:
+            target_window = self._api.foreground_window()
+        except OSError:
+            target_window = 0
+        foreground_granted = False
+        if self._parent_pid is not None:
+            try:
+                foreground_granted = self._api.allow_set_foreground_window(self._parent_pid)
+            except OSError:
+                foreground_granted = False
+        return {
+            "target_hwnd": target_window or None,
+            "foreground_granted": foreground_granted,
+        }
 
     def _watch_parent_process(self) -> None:
         if self._parent_pid is None:

@@ -22,6 +22,7 @@ from clipsoon.system import (
     ClipboardController,
     ForegroundTargetHandle,
     GlobalHotkeyService,
+    HotkeyActivationContext,
     LaunchAtLoginManager,
     PlatformBridge,
     PynputPasteAdapter,
@@ -37,7 +38,7 @@ _HOTKEY_RESTART_BACKOFF_SECONDS = 15.0
 
 
 class _Signals(QObject):
-    hotkey = Signal()
+    hotkey = Signal(object)
     hotkey_failed = Signal(str)
 
 
@@ -152,26 +153,33 @@ class ClipSoonApplication(QObject):
         self.panel.accessibility_requested.connect(self.open_accessibility_settings)
         self.panel.position_changed.connect(self._save_panel_position)
         self.sender.finished.connect(self._send_finished)
-        self.tray_actions["show"].triggered.connect(self.show_panel)
+        self.tray_actions["show"].triggered.connect(lambda _checked=False: self.show_panel())
         self.tray_actions["pause"].toggled.connect(self._toggle_capture)
         self.tray_actions["settings"].triggered.connect(self.show_settings)
         self.tray_actions["quit"].triggered.connect(self.qt_app.quit)
         self.tray.activated.connect(self._tray_activated)
         self.qt_app.aboutToQuit.connect(self.shutdown)
 
-    def toggle_panel(self) -> None:
+    def toggle_panel(self, context: HotkeyActivationContext | None = None) -> None:
         if self.panel.isVisible():
             self.panel.hide_panel()
         else:
-            self.show_panel()
+            self.show_panel(context)
 
-    def show_panel(self) -> None:
+    def show_panel(self, context: HotkeyActivationContext | None = None) -> None:
         if (
             PlatformBridge.accessibility_permission_status() is True
             and self.panel.has_accessibility_warning()
         ):
             self.panel.clear_status()
-        self.target = PlatformBridge.capture_target()
+        captured_target = (
+            PlatformBridge.target_from_window_id(context.target_window)
+            if PlatformBridge.is_windows()
+            and isinstance(context, HotkeyActivationContext)
+            and context.target_window is not None
+            else None
+        )
+        self.target = captured_target or PlatformBridge.capture_target()
         initial_foreground = (
             self.target.identifier
             if self.target is not None and self.target.kind == "windows"
@@ -187,6 +195,8 @@ class ClipSoonApplication(QObject):
             )
             self._panel_watch_timer.start()
             QTimer.singleShot(0, lambda: self._activate_windows_panel(0))
+            if isinstance(context, HotkeyActivationContext) and not context.foreground_granted:
+                LOGGER.debug("Windows hotkey helper could not pre-authorize foreground activation")
         LOGGER.info("Panel visible in %.1f ms; target=%s", elapsed, self.target.name if self.target else "none")
         if elapsed > 100:
             LOGGER.warning("Hotkey-to-visible budget exceeded: %.1f ms", elapsed)
@@ -194,7 +204,11 @@ class ClipSoonApplication(QObject):
     def _activate_windows_panel(self, attempt: int) -> None:
         if not PlatformBridge.is_windows() or not self.panel.isVisible():
             return
-        if PlatformBridge.request_window_activation(int(self.panel.winId())):
+        panel_window = int(self.panel.winId())
+        if (
+            PlatformBridge.foreground_window_id() == panel_window
+            or PlatformBridge.request_window_activation(panel_window)
+        ):
             self._panel_guard.saw_panel_foreground = True
             self.panel.activateWindow()
             self.panel.search.setFocus()

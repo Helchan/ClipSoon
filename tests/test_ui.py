@@ -6,8 +6,15 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, QRect, QSize, Qt
-from PySide6.QtGui import QColor, QImage, QKeySequence, QPalette
-from PySide6.QtWidgets import QDialog, QFrame, QLabel, QMenu, QStyleOptionViewItem
+from PySide6.QtGui import QColor, QImage, QInputMethodEvent, QKeySequence, QPalette
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFrame,
+    QLabel,
+    QMenu,
+    QStyleOptionViewItem,
+)
 
 import clipsoon.ui as ui_module
 from clipsoon import __version__
@@ -48,6 +55,40 @@ def test_panel_search_keyboard_send_and_escape(qtbot) -> None:
     assert sent and sent[0].id == "old-exact"
     qtbot.keyPress(panel.search, Qt.Key.Key_Escape)
     assert not panel.isVisible()
+
+
+def test_panel_search_return_sends_when_input_method_ui_is_visible(qtbot, monkeypatch) -> None:
+    panel = ClipPanel(AppSettings)
+    panel.set_items([clip("item", "内容", 1)])
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    sent: list[ClipItem] = []
+    panel.send_requested.connect(sent.append)
+    monkeypatch.setattr(QApplication.inputMethod(), "isVisible", lambda: True)
+
+    qtbot.keyPress(panel.search, Qt.Key.Key_Return)
+    qtbot.keyPress(panel.search, Qt.Key.Key_Enter)
+
+    assert [item.id for item in sent] == ["item", "item"]
+
+
+def test_panel_search_return_waits_for_active_input_method_composition(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    panel.set_items([clip("item", "内容", 1)])
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    sent: list[ClipItem] = []
+    panel.send_requested.connect(sent.append)
+
+    QApplication.sendEvent(panel.search, QInputMethodEvent("pin", []))
+    qtbot.keyPress(panel.search, Qt.Key.Key_Return)
+    assert sent == []
+
+    QApplication.sendEvent(panel.search, QInputMethodEvent("", []))
+    qtbot.keyPress(panel.search, Qt.Key.Key_Return)
+    assert [item.id for item in sent] == ["item"]
 
 
 def test_status_is_empty_when_idle_and_transient_messages_clear(qtbot) -> None:
