@@ -20,7 +20,7 @@ PROTOCOL_VERSION = 1
 _HEALTH_CHECK_INTERVAL_MS = 250
 _STARTUP_TIMEOUT_SECONDS = 4.0
 _HEARTBEAT_TIMEOUT_SECONDS = 1.75
-_CLIPBOARD_NATIVE_CAPTURE_TIMEOUT_SECONDS = 10.0
+_CLIPBOARD_NATIVE_OPERATION_TIMEOUT_SECONDS = 10.0
 _CLIPBOARD_MATERIALIZATION_TIMEOUT_SECONDS = 120.0
 _STABLE_UPTIME_SECONDS = 10.0
 _MAX_PROTOCOL_BUFFER_BYTES = 1_048_576
@@ -137,7 +137,8 @@ class WindowsWorkerSupervisor(QObject):
         self._accept_events = False
         self._session_id = ""
         self._expected_process_id = 0
-        self._native_capture_started_at: float | None = None
+        self._native_operation_kind: str | None = None
+        self._native_operation_started_at: float | None = None
         self._materialization_started_at: float | None = None
         self._reported_error_codes: set[str] = set()
         self._stdout_buffer = bytearray()
@@ -172,6 +173,27 @@ class WindowsWorkerSupervisor(QObject):
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def native_operation_kind(self) -> str | None:
+        """Return the active bounded clipboard operation, if any."""
+
+        return self._native_operation_kind
+
+    @property
+    def is_native_capture_active(self) -> bool:
+        """Expose whether the clipboard helper is inside a native read."""
+
+        return self._native_operation_kind == "capture"
+
+    @property
+    def is_capture_pipeline_busy(self) -> bool:
+        """Return whether an external capture can still block control commands."""
+
+        return (
+            self._native_operation_kind == "capture"
+            or self._materialization_started_at is not None
+        )
 
     def start(self) -> None:
         self._desired = True
@@ -220,7 +242,7 @@ class WindowsWorkerSupervisor(QObject):
             return
         self._stdout_buffer.clear()
         self._expected_process_id = 0
-        self._native_capture_started_at = None
+        self._clear_native_operation()
         self._materialization_started_at = None
         self._session_id = uuid.uuid4().hex
         self._protocol.reset(self._session_id)
@@ -254,7 +276,7 @@ class WindowsWorkerSupervisor(QObject):
             return
         self._stop_handled = True
         self._set_reported_health(False)
-        self._native_capture_started_at = None
+        self._clear_native_operation()
         self._materialization_started_at = None
         self._expected_process_id = 0
         if not self._desired:
@@ -309,7 +331,15 @@ class WindowsWorkerSupervisor(QObject):
         allowed_types = {"ready", "heartbeat", "error"}
         allowed_types.add("hotkey" if self.role == "hotkey" else "clipboard")
         if self.role == "clipboard":
-            allowed_types.update({"capture_materializing", "capture_started"})
+            allowed_types.update(
+                {
+                    "capture_materializing",
+                    "capture_started",
+                    "verify_result",
+                    "write_result",
+                    "write_started",
+                }
+            )
         if kind not in allowed_types:
             LOGGER.warning("Ignoring unknown %s helper message type: %s", self.role, kind)
             return
@@ -317,19 +347,23 @@ class WindowsWorkerSupervisor(QObject):
             return
         self._watchdog.activity(now, ready=kind == "ready")
         if kind == "ready":
-            self._native_capture_started_at = None
+            self._clear_native_operation()
             self._materialization_started_at = None
             self._reported_error_codes.clear()
             self._set_reported_health(True)
         elif kind == "capture_started" and self.role == "clipboard":
-            self._native_capture_started_at = now
+            self._begin_native_operation("capture", now)
             self._materialization_started_at = None
         elif kind in {"capture_materializing", "clipboard"} and self.role == "clipboard":
-            self._native_capture_started_at = None
+            self._clear_native_operation("capture")
             self._materialization_started_at = now if kind == "capture_materializing" else None
+        elif kind == "write_started" and self.role == "clipboard":
+            self._begin_native_operation("write", now)
+        elif kind in {"write_result", "verify_result"} and self.role == "clipboard":
+            self._clear_native_operation("write")
         elif kind == "error":
             if self.role == "clipboard":
-                self._native_capture_started_at = None
+                self._clear_native_operation()
                 self._materialization_started_at = None
             text = str(message.get("message") or f"Windows {self.role} 宿主发生错误")
             if message.get("fatal"):
@@ -383,10 +417,15 @@ class WindowsWorkerSupervisor(QObject):
         self._restart_timer.start(max(0, int(delay_ms)))
 
     def _unhealthy_reason(self, *, running: bool, at: float) -> str | None:
-        if self.role == "clipboard" and self._native_capture_started_at is not None:
+        if self.role == "clipboard" and self._native_operation_started_at is not None:
             if not running:
                 return "进程已停止"
-            if at - self._native_capture_started_at > _CLIPBOARD_NATIVE_CAPTURE_TIMEOUT_SECONDS:
+            if (
+                at - self._native_operation_started_at
+                > _CLIPBOARD_NATIVE_OPERATION_TIMEOUT_SECONDS
+            ):
+                if self._native_operation_kind == "write":
+                    return "原生剪贴板写入超时"
                 return "原生剪贴板读取超时"
             return None
         if self.role == "clipboard" and self._materialization_started_at is not None:
@@ -395,6 +434,16 @@ class WindowsWorkerSupervisor(QObject):
             if at - self._materialization_started_at > _CLIPBOARD_MATERIALIZATION_TIMEOUT_SECONDS:
                 return "剪贴板内容转换落盘超时"
         return self._watchdog.unhealthy_reason(running=running, at=at)
+
+    def _begin_native_operation(self, kind: str, at: float) -> None:
+        self._native_operation_kind = kind
+        self._native_operation_started_at = at
+
+    def _clear_native_operation(self, expected_kind: str | None = None) -> None:
+        if expected_kind is not None and self._native_operation_kind != expected_kind:
+            return
+        self._native_operation_kind = None
+        self._native_operation_started_at = None
 
     def _send_shutdown(self) -> None:
         if self.send({"type": "shutdown", "parent_pid": os.getpid()}):

@@ -14,6 +14,7 @@ from clipsoon.core import (
     AppSettings,
     ClipItem,
     ClipKind,
+    FileItemClaimStatus,
     HistoryRepository,
     JsonSettingsStore,
     ObservableSettings,
@@ -583,6 +584,33 @@ def test_validate_file_item_retries_after_concurrent_refresh(
     assert validated[0] is not None
     assert validated[0].item == refreshed
     assert repo.get(item.id) == refreshed
+    repo.close()
+
+
+def test_claim_validated_file_item_is_revision_cas_without_consumer(
+    tmp_path: Path,
+) -> None:
+    repo = HistoryRepository(tmp_path)
+    file_path = tmp_path / "claimed.txt"
+    file_path.write_text("payload", encoding="utf-8")
+    item = repo.add_files((str(file_path),), "first")
+    validated = repo.validate_file_item(item.id)
+    assert validated is not None
+
+    accepted = repo.claim_validated_file_item(validated)
+    assert accepted.status is FileItemClaimStatus.ACCEPTED
+    assert accepted.item == item
+
+    refreshed = repo.add_files((str(file_path),), "second")
+    stale = repo.claim_validated_file_item(validated)
+    assert stale.status is FileItemClaimStatus.REFRESHED
+    assert stale.item == refreshed
+
+    assert repo.delete(item.id)
+    missing = repo.claim_validated_file_item(
+        ValidatedFileItem(refreshed, validated.revision + 1)
+    )
+    assert missing.status is FileItemClaimStatus.MISSING
     repo.close()
 
 

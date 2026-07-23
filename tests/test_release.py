@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def test_release_version_is_consistent() -> None:
     project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert __version__ == "0.10.1"
+    assert __version__ == "0.10.2"
     assert project["project"]["version"] == __version__
 
 
@@ -36,3 +36,23 @@ def test_windows_helper_smoke_uses_only_registered_combo_hotkeys() -> None:
 
     assert "combo:ctrl+shift+space" in smoke
     assert "double:" not in smoke
+
+
+def test_windows_helper_smoke_exercises_eager_native_clipboard_formats() -> None:
+    smoke = (PROJECT_ROOT / "scripts/smoke_windows_helpers.py").read_text(encoding="utf-8")
+
+    assert '"text"' in smoke
+    assert '"files"' in smoke
+    assert '"image"' in smoke
+    assert '"verify_clipboard"' in smoke
+    assert '"verify_result"' in smoke
+    assert "CF_UNICODETEXT" in smoke
+    assert "CF_HDROP" in smoke
+    assert "CF_DIBV5" in smoke
+    assert "api.global_bytes(CF_DIB)" in smoke
+    assert 'register_format("PNG")' in smoke
+    assert "_shutdown(process, \"clipboard\")" in smoke
+    assert "did not survive clipboard helper exit" in smoke
+    shutdown = smoke.index('_shutdown(process, "clipboard")')
+    independent_png_lookup = smoke.index('api.register_format("PNG")')
+    assert shutdown < independent_png_lookup

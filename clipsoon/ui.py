@@ -690,10 +690,7 @@ class SettingsDialog(QDialog):
         header.setSpacing(2)
         title = QLabel("偏好设置")
         title.setObjectName("dialogTitle")
-        subtitle = QLabel("配置快捷键、历史记录与粘贴行为")
-        subtitle.setObjectName("settingsSubtitle")
         header.addWidget(title)
-        header.addWidget(subtitle)
         layout.addLayout(header)
 
         def section(title_text: str) -> tuple[QFrame, QVBoxLayout]:
@@ -730,32 +727,35 @@ class SettingsDialog(QDialog):
         shortcut_form = form_grid()
         shortcut_layout.addLayout(shortcut_form)
 
-        self._available_hotkeys = (
-            {"自定义组合键": "custom"} if sys.platform == "win32" else self._HOTKEYS
-        )
-        self.hotkey_mode = QComboBox()
-        self.hotkey_mode.addItems(self._available_hotkeys)
-        current = next(
-            (
-                label
-                for label, value in self._available_hotkeys.items()
-                if value == settings.hotkey
-            ),
-            "自定义组合键",
-        )
-        self.hotkey_mode.setCurrentText(current)
-        add_row(shortcut_form, 0, "呼出方式", self.hotkey_mode)
         self.custom_hotkey = QKeySequenceEdit()
         self.custom_hotkey.setMaximumSequenceLength(1)
         self.custom_hotkey.setClearButtonEnabled(True)
         default_custom = WINDOWS_DEFAULT_HOTKEY
         hotkey_text = _hotkey_display(settings.hotkey if settings.hotkey.startswith("combo:") else default_custom)
         self.custom_hotkey.setKeySequence(QKeySequence(hotkey_text))
-        self.custom_hotkey.setEnabled(current == "自定义组合键")
-        self.hotkey_mode.currentTextChanged.connect(
-            lambda value: self.custom_hotkey.setEnabled(value == "自定义组合键")
-        )
-        add_row(shortcut_form, 1, "自定义组合键", self.custom_hotkey)
+        self.hotkey_mode: QComboBox | None = None
+        if sys.platform == "win32":
+            self._available_hotkeys = {"快捷键": "custom"}
+            add_row(shortcut_form, 0, "快捷键", self.custom_hotkey)
+        else:
+            self._available_hotkeys = self._HOTKEYS
+            self.hotkey_mode = QComboBox()
+            self.hotkey_mode.addItems(self._available_hotkeys)
+            current = next(
+                (
+                    label
+                    for label, value in self._available_hotkeys.items()
+                    if value == settings.hotkey
+                ),
+                "自定义组合键",
+            )
+            self.hotkey_mode.setCurrentText(current)
+            add_row(shortcut_form, 0, "呼出方式", self.hotkey_mode)
+            self.custom_hotkey.setEnabled(current == "自定义组合键")
+            self.hotkey_mode.currentTextChanged.connect(
+                lambda value: self.custom_hotkey.setEnabled(value == "自定义组合键")
+            )
+            add_row(shortcut_form, 1, "自定义组合键", self.custom_hotkey)
 
         self.interval = _spin(settings.double_tap_interval_ms, 180, 900, " ms")
         self.interval.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
@@ -788,6 +788,8 @@ class SettingsDialog(QDialog):
         # not reliably inherit the dialog stylesheet, so an explicitly dark
         # dialog could otherwise show white text on the system's light popup.
         for combo in (self.hotkey_mode, self.theme):
+            if combo is None:
+                continue
             _style_combo_popup(combo, dark)
 
         self.selection_memory = _spin(settings.selection_memory_seconds, 1, 300, " 秒")
@@ -878,10 +880,16 @@ class SettingsDialog(QDialog):
         layout.addLayout(footer)
 
     def values(self) -> dict[str, object]:
-        selected = self._available_hotkeys[self.hotkey_mode.currentText()]
-        if selected == "custom":
+        if self.hotkey_mode is None:
             recorded = self.custom_hotkey.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
             selected = _parse_hotkey(recorded)
+        else:
+            selected = self._available_hotkeys[self.hotkey_mode.currentText()]
+            if selected == "custom":
+                recorded = self.custom_hotkey.keySequence().toString(
+                    QKeySequence.SequenceFormat.PortableText
+                )
+                selected = _parse_hotkey(recorded)
         return {
             "hotkey": selected,
             "double_tap_interval_ms": self.interval.value(),
@@ -899,7 +907,10 @@ class SettingsDialog(QDialog):
 
     def _validate_accept(self) -> None:
         recorded = self.custom_hotkey.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
-        custom = self._available_hotkeys[self.hotkey_mode.currentText()] == "custom"
+        custom = (
+            self.hotkey_mode is None
+            or self._available_hotkeys[self.hotkey_mode.currentText()] == "custom"
+        )
         parsed = _parse_hotkey(recorded) if custom else ""
         if custom and not parsed:
             QMessageBox.warning(self, "快捷键无效", "组合键必须包含 Ctrl/Shift/Alt/Command 和一个普通键。")

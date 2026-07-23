@@ -12,6 +12,7 @@ import argparse
 import ctypes
 import json
 import os
+import queue
 import struct
 import sys
 import tempfile
@@ -49,10 +50,16 @@ WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_TIMER = 0x0113
 WM_CLIPBOARDUPDATE = 0x031D
+WM_APP = 0x8000
+WM_CLIPSOON_CONTROL = WM_APP + 1
 HWND_MESSAGE = -3
 HEARTBEAT_TIMER_ID = 1
 RETRY_TIMER_ID = 2
 
+GMEM_MOVEABLE = 0x0002
+GMEM_ZEROINIT = 0x0040
+GHND = GMEM_MOVEABLE | GMEM_ZEROINIT
+DROPEFFECT_COPY = 0x00000001
 _MAX_IMAGE_BYTES = 256 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 _MAX_FILE_COUNT = 10_000
@@ -62,6 +69,7 @@ _INITIAL_RETRY_INTERVAL_MS = 80
 _MAX_RETRY_INTERVAL_MS = 1_000
 _HEARTBEAT_INTERVAL_MS = 500
 _MAX_MATERIALIZATION_SECONDS = 120.0
+_WRITE_OPEN_RETRY_DELAYS_SECONDS = (0.0, 0.005, 0.015, 0.03)
 STD_INPUT_HANDLE = -10
 STD_OUTPUT_HANDLE = -11
 ERROR_BROKEN_PIPE = 109
@@ -116,11 +124,23 @@ class NativeClipboardApi(Protocol):
 
     def close_clipboard(self) -> bool: ...
 
+    def empty_clipboard(self) -> bool: ...
+
+    def allocate_global_bytes(self, data: bytes) -> int: ...
+
+    def clipboard_owner(self) -> int: ...
+
+    def set_clipboard_handle(self, format_id: int, handle: int) -> bool: ...
+
+    def free_global(self, handle: int) -> None: ...
+
     def enum_formats(self) -> list[int]: ...
 
     def format_name(self, format_id: int) -> str: ...
 
     def register_format(self, name: str) -> int: ...
+
+    def is_format_available(self, format_id: int) -> bool: ...
 
     def global_bytes(self, format_id: int) -> bytes: ...
 
@@ -339,6 +359,13 @@ class WindowsClipboardReader:
         self.capture_started = capture_started
         self.capture_materializing = capture_materializing
         self.png_format = api.register_format("PNG")
+        self.internal_write_format = api.register_format("ClipSoon.InternalWrite")
+
+    def is_internal_write(self) -> bool:
+        return bool(
+            self.internal_write_format
+            and self.api.is_format_available(self.internal_write_format)
+        )
 
     def read(self, sequence: int) -> ClipboardSnapshot:
         if not self.api.open_clipboard(self.owner):
@@ -531,6 +558,15 @@ class ClipboardHost:
             }
         )
 
+    def ignore_sequence(self, sequence: int) -> None:
+        """Advance past a clipboard value written by this helper."""
+
+        self.last_sequence = sequence
+        self.pending_sequence = None
+        self.pending_source = ""
+        self._retry_attempt = 0
+        self.schedule_capture(None)
+
     def _attempt_pending(self) -> None:
         attempted_sequence = self.pending_sequence
         try:
@@ -550,7 +586,11 @@ class ClipboardHost:
             self.schedule_capture(_SETTLE_INTERVAL_MS)
             return
         try:
-            snapshot = self.reader.read(sequence)
+            snapshot = (
+                ClipboardSnapshot(sequence, "ignored", {"reason": "internal-write"})
+                if self.reader.is_internal_write()
+                else self.reader.read(sequence)
+            )
         except ClipboardBusyError as exc:
             delay = min(
                 _MAX_RETRY_INTERVAL_MS,
@@ -622,6 +662,482 @@ class ClipboardHost:
             self.pending_source = ""
 
 
+@dataclass(frozen=True, slots=True)
+class _ClipboardWrite:
+    request_id: str
+    kind: str
+    formats: tuple[tuple[int, bytes], ...]
+
+
+class WindowsClipboardBroker:
+    """Eager Win32 clipboard writer executed exclusively by the message thread."""
+
+    def __init__(
+        self,
+        api: NativeClipboardApi,
+        owner: int,
+        payload_store: ImagePayloadStore,
+        emit: Callable[[Mapping[str, Any]], None],
+        *,
+        ignore_sequence: Callable[[int], None] = lambda _sequence: None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.api = api
+        self.owner = owner
+        self.payload_store = payload_store
+        self.emit = emit
+        self.ignore_sequence = ignore_sequence
+        self.sleep = sleep
+        self.png_format = api.register_format("PNG")
+        self.preferred_drop_effect_format = api.register_format("Preferred DropEffect")
+        self.internal_write_format = api.register_format("ClipSoon.InternalWrite")
+        if not self.png_format or not self.preferred_drop_effect_format or not self.internal_write_format:
+            raise ClipboardHostError("RegisterClipboardFormatW failed for broker formats")
+
+    def handle(self, command: Mapping[str, Any]) -> None:
+        command_type = command.get("type")
+        try:
+            if command_type == "write_clipboard":
+                self._write(command)
+                return
+            if command_type == "verify_clipboard":
+                self._verify(command)
+                return
+            self.emit(
+                {
+                    "type": "error",
+                    "stage": "control",
+                    "message": str(command.get("message", "unsupported control command")),
+                    "fatal": False,
+                }
+            )
+        except Exception as exc:
+            event_type = (
+                "verify_result" if command_type == "verify_clipboard" else "write_result"
+            )
+            self._emit_result(
+                event_type,
+                str(command.get("request_id", "")),
+                str(command.get("kind", "")),
+                False,
+                self.api.sequence_number(),
+                "internal_error",
+                str(exc),
+            )
+
+    def _write(self, command: Mapping[str, Any]) -> None:
+        request_id = self._request_id(command)
+        kind = self._kind(command)
+        if request_id is None or kind is None:
+            self._emit_result(
+                "write_result",
+                request_id or "",
+                kind or "",
+                False,
+                self.api.sequence_number(),
+                "invalid_request",
+                "request_id must be 32 hexadecimal characters and kind must be valid",
+            )
+            return
+        self.emit(
+            {
+                "type": "write_started",
+                "request_id": request_id,
+                "kind": kind,
+                "time_ns": time.time_ns(),
+            }
+        )
+        try:
+            value = self._load_write(command, request_id, kind)
+        except Exception as exc:
+            self._emit_result(
+                "write_result",
+                request_id,
+                kind,
+                False,
+                self.api.sequence_number(),
+                "manifest_error",
+                str(exc),
+            )
+            return
+
+        current_sequence = self.api.sequence_number()
+        if current_sequence and self._matches_current(value, current_sequence, require_owner=True):
+            self.ignore_sequence(current_sequence)
+            self._emit_result("write_result", request_id, kind, True, current_sequence)
+            return
+
+        before_sequence = current_sequence
+        handles: list[int] = []
+        try:
+            for _format_id, data in value.formats:
+                handles.append(self.api.allocate_global_bytes(data))
+        except Exception as exc:
+            for handle in handles:
+                with suppress(Exception):
+                    self.api.free_global(handle)
+            self._emit_result(
+                "write_result",
+                request_id,
+                kind,
+                False,
+                self.api.sequence_number(),
+                "clipboard_write_failed",
+                str(exc),
+            )
+            return
+        if not self._open_with_retry():
+            for handle in handles:
+                with suppress(Exception):
+                    self.api.free_global(handle)
+            self._emit_result(
+                "write_result",
+                request_id,
+                kind,
+                False,
+                self.api.sequence_number(),
+                "clipboard_busy",
+                "OpenClipboard failed after bounded retries",
+            )
+            return
+
+        wrote_all = False
+        write_error = ""
+        try:
+            if not self.api.empty_clipboard():
+                write_error = "EmptyClipboard failed"
+            else:
+                wrote_all = True
+                for index, ((format_id, _data), handle) in enumerate(
+                    zip(value.formats, handles, strict=True)
+                ):
+                    if self.api.set_clipboard_handle(format_id, handle):
+                        handles[index] = 0
+                        continue
+                    wrote_all = False
+                    write_error = f"SetClipboardData({format_id}) failed"
+                    # Remove every handle already transferred to Windows so a
+                    # failed transaction can never escape as a partial value.
+                    self.api.empty_clipboard()
+                    break
+        except Exception as exc:
+            wrote_all = False
+            write_error = str(exc)
+            with suppress(Exception):
+                self.api.empty_clipboard()
+        finally:
+            for handle in handles:
+                if handle:
+                    with suppress(Exception):
+                        self.api.free_global(handle)
+        closed = self.api.close_clipboard()
+        if not closed:
+            # Best-effort release keeps the broker usable, but the transaction
+            # remains failed because the first CloseClipboard did not succeed.
+            with suppress(Exception):
+                self.api.close_clipboard()
+            self._emit_result(
+                "write_result",
+                request_id,
+                kind,
+                False,
+                self.api.sequence_number(),
+                "close_failed",
+                "CloseClipboard failed",
+            )
+            return
+        if not wrote_all:
+            self._emit_result(
+                "write_result",
+                request_id,
+                kind,
+                False,
+                self.api.sequence_number(),
+                "clipboard_write_failed",
+                write_error or "clipboard transaction failed",
+            )
+            return
+
+        sequence = self.api.sequence_number()
+        complete = (
+            bool(sequence)
+            and sequence != before_sequence
+            and self._matches_current(value, sequence, require_owner=True)
+        )
+        if not complete:
+            self._emit_result(
+                "write_result",
+                request_id,
+                kind,
+                False,
+                sequence,
+                "verification_failed",
+                "clipboard sequence, owner, or formats did not verify",
+            )
+            return
+        self.ignore_sequence(sequence)
+        self._emit_result("write_result", request_id, kind, True, sequence)
+
+    def _verify(self, command: Mapping[str, Any]) -> None:
+        request_id = self._request_id(command)
+        kind = self._kind(command)
+        sequence = command.get("sequence")
+        if (
+            request_id is None
+            or kind is None
+            or isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence <= 0
+        ):
+            self._emit_result(
+                "verify_result",
+                request_id or "",
+                kind or "",
+                False,
+                self.api.sequence_number(),
+                "invalid_request",
+                "verify_clipboard requires a valid request_id, kind, and positive sequence",
+            )
+            return
+        value = self._verification_shape(request_id, kind)
+        if self._matches_current(value, sequence, require_owner=True):
+            self.ignore_sequence(sequence)
+            self._emit_result("verify_result", request_id, kind, True, sequence)
+            return
+        self._emit_result(
+            "verify_result",
+            request_id,
+            kind,
+            False,
+            self.api.sequence_number(),
+            "verification_failed",
+            "clipboard sequence, marker, owner, or formats did not verify",
+        )
+
+    def _load_write(
+        self,
+        command: Mapping[str, Any],
+        request_id: str,
+        kind: str,
+    ) -> _ClipboardWrite:
+        manifest_name = command.get("manifest")
+        manifest_bytes = command.get("manifest_bytes")
+        manifest_data = self._read_ipc_file(
+            manifest_name,
+            manifest_bytes,
+            maximum=_MAX_MANIFEST_BYTES,
+            label="manifest",
+        )
+        try:
+            manifest = json.loads(manifest_data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ClipboardDataError("write manifest is not valid UTF-8 JSON") from exc
+        if not isinstance(manifest, dict):
+            raise ClipboardDataError("write manifest must be an object")
+        expected = {
+            "protocol": PROTOCOL_VERSION,
+            "session_id": self.payload_store.session_id,
+            "request_id": request_id,
+            "kind": kind,
+        }
+        if any(manifest.get(key) != value for key, value in expected.items()):
+            raise ClipboardDataError("write manifest protocol, session, request, or kind mismatch")
+
+        # GlobalSize may be larger than the requested allocation.  The
+        # terminator gives our private format an explicit logical length while
+        # GHND keeps any allocator padding deterministic and non-sensitive.
+        marker = request_id.encode("ascii") + b"\0"
+        if kind == "text":
+            text = manifest.get("text")
+            if not isinstance(text, str) or "\0" in text:
+                raise ClipboardDataError("text manifest value must be a NUL-free string")
+            text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+            formats = (
+                (CF_UNICODETEXT, text.encode("utf-16-le") + b"\0\0"),
+                (self.internal_write_format, marker),
+            )
+        elif kind == "files":
+            files = manifest.get("files")
+            if (
+                not isinstance(files, list)
+                or not files
+                or len(files) > _MAX_FILE_COUNT
+                or any(
+                    not isinstance(path, str)
+                    or not path
+                    or "\0" in path
+                    or len(path) > _MAX_FILE_PATH_CHARS
+                    for path in files
+                )
+            ):
+                raise ClipboardDataError("files manifest contains invalid paths")
+            if any(
+                not os.path.isabs(path)
+                or not Path(path).exists()
+                or not (Path(path).is_file() or Path(path).is_dir())
+                for path in files
+            ):
+                raise ClipboardDataError(
+                    "files manifest paths must be absolute existing files or directories"
+                )
+            dropfiles = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+            dropfiles += ("\0".join(files) + "\0\0").encode("utf-16-le")
+            formats = (
+                (CF_HDROP, dropfiles),
+                (self.preferred_drop_effect_format, struct.pack("<I", DROPEFFECT_COPY)),
+                (self.internal_write_format, marker),
+            )
+        else:
+            png = self._read_ipc_file(
+                manifest.get("png_file"),
+                manifest.get("png_bytes"),
+                maximum=_MAX_IMAGE_BYTES,
+                label="PNG payload",
+            )
+            dibv5 = self._read_ipc_file(
+                manifest.get("dibv5_file"),
+                manifest.get("dibv5_bytes"),
+                maximum=_MAX_IMAGE_BYTES,
+                label="DIBV5 payload",
+            )
+            _png_dimensions(png)
+            if len(dibv5) < 124 or struct.unpack_from("<I", dibv5)[0] < 124:
+                raise ClipboardDataError("DIBV5 payload has an invalid header")
+            formats = (
+                (self.png_format, png),
+                (CF_DIBV5, dibv5),
+                (self.internal_write_format, marker),
+            )
+        return _ClipboardWrite(request_id, kind, formats)
+
+    def _verification_shape(self, request_id: str, kind: str) -> _ClipboardWrite:
+        marker = request_id.encode("ascii") + b"\0"
+        if kind == "text":
+            formats = ((CF_UNICODETEXT, b""), (self.internal_write_format, marker))
+        elif kind == "files":
+            formats = (
+                (CF_HDROP, b""),
+                (self.preferred_drop_effect_format, b""),
+                (self.internal_write_format, marker),
+            )
+        else:
+            formats = (
+                (self.png_format, b""),
+                (CF_DIBV5, b""),
+                (self.internal_write_format, marker),
+            )
+        return _ClipboardWrite(request_id, kind, formats)
+
+    def _matches_current(
+        self,
+        value: _ClipboardWrite,
+        sequence: int,
+        *,
+        require_owner: bool,
+    ) -> bool:
+        if (
+            self.api.sequence_number() != sequence
+            or (require_owner and self.api.clipboard_owner() != self.owner)
+            or not self._formats_available(value)
+            or not self._open_with_retry()
+        ):
+            return False
+        matches = False
+        try:
+            matches = (
+                self.api.sequence_number() == sequence
+                and self.api.global_bytes(self.internal_write_format)[
+                    : len(value.request_id) + 1
+                ]
+                == value.request_id.encode("ascii") + b"\0"
+            )
+        except Exception:
+            matches = False
+        closed = self.api.close_clipboard()
+        return bool(closed and matches and self.api.sequence_number() == sequence)
+
+    def _formats_available(self, value: _ClipboardWrite) -> bool:
+        required = [format_id for format_id, _data in value.formats]
+        if value.kind == "image":
+            required.append(CF_DIB)
+        return all(self.api.is_format_available(format_id) for format_id in required)
+
+    def _open_with_retry(self) -> bool:
+        for delay in _WRITE_OPEN_RETRY_DELAYS_SECONDS:
+            if delay:
+                self.sleep(delay)
+            if self.api.open_clipboard(self.owner):
+                return True
+        return False
+
+    def _read_ipc_file(
+        self,
+        name: Any,
+        expected_bytes: Any,
+        *,
+        maximum: int,
+        label: str,
+    ) -> bytes:
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or isinstance(expected_bytes, bool)
+            or not isinstance(expected_bytes, int)
+            or expected_bytes <= 0
+            or expected_bytes > maximum
+        ):
+            raise ClipboardDataError(f"{label} reference is invalid")
+        root = self.payload_store.root
+        unresolved = root / name
+        if unresolved.is_symlink():
+            raise ClipboardDataError(f"{label} must not be a symbolic link")
+        path = unresolved.resolve()
+        if path.parent != root or not path.is_file():
+            raise ClipboardDataError(f"{label} is outside the helper IPC directory")
+        data = path.read_bytes()
+        if len(data) != expected_bytes:
+            raise ClipboardDataError(f"{label} byte count mismatch")
+        return data
+
+    @staticmethod
+    def _request_id(command: Mapping[str, Any]) -> str | None:
+        value = command.get("request_id")
+        if not isinstance(value, str) or len(value) != 32:
+            return None
+        folded = value.casefold()
+        if any(character not in "0123456789abcdef" for character in folded):
+            return None
+        return value
+
+    @staticmethod
+    def _kind(command: Mapping[str, Any]) -> str | None:
+        value = command.get("kind")
+        return value if value in {"text", "image", "files"} else None
+
+    def _emit_result(
+        self,
+        event_type: str,
+        request_id: str,
+        kind: str,
+        ok: bool,
+        sequence: int,
+        code: str = "",
+        error: str = "",
+    ) -> None:
+        self.emit(
+            {
+                "type": event_type,
+                "request_id": request_id,
+                "kind": kind,
+                "ok": ok,
+                "sequence": sequence,
+                "code": code,
+                "error": error,
+            }
+        )
+
+
 _LRESULT = ctypes.c_ssize_t
 _WNDPROC_TYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
     _LRESULT,
@@ -688,12 +1204,20 @@ class CtypesWindowsApi:
         self.user32.OpenClipboard.restype = wintypes.BOOL
         self.user32.CloseClipboard.argtypes = ()
         self.user32.CloseClipboard.restype = wintypes.BOOL
+        self.user32.EmptyClipboard.argtypes = ()
+        self.user32.EmptyClipboard.restype = wintypes.BOOL
+        self.user32.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
+        self.user32.SetClipboardData.restype = wintypes.HANDLE
+        self.user32.GetClipboardOwner.argtypes = ()
+        self.user32.GetClipboardOwner.restype = wintypes.HWND
         self.user32.EnumClipboardFormats.argtypes = (wintypes.UINT,)
         self.user32.EnumClipboardFormats.restype = wintypes.UINT
         self.user32.GetClipboardFormatNameW.argtypes = (wintypes.UINT, wintypes.LPWSTR, ctypes.c_int)
         self.user32.GetClipboardFormatNameW.restype = ctypes.c_int
         self.user32.RegisterClipboardFormatW.argtypes = (wintypes.LPCWSTR,)
         self.user32.RegisterClipboardFormatW.restype = wintypes.UINT
+        self.user32.IsClipboardFormatAvailable.argtypes = (wintypes.UINT,)
+        self.user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
         self.user32.GetClipboardData.argtypes = (wintypes.UINT,)
         self.user32.GetClipboardData.restype = wintypes.HANDLE
         self.user32.AddClipboardFormatListener.argtypes = (wintypes.HWND,)
@@ -730,6 +1254,10 @@ class CtypesWindowsApi:
         self.user32.DispatchMessageW.restype = _LRESULT
         self.kernel32.GlobalSize.argtypes = (wintypes.HGLOBAL,)
         self.kernel32.GlobalSize.restype = ctypes.c_size_t
+        self.kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+        self.kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        self.kernel32.GlobalFree.argtypes = (wintypes.HGLOBAL,)
+        self.kernel32.GlobalFree.restype = wintypes.HGLOBAL
         self.kernel32.GlobalLock.argtypes = (wintypes.HGLOBAL,)
         self.kernel32.GlobalLock.restype = wintypes.LPVOID
         self.kernel32.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
@@ -804,6 +1332,38 @@ class CtypesWindowsApi:
     def close_clipboard(self) -> bool:
         return bool(self.user32.CloseClipboard())
 
+    def empty_clipboard(self) -> bool:
+        return bool(self.user32.EmptyClipboard())
+
+    def allocate_global_bytes(self, data: bytes) -> int:
+        if not data:
+            raise ClipboardDataError("clipboard format payload is empty")
+        handle = self.kernel32.GlobalAlloc(GHND, len(data))
+        if not handle:
+            raise ClipboardDataError("GlobalAlloc failed")
+        try:
+            pointer = self.kernel32.GlobalLock(handle)
+            if not pointer:
+                raise ClipboardDataError("GlobalLock failed")
+            try:
+                ctypes.memmove(pointer, data, len(data))
+            finally:
+                self.kernel32.GlobalUnlock(handle)
+            return int(handle)
+        except BaseException:
+            self.kernel32.GlobalFree(handle)
+            raise
+
+    def clipboard_owner(self) -> int:
+        return int(self.user32.GetClipboardOwner() or 0)
+
+    def set_clipboard_handle(self, format_id: int, handle: int) -> bool:
+        return bool(self.user32.SetClipboardData(format_id, wintypes.HANDLE(handle)))
+
+    def free_global(self, handle: int) -> None:
+        if self.kernel32.GlobalFree(wintypes.HGLOBAL(handle)):
+            raise ClipboardDataError("GlobalFree failed")
+
     def enum_formats(self) -> list[int]:
         formats: list[int] = []
         format_id = 0
@@ -823,6 +1383,9 @@ class CtypesWindowsApi:
 
     def register_format(self, name: str) -> int:
         return int(self.user32.RegisterClipboardFormatW(name))
+
+    def is_format_available(self, format_id: int) -> bool:
+        return bool(self.user32.IsClipboardFormatAvailable(format_id))
 
     def global_bytes(self, format_id: int) -> bytes:
         handle = self.user32.GetClipboardData(format_id)
@@ -926,6 +1489,8 @@ class WindowsMessageLoop:
         self.capture_phase = CapturePhaseTracker()
         self.hwnd = 0
         self.host: ClipboardHost | None = None
+        self.broker: WindowsClipboardBroker | None = None
+        self._control_queue: queue.SimpleQueue[Mapping[str, Any]] = queue.SimpleQueue()
         self._wndproc = _WNDPROC_TYPE(self._window_proc)
         self._listener_added = False
         self._heartbeat_stop = threading.Event()
@@ -950,6 +1515,13 @@ class WindowsMessageLoop:
                 schedule_capture=self._schedule_capture,
                 after_sequence=self.after_sequence,
                 capture_finished=self.capture_phase.finished,
+            )
+            self.broker = WindowsClipboardBroker(
+                self.api,
+                self.hwnd,
+                self.payload_store,
+                self.emitter.emit,
+                ignore_sequence=self.host.ignore_sequence,
             )
             self._start_heartbeat()
             threading.Thread(
@@ -1086,14 +1658,30 @@ class WindowsMessageLoop:
                 value = line.strip()
                 if not value:
                     continue
-                shutdown = value.casefold() == "shutdown"
-                if not shutdown:
-                    try:
-                        shutdown = json.loads(value).get("type") == "shutdown"
-                    except (AttributeError, json.JSONDecodeError):
-                        shutdown = False
-                if shutdown:
+                if value.casefold() == "shutdown":
                     self.api.user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+                    return
+                try:
+                    parsed = json.loads(value)
+                    command: Mapping[str, Any] = (
+                        parsed
+                        if isinstance(parsed, dict)
+                        else {
+                            "type": "_protocol_error",
+                            "message": "control command must be a JSON object",
+                        }
+                    )
+                except json.JSONDecodeError:
+                    command = {
+                        "type": "_protocol_error",
+                        "message": "control command is not valid JSON",
+                    }
+                if command.get("type") == "shutdown":
+                    self.api.user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+                    return
+                self._control_queue.put(command)
+                if not self.api.user32.PostMessageW(self.hwnd, WM_CLIPSOON_CONTROL, 0, 0):
+                    self.hard_exit(1)
                     return
         except BaseException:
             pass
@@ -1110,6 +1698,14 @@ class WindowsMessageLoop:
 
     def _window_proc(self, hwnd: int, message: int, wparam: int, lparam: int) -> int:
         try:
+            if message == WM_CLIPSOON_CONTROL and self.broker is not None:
+                while True:
+                    try:
+                        command = self._control_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    self.broker.handle(command)
+                return 0
             if message == WM_CLIPBOARDUPDATE and self.host is not None:
                 self.host.clipboard_changed()
                 return 0

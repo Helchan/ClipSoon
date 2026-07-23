@@ -12,14 +12,18 @@ import pytest
 
 from clipsoon.windows_clipboard_host import (
     CF_DIB,
+    CF_DIBV5,
     CF_HDROP,
     CF_UNICODETEXT,
+    GHND,
     CapturePhaseTracker,
     ClipboardBusyError,
     ClipboardDataError,
     ClipboardHost,
+    CtypesWindowsApi,
     ImagePayloadStore,
     JsonLineEmitter,
+    WindowsClipboardBroker,
     WindowsClipboardReader,
     WindowsMessageLoop,
     WindowsPipeReader,
@@ -33,6 +37,8 @@ class FakeClipboardApi:
     def __init__(self, sequence: int = 1) -> None:
         self.sequence = sequence
         self.png_format = 49_001
+        self.internal_write_format = 49_002
+        self.preferred_drop_effect_format = 49_003
         self.formats: list[int] = []
         self.names: dict[int, str] = {}
         self.payloads: dict[int, bytes] = {}
@@ -44,6 +50,14 @@ class FakeClipboardApi:
         self.close_calls = 0
         self.calls: list[str] = []
         self.source_app = "Editor"
+        self.owner = 0
+        self.open_owner = 0
+        self.empty_calls = 0
+        self.set_calls: list[tuple[int, bytes]] = []
+        self.fail_set_format = 0
+        self.global_handles: dict[int, bytes] = {}
+        self.freed_handles: list[int] = []
+        self.next_handle = 1
 
     def sequence_number(self) -> int:
         return self.sequence
@@ -52,19 +66,57 @@ class FakeClipboardApi:
         self.calls.append("source")
         return self.source_app
 
-    def open_clipboard(self, _owner: int) -> bool:
+    def open_clipboard(self, owner: int) -> bool:
         self.open_calls += 1
         succeeded = self.open_results.pop(0) if self.open_results else True
         self.opened = succeeded
+        self.open_owner = owner if succeeded else 0
         self.calls.append("open")
         return succeeded
 
     def close_clipboard(self) -> bool:
         assert self.opened
-        self.opened = False
         self.close_calls += 1
         self.calls.append("close")
+        if self.close_result:
+            self.opened = False
         return self.close_result
+
+    def empty_clipboard(self) -> bool:
+        assert self.opened
+        self.empty_calls += 1
+        self.formats.clear()
+        self.payloads.clear()
+        self.sequence += 1
+        self.owner = self.open_owner
+        self.calls.append("empty")
+        return True
+
+    def allocate_global_bytes(self, data: bytes) -> int:
+        handle = self.next_handle
+        self.next_handle += 1
+        self.global_handles[handle] = data
+        self.calls.append("alloc")
+        return handle
+
+    def set_clipboard_handle(self, format_id: int, handle: int) -> bool:
+        assert self.opened
+        data = self.global_handles[handle]
+        self.calls.append(f"set:{format_id}")
+        self.set_calls.append((format_id, data))
+        if format_id == self.fail_set_format:
+            return False
+        del self.global_handles[handle]
+        self.formats.append(format_id)
+        self.payloads[format_id] = data
+        return True
+
+    def free_global(self, handle: int) -> None:
+        del self.global_handles[handle]
+        self.freed_handles.append(handle)
+
+    def clipboard_owner(self) -> int:
+        return self.owner
 
     def enum_formats(self) -> list[int]:
         assert self.opened
@@ -75,8 +127,16 @@ class FakeClipboardApi:
         return self.names.get(format_id, f"format/{format_id}")
 
     def register_format(self, name: str) -> int:
-        assert name == "PNG"
-        return self.png_format
+        return {
+            "PNG": self.png_format,
+            "ClipSoon.InternalWrite": self.internal_write_format,
+            "Preferred DropEffect": self.preferred_drop_effect_format,
+        }[name]
+
+    def is_format_available(self, format_id: int) -> bool:
+        if format_id == CF_DIB and CF_DIBV5 in self.formats:
+            return True
+        return format_id in self.formats
 
     def global_bytes(self, format_id: int) -> bytes:
         assert self.opened
@@ -87,6 +147,26 @@ class FakeClipboardApi:
         assert self.opened and format_id == CF_HDROP
         self.calls.append("files")
         return list(self.files)
+
+
+def test_native_clipboard_allocations_are_moveable_and_zero_initialized() -> None:
+    allocated: list[tuple[int, int]] = []
+    backing = ctypes.create_string_buffer(16)
+    kernel = SimpleNamespace(
+        GlobalAlloc=lambda flags, size: allocated.append((flags, size)) or 91,
+        GlobalLock=lambda _handle: ctypes.addressof(backing),
+        GlobalUnlock=lambda _handle: True,
+        GlobalFree=lambda _handle: 0,
+    )
+    api = object.__new__(CtypesWindowsApi)
+    api.kernel32 = kernel
+
+    handle = api.allocate_global_bytes(b"marker")
+
+    assert handle == 91
+    assert allocated == [(GHND, 6)]
+    assert backing.raw[:6] == b"marker"
+    assert backing.raw[6:] == bytes(10)
 
 
 def make_reader(
@@ -293,6 +373,294 @@ def test_private_marker_suppresses_payload_read(tmp_path: Path, marker: str) -> 
     assert not any(call.startswith("data:") for call in api.calls)
 
 
+def test_host_skips_internal_write_without_opening_clipboard(tmp_path: Path) -> None:
+    api = FakeClipboardApi(sequence=10)
+    api.formats = [api.internal_write_format, api.png_format, CF_DIB]
+    events: list[dict[str, object]] = []
+    capture_delays: list[int | None] = []
+    host = ClipboardHost(
+        api,
+        make_reader(tmp_path, api),
+        events.append,
+        schedule_capture=capture_delays.append,
+        after_sequence=9,
+    )
+
+    host.clipboard_changed()
+    host.retry_pending()
+
+    assert api.open_calls == 0
+    assert host.last_sequence == 10
+    assert host.pending_sequence is None
+    assert events[-1]["kind"] == "ignored"
+    manifest = json.loads((tmp_path / str(events[-1]["manifest"])).read_text(encoding="utf-8"))
+    assert manifest["reason"] == "internal-write"
+
+
+def test_broker_eagerly_writes_png_dibv5_marker_and_verifies_idempotently(
+    tmp_path: Path,
+) -> None:
+    session_id = "a" * 32
+    request_id = "b" * 32
+    api = FakeClipboardApi(sequence=10)
+    events: list[dict[str, object]] = []
+    ignored: list[int] = []
+    store = ImagePayloadStore(tmp_path, session_id=session_id)
+    png = _png(7, 9)
+    dibv5 = bytearray(124)
+    struct.pack_into("<IiiHH", dibv5, 0, 124, 7, 9, 1, 32)
+    png_name = f"write-png-{session_id}-{request_id}.png"
+    dibv5_name = f"write-dibv5-{session_id}-{request_id}.dibv5"
+    (tmp_path / png_name).write_bytes(png)
+    (tmp_path / dibv5_name).write_bytes(dibv5)
+    manifest = {
+        "protocol": 1,
+        "session_id": session_id,
+        "request_id": request_id,
+        "kind": "image",
+        "png_file": png_name,
+        "png_bytes": len(png),
+        "dibv5_file": dibv5_name,
+        "dibv5_bytes": len(dibv5),
+    }
+    manifest_name, manifest_bytes = _write_manifest(tmp_path, session_id, request_id, manifest)
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        store,
+        events.append,
+        ignore_sequence=ignored.append,
+        sleep=lambda _delay: None,
+    )
+    command = {
+        "type": "write_clipboard",
+        "request_id": request_id,
+        "kind": "image",
+        "manifest": manifest_name,
+        "manifest_bytes": manifest_bytes,
+    }
+
+    broker.handle(command)
+
+    assert events[0]["type"] == "write_started"
+    assert events[0]["request_id"] == request_id
+    assert events[0]["kind"] == "image"
+    assert isinstance(events[0]["time_ns"], int)
+    assert events[1]["type"] == "write_result"
+    assert [format_id for format_id, _data in api.set_calls] == [
+        api.png_format,
+        CF_DIBV5,
+        api.internal_write_format,
+    ]
+    assert api.calls[:4] == ["alloc", "alloc", "alloc", "open"]
+    assert api.payloads[api.png_format] == png
+    assert api.payloads[CF_DIBV5] == dibv5
+    assert api.payloads[api.internal_write_format] == request_id.encode("ascii") + b"\0"
+    assert events[-1] == {
+        "type": "write_result",
+        "request_id": request_id,
+        "kind": "image",
+        "ok": True,
+        "sequence": 11,
+        "code": "",
+        "error": "",
+    }
+    assert ignored == [11]
+    empty_calls = api.empty_calls
+
+    # GlobalAlloc/GlobalSize may expose allocator padding beyond the requested
+    # marker bytes.  The explicit NUL is the logical boundary.
+    api.payloads[api.internal_write_format] += bytes(7)
+    broker.handle(command)
+    broker.handle(
+        {
+            "type": "verify_clipboard",
+            "request_id": request_id,
+            "kind": "image",
+            "sequence": 11,
+        }
+    )
+
+    assert api.empty_calls == empty_calls
+    assert events[-1]["type"] == "verify_result"
+    assert events[-1]["ok"] is True
+    assert ignored == [11, 11, 11]
+
+
+def test_broker_initial_ack_requires_matching_request_marker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    session_id = "c" * 32
+    request_id = "d" * 32
+    api = FakeClipboardApi(sequence=15)
+    original_global_bytes = api.global_bytes
+
+    def corrupted_marker(format_id: int) -> bytes:
+        if format_id == api.internal_write_format:
+            return b"wrong-request-marker\0"
+        return original_global_bytes(format_id)
+
+    monkeypatch.setattr(api, "global_bytes", corrupted_marker)
+    events: list[dict[str, object]] = []
+    store = ImagePayloadStore(tmp_path, session_id=session_id)
+    manifest = {
+        "protocol": 1,
+        "session_id": session_id,
+        "request_id": request_id,
+        "kind": "text",
+        "text": "payload",
+    }
+    manifest_name, manifest_bytes = _write_manifest(
+        tmp_path,
+        session_id,
+        request_id,
+        manifest,
+    )
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        store,
+        events.append,
+        sleep=lambda _delay: None,
+    )
+
+    broker.handle(
+        {
+            "type": "write_clipboard",
+            "request_id": request_id,
+            "kind": "text",
+            "manifest": manifest_name,
+            "manifest_bytes": manifest_bytes,
+        }
+    )
+
+    assert api.payloads[api.internal_write_format] == request_id.encode("ascii") + b"\0"
+    assert events[-1]["ok"] is False
+    assert events[-1]["code"] == "verification_failed"
+
+
+def test_broker_writes_files_and_directories_as_hdrop_with_effect_and_marker(
+    tmp_path: Path,
+) -> None:
+    session_id = "1" * 32
+    request_id = "2" * 32
+    api = FakeClipboardApi(sequence=20)
+    events: list[dict[str, object]] = []
+    store = ImagePayloadStore(tmp_path, session_id=session_id)
+    first = tmp_path / "one.txt"
+    second = tmp_path / "two.png"
+    directory = tmp_path / "folder"
+    first.write_text("one", encoding="utf-8")
+    second.write_bytes(b"two")
+    directory.mkdir()
+    files = [str(first), str(second), str(directory)]
+    manifest = {
+        "protocol": 1,
+        "session_id": session_id,
+        "request_id": request_id,
+        "kind": "files",
+        "files": files,
+    }
+    manifest_name, manifest_bytes = _write_manifest(tmp_path, session_id, request_id, manifest)
+    broker = WindowsClipboardBroker(api, 321, store, events.append, sleep=lambda _delay: None)
+
+    broker.handle(
+        {
+            "type": "write_clipboard",
+            "request_id": request_id,
+            "kind": "files",
+            "manifest": manifest_name,
+            "manifest_bytes": manifest_bytes,
+        }
+    )
+
+    assert [format_id for format_id, _data in api.set_calls] == [
+        CF_HDROP,
+        api.preferred_drop_effect_format,
+        api.internal_write_format,
+    ]
+    dropfiles = api.payloads[CF_HDROP]
+    assert struct.unpack_from("<IiiII", dropfiles) == (20, 0, 0, 0, 1)
+    assert dropfiles[20:].decode("utf-16-le") == "\0".join(files) + "\0\0"
+    assert api.payloads[api.preferred_drop_effect_format] == struct.pack("<I", 1)
+    assert events[-1]["ok"] is True
+
+
+def test_broker_failed_format_write_clears_partial_transaction_and_never_acks(
+    tmp_path: Path,
+) -> None:
+    session_id = "3" * 32
+    request_id = "4" * 32
+    api = FakeClipboardApi(sequence=30)
+    api.fail_set_format = CF_DIBV5
+    events: list[dict[str, object]] = []
+    store = ImagePayloadStore(tmp_path, session_id=session_id)
+    png = _png(2, 2)
+    dibv5 = struct.pack("<IiiHH", 124, 2, 2, 1, 32) + bytes(108)
+    (tmp_path / "image.png").write_bytes(png)
+    (tmp_path / "image.dibv5").write_bytes(dibv5)
+    manifest = {
+        "protocol": 1,
+        "session_id": session_id,
+        "request_id": request_id,
+        "kind": "image",
+        "png_file": "image.png",
+        "png_bytes": len(png),
+        "dibv5_file": "image.dibv5",
+        "dibv5_bytes": len(dibv5),
+    }
+    manifest_name, manifest_bytes = _write_manifest(tmp_path, session_id, request_id, manifest)
+    broker = WindowsClipboardBroker(api, 123, store, events.append, sleep=lambda _delay: None)
+
+    broker.handle(
+        {
+            "type": "write_clipboard",
+            "request_id": request_id,
+            "kind": "image",
+            "manifest": manifest_name,
+            "manifest_bytes": manifest_bytes,
+        }
+    )
+
+    assert api.empty_calls == 2
+    assert api.formats == []
+    assert api.payloads == {}
+    assert api.global_handles == {}
+    assert len(api.freed_handles) == 2
+    assert api.close_calls == 1
+    assert events[-1]["ok"] is False
+    assert events[-1]["code"] == "clipboard_write_failed"
+
+
+def test_broker_rejects_manifest_outside_session_ipc_directory(tmp_path: Path) -> None:
+    session_id = "5" * 32
+    request_id = "6" * 32
+    api = FakeClipboardApi(sequence=40)
+    events: list[dict[str, object]] = []
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        ImagePayloadStore(tmp_path, session_id=session_id),
+        events.append,
+        sleep=lambda _delay: None,
+    )
+
+    broker.handle(
+        {
+            "type": "write_clipboard",
+            "request_id": request_id,
+            "kind": "text",
+            "manifest": "../manifest.json",
+            "manifest_bytes": 10,
+        }
+    )
+
+    assert api.open_calls == 0
+    assert events[-1]["ok"] is False
+    assert events[-1]["code"] == "manifest_error"
+
+
 def test_host_retries_busy_current_sequence_and_emits_short_manifest_event(tmp_path: Path) -> None:
     api = FakeClipboardApi(sequence=10)
     api.formats = [CF_UNICODETEXT]
@@ -473,6 +841,18 @@ def test_malformed_dib_is_rejected() -> None:
 
 def _png(width: int, height: int) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + struct.pack(">I4sII", 13, b"IHDR", width, height)
+
+
+def _write_manifest(
+    root: Path,
+    session_id: str,
+    request_id: str,
+    value: dict[str, object],
+) -> tuple[str, int]:
+    data = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+    name = f"write-manifest-{session_id}-{request_id}.json"
+    (root / name).write_bytes(data)
+    return name, len(data)
 
 
 class FakePipeKernel:

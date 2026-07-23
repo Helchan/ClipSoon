@@ -9,6 +9,7 @@ from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, QRect, QSize, Q
 from PySide6.QtGui import QColor, QImage, QInputMethodEvent, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFrame,
     QLabel,
@@ -134,6 +135,10 @@ def test_settings_and_custom_hotkey_validation(qtbot) -> None:
     assert _hotkey_display("combo:ctrl+plus").endswith("++")
     assert dialog.findChildren(QFrame, "settingsSection")
     assert dialog.findChild(QFrame, "settingsSection") is not None
+    assert not any(
+        label.text() == "配置快捷键、历史记录与粘贴行为"
+        for label in dialog.findChildren(QLabel)
+    )
     assert not hasattr(dialog, "version_label")
 
 
@@ -148,16 +153,31 @@ def test_windows_settings_only_offer_registered_combo_and_hide_double_interval(
     )
     qtbot.addWidget(dialog)
 
-    assert dialog.hotkey_mode.count() == 1
-    assert dialog.hotkey_mode.itemText(0) == "自定义组合键"
-    assert dialog.hotkey_mode.currentText() == "自定义组合键"
+    assert dialog.hotkey_mode is None
     assert dialog.custom_hotkey.isEnabled()
     assert _hotkey_display(WINDOWS_DEFAULT_HOTKEY).casefold() == "ctrl+shift+space"
     assert dialog.values()["hotkey"] == WINDOWS_DEFAULT_HOTKEY
+    field_labels = dialog.findChildren(QLabel, "settingsFieldLabel")
+    assert "呼出方式" not in [label.text() for label in field_labels]
+    assert "自定义组合键" not in [label.text() for label in field_labels]
+    assert [label.text() for label in field_labels].count("快捷键") == 1
+    assert dialog.findChildren(QComboBox) == [dialog.theme]
+    dialog.custom_hotkey.setKeySequence(QKeySequence("Ctrl+Alt+K"))
+    assert dialog.values()["hotkey"] == "combo:ctrl+alt+k"
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        ui_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+    dialog.custom_hotkey.clear()
+    dialog._validate_accept()
+    assert warnings == ["组合键必须包含 Ctrl/Shift/Alt/Command 和一个普通键。"]
+    assert dialog.result() == QDialog.DialogCode.Rejected
     assert dialog.interval.isHidden()
     interval_labels = [
         label
-        for label in dialog.findChildren(QLabel, "settingsFieldLabel")
+        for label in field_labels
         if label.text() == "双击间隔"
     ]
     assert len(interval_labels) == 1
@@ -172,6 +192,7 @@ def test_non_windows_settings_retain_double_modifier_modes(qtbot, monkeypatch) -
     )
     qtbot.addWidget(dialog)
 
+    assert dialog.hotkey_mode is not None
     assert dialog.hotkey_mode.count() == len(SettingsDialog._HOTKEYS)
     assert dialog.hotkey_mode.currentText() == "双击 Shift"
     assert dialog.values()["hotkey"] == "double:shift"
@@ -197,7 +218,6 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
     assert dialog.width() == 580
     assert dialog.height() < 720
     controls = [
-        dialog.hotkey_mode,
         dialog.custom_hotkey,
         dialog.interval,
         dialog.maximum,
@@ -206,6 +226,8 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
         dialog.theme,
         dialog.selection_memory,
     ]
+    if dialog.hotkey_mode is not None:
+        controls.insert(0, dialog.hotkey_mode)
     assert len({control.width() for control in controls}) == 1
 
 
@@ -240,6 +262,8 @@ def test_dark_settings_combo_popups_use_readable_theme_colors(qtbot) -> None:
     qtbot.waitExposed(dialog)
 
     for combo in (dialog.hotkey_mode, dialog.theme):
+        if combo is None:
+            continue
         view = combo.view()
         palette = view.palette()
         assert palette.color(QPalette.ColorRole.Base) == QColor("#242630")
@@ -264,6 +288,8 @@ def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -
     qtbot.addWidget(dialog)
 
     for combo in (dialog.hotkey_mode, dialog.theme):
+        if combo is None:
+            continue
         palette = combo.view().palette()
         assert palette.color(QPalette.ColorRole.Base) == QColor("#FFFFFF")
         assert palette.color(QPalette.ColorRole.Text) == QColor("#161821")

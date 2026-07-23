@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import plistlib
+import struct
 import subprocess
 import sys
 import threading
@@ -10,11 +11,18 @@ import types
 from pathlib import Path
 
 from PySide6.QtCore import QMimeData, QObject, QRunnable, QThreadPool, QUrl, Signal
-from PySide6.QtGui import QClipboard, QImage
+from PySide6.QtGui import QClipboard, QColor, QImage
 
 import clipsoon.core as core_module
 import clipsoon.system as system_module
-from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, ClipItem, ClipKind, HistoryRepository
+from clipsoon.core import (
+    WINDOWS_DEFAULT_HOTKEY,
+    AppSettings,
+    ClipboardWriteReceipt,
+    ClipItem,
+    ClipKind,
+    HistoryRepository,
+)
 from clipsoon.system import (
     ClipboardController,
     ForegroundTargetHandle,
@@ -24,8 +32,10 @@ from clipsoon.system import (
     LaunchAtLoginManager,
     PlatformBridge,
     SelectionSender,
+    _bitmap_v5_payload,
     _canonical_key,
     _NativeClipboardStoreTask,
+    _prepare_windows_write_artifacts,
 )
 
 
@@ -58,6 +68,8 @@ class FakeClipboard(QObject):
         super().__init__()
         self.mime = QMimeData()
         self.sequence = 0
+        self.owned = False
+        self.write_history: list[QMimeData] = []
 
     def mimeData(self, _mode=QClipboard.Mode.Clipboard) -> QMimeData:
         return self.mime
@@ -68,11 +80,17 @@ class FakeClipboard(QObject):
 
     def setMimeData(self, mime: QMimeData, _mode=QClipboard.Mode.Clipboard) -> None:
         self.mime = mime
+        self.owned = True
+        self.write_history.append(mime)
         self.sequence += 1
         self.dataChanged.emit()
 
+    def ownsClipboard(self) -> bool:
+        return self.owned
+
     def set_external(self, mime: QMimeData) -> None:
         self.mime = mime
+        self.owned = False
         self.sequence += 1
         self.dataChanged.emit()
 
@@ -102,6 +120,16 @@ class CallbackSignal:
             callback(*arguments)
 
 
+class FakeNativeCall:
+    def __init__(self, callback) -> None:
+        self.callback = callback
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *arguments):
+        return self.callback(*arguments)
+
+
 class FakeWorkerSupervisor:
     instances: list[FakeWorkerSupervisor] = []
 
@@ -109,8 +137,11 @@ class FakeWorkerSupervisor:
         self.role, self.arguments = role, arguments
         self.message = CallbackSignal()
         self.failed = CallbackSignal()
+        self.health_changed = CallbackSignal()
         self.is_healthy = False
-        self.session_id = ""
+        self.is_capture_pipeline_busy = False
+        self.session_id = "a" * 32
+        self.sent: list[dict] = []
         self.started = 0
         self.stopped = 0
         self.restarted = 0
@@ -126,6 +157,10 @@ class FakeWorkerSupervisor:
 
     def restart(self) -> None:
         self.restarted += 1
+
+    def send(self, message) -> bool:
+        self.sent.append(dict(message))
+        return self.is_healthy
 
 
 def test_double_modifier_state_machine_contract() -> None:
@@ -221,40 +256,684 @@ def test_clipboard_capture_precedence_and_self_write(qtbot, tmp_path: Path) -> N
     repository.close()
 
 
-def test_windows_image_write_publishes_bitmap_png_and_internal_marker(
+def test_windows_bitmap_v5_payload_has_header_and_bottom_up_bgra_pixels() -> None:
+    image = QImage(1, 2, QImage.Format.Format_ARGB32)
+    image.setPixelColor(0, 0, QColor(10, 20, 30, 40))
+    image.setPixelColor(0, 1, QColor(50, 60, 70, 80))
+
+    payload = _bitmap_v5_payload(image)
+
+    assert len(payload) == 124 + 8
+    assert struct.unpack_from("<IiiHHI", payload, 0) == (124, 1, 2, 1, 32, 0)
+    assert struct.unpack_from("<IIIII", payload, 40) == (
+        0x00FF0000,
+        0x0000FF00,
+        0x000000FF,
+        0xFF000000,
+        0x57696E20,
+    )
+    assert payload[124:] == bytes((22, 19, 16, 80, 5, 3, 2, 40))
+
+
+def test_windows_write_artifacts_use_session_scoped_atomic_manifest(tmp_path: Path) -> None:
+    image_path = tmp_path / "outgoing.png"
+    image = QImage(2, 1, QImage.Format.Format_ARGB32)
+    image.fill(0x88776655)
+    assert image.save(str(image_path), "PNG")
+    item = ClipItem("image", ClipKind.IMAGE, "hash", 1, 1, image_path=str(image_path))
+    session_id, request_id = "a" * 32, "b" * 32
+
+    prepared = _prepare_windows_write_artifacts(tmp_path / "ipc", item, request_id, session_id)
+    manifest_path = tmp_path / "ipc" / prepared.manifest_name
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["session_id"] == session_id
+    assert manifest["request_id"] == request_id
+    assert manifest["kind"] == "image"
+    assert manifest["png_bytes"] == (tmp_path / "ipc" / manifest["png_file"]).stat().st_size
+    assert manifest["dibv5_bytes"] == (tmp_path / "ipc" / manifest["dibv5_file"]).stat().st_size
+    assert not tuple((tmp_path / "ipc").glob(".*.tmp"))
+
+
+def test_windows_write_uses_broker_ack_and_never_qt_clipboard(
+    qtbot,
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
     clipboard = FakeClipboard()
     repository = HistoryRepository(tmp_path)
     controller = ClipboardController(clipboard, repository, AppSettings, lambda: "Source")
-    controller._sequence_number = lambda: clipboard.sequence  # type: ignore[method-assign]
-    image_path = tmp_path / "outgoing.png"
-    image = QImage(3, 2, QImage.Format.Format_ARGB32)
-    image.fill(0x88FF0000)
-    assert image.save(str(image_path), "PNG")
-    png = image_path.read_bytes()
-    item = ClipItem(
-        "image",
-        ClipKind.IMAGE,
-        "hash",
-        1,
-        1,
-        image_path=str(image_path),
-        width=3,
-        height=2,
-        byte_size=len(png),
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    item = ClipItem("text", ClipKind.TEXT, "hash", 1, 1, text="payload")
+    results: list[tuple[ClipboardWriteReceipt | None, str]] = []
+
+    assert not controller.write_item(item)
+    controller.request_write(item, lambda receipt, error: results.append((receipt, error)))
+    qtbot.waitUntil(lambda: bool(worker.sent), timeout=1_000)
+    command = worker.sent[-1]
+    assert command["type"] == "write_clipboard"
+    assert clipboard.write_history == []
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": "f" * 32,
+            "kind": "text",
+            "sequence": 41,
+        }
     )
+    assert results == []
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": command["request_id"],
+            "kind": "text",
+            "sequence": 42,
+            "code": "",
+            "error": "",
+        }
+    )
+    assert results == [(ClipboardWriteReceipt(command["request_id"], ClipKind.TEXT, 42), "")]
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": command["request_id"],
+            "kind": "text",
+            "sequence": 42,
+        }
+    )
+    assert len(results) == 1
+    controller.stop()
+    repository.close()
+
+
+def test_windows_write_waits_for_starting_helper_and_keeps_request_id(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
     monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    worker.is_healthy = False
+    worker.session_id = ""
+    results: list[tuple[ClipboardWriteReceipt | None, str]] = []
 
-    assert controller.write_item(item)
+    controller.request_write(
+        ClipItem("text", ClipKind.TEXT, "hash", 1, 1, text="payload"),
+        lambda receipt, error: results.append((receipt, error)),
+    )
 
-    windows_png = 'application/x-qt-windows-mime;value="PNG"'
-    internal_write = 'application/x-qt-windows-mime;value="ClipSoon.InternalWrite"'
-    assert clipboard.mime.hasImage()
-    assert bytes(clipboard.mime.data("image/png")) == png
-    assert bytes(clipboard.mime.data(windows_png)) == png
-    assert bytes(clipboard.mime.data(internal_write))
+    assert worker.sent == []
+    assert len(controller._windows_pending_writes) == 1
+    request_id = next(iter(controller._windows_pending_writes))
+
+    worker.session_id = "b" * 32
+    worker.is_healthy = True
+    worker.health_changed.emit(True)
+    qtbot.waitUntil(lambda: bool(worker.sent), timeout=1_000)
+    assert worker.sent[-1]["request_id"] == request_id
+
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 43,
+        }
+    )
+    assert results == [(ClipboardWriteReceipt(request_id, ClipKind.TEXT, 43), "")]
+    controller.stop()
+    repository.close()
+
+
+def test_windows_transient_write_failure_replays_once_with_same_request_id(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    results: list[tuple[ClipboardWriteReceipt | None, str]] = []
+
+    controller.request_write(
+        ClipItem("text", ClipKind.TEXT, "hash", 1, 1, text="payload"),
+        lambda receipt, error: results.append((receipt, error)),
+    )
+    qtbot.waitUntil(lambda: bool(worker.sent), timeout=1_000)
+    request_id = str(worker.sent[-1]["request_id"])
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": False,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 44,
+            "code": "clipboard_busy",
+            "error": "clipboard busy",
+        }
+    )
+
+    qtbot.waitUntil(
+        lambda: len([command for command in worker.sent if command["type"] == "write_clipboard"])
+        == 2,
+        timeout=1_000,
+    )
+    assert results == []
+    assert worker.sent[-1]["request_id"] == request_id
+
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 45,
+        }
+    )
+    assert results == [(ClipboardWriteReceipt(request_id, ClipKind.TEXT, 45), "")]
+    controller.stop()
+    repository.close()
+
+
+def test_windows_transient_write_failure_never_retries_more_than_once(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    results: list[tuple[ClipboardWriteReceipt | None, str]] = []
+
+    controller.request_write(
+        ClipItem("text", ClipKind.TEXT, "hash", 1, 1, text="payload"),
+        lambda receipt, error: results.append((receipt, error)),
+    )
+    qtbot.waitUntil(lambda: bool(worker.sent), timeout=1_000)
+    request_id = str(worker.sent[-1]["request_id"])
+    for code in ("verification_failed", "close_failed"):
+        worker.message.emit(
+            {
+                "type": "write_result",
+                "ok": False,
+                "request_id": request_id,
+                "kind": "text",
+                "sequence": 46,
+                "code": code,
+                "error": code,
+            }
+        )
+        if code == "verification_failed":
+            qtbot.waitUntil(
+                lambda: len(
+                    [command for command in worker.sent if command["type"] == "write_clipboard"]
+                )
+                == 2,
+                timeout=1_000,
+            )
+
+    assert results == [(None, "close_failed")]
+    assert len([command for command in worker.sent if command["type"] == "write_clipboard"]) == 2
+    controller.stop()
+    repository.close()
+
+
+def test_windows_materializing_capture_is_preempted_once_before_write(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    worker.is_capture_pipeline_busy = True
+    worker.message.emit({"type": "capture_materializing", "sequence": 70})
+    results: list[tuple[ClipboardWriteReceipt | None, str]] = []
+
+    controller.request_write(
+        ClipItem("text", ClipKind.TEXT, "hash", 1, 1, text="payload"),
+        lambda receipt, error: results.append((receipt, error)),
+    )
+    worker.message.emit({"type": "capture_materializing", "sequence": 70})
+
+    assert worker.restarted == 1
+    assert worker.sent == []
+    assert controller._windows_accepted_sequence == 70
+    request_id = next(iter(controller._windows_pending_writes))
+
+    worker.is_healthy = False
+    worker.health_changed.emit(False)
+    worker.session_id = "b" * 32
+    worker.is_capture_pipeline_busy = False
+    worker.is_healthy = True
+    worker.health_changed.emit(True)
+    qtbot.waitUntil(lambda: bool(worker.sent), timeout=1_000)
+    assert worker.sent[-1]["request_id"] == request_id
+
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 71,
+        }
+    )
+    assert results == [(ClipboardWriteReceipt(request_id, ClipKind.TEXT, 71), "")]
+    controller.stop()
+    repository.close()
+
+
+def test_windows_capture_event_preempts_inflight_write_and_ignores_late_ack(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    results: list[tuple[ClipboardWriteReceipt | None, str]] = []
+
+    controller.request_write(
+        ClipItem("text", ClipKind.TEXT, "hash", 1, 1, text="payload"),
+        lambda receipt, error: results.append((receipt, error)),
+    )
+    qtbot.waitUntil(lambda: bool(worker.sent), timeout=1_000)
+    first_command = worker.sent[-1]
+    request_id = str(first_command["request_id"])
+    first_manifest = controller._windows_ipc_dir / str(first_command["manifest"])
+    assert first_manifest.exists()
+
+    worker.is_capture_pipeline_busy = True
+    worker.message.emit({"type": "capture_started", "sequence": 80})
+    worker.message.emit({"type": "capture_materializing", "sequence": 80})
+    assert worker.restarted == 1
+    assert not first_manifest.exists()
+
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 81,
+        }
+    )
+    assert results == []
+
+    worker.is_healthy = False
+    worker.health_changed.emit(False)
+    worker.session_id = "c" * 32
+    worker.is_capture_pipeline_busy = False
+    worker.is_healthy = True
+    worker.health_changed.emit(True)
+    qtbot.waitUntil(
+        lambda: len([command for command in worker.sent if command["type"] == "write_clipboard"])
+        == 2,
+        timeout=1_000,
+    )
+    second_command = worker.sent[-1]
+    assert second_command["request_id"] == request_id
+    assert second_command["manifest"] != first_command["manifest"]
+
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 82,
+        }
+    )
+    assert results == [(ClipboardWriteReceipt(request_id, ClipKind.TEXT, 82), "")]
+    controller.stop()
+    repository.close()
+
+
+def test_windows_preparing_preemption_still_allows_one_native_transient_replay(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    original_prepare = system_module._prepare_windows_write_artifacts
+    first_started = threading.Event()
+    release_first = threading.Event()
+    call_count = [0]
+
+    def controlled_prepare(ipc_dir, item, request_id, session_id):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            first_started.set()
+            assert release_first.wait(2)
+        return original_prepare(ipc_dir, item, request_id, session_id)
+
+    monkeypatch.setattr(
+        system_module,
+        "_prepare_windows_write_artifacts",
+        controlled_prepare,
+    )
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    results: list[tuple[ClipboardWriteReceipt | None, str]] = []
+
+    controller.request_write(
+        ClipItem("text", ClipKind.TEXT, "hash", 1, 1, text="payload"),
+        lambda receipt, error: results.append((receipt, error)),
+    )
+    qtbot.waitUntil(first_started.is_set, timeout=1_000)
+    request_id = next(iter(controller._windows_pending_writes))
+
+    worker.is_capture_pipeline_busy = True
+    worker.message.emit({"type": "capture_materializing", "sequence": 84})
+    worker.is_healthy = False
+    worker.health_changed.emit(False)
+    worker.session_id = "d" * 32
+    worker.is_capture_pipeline_busy = False
+    worker.is_healthy = True
+    worker.health_changed.emit(True)
+    release_first.set()
+
+    qtbot.waitUntil(lambda: bool(worker.sent), timeout=1_000)
+    assert worker.restarted == 1
+    assert call_count[0] == 2
+    assert worker.sent[-1]["request_id"] == request_id
+    assert str(worker.sent[-1]["manifest"]).startswith(f"write-manifest-{'d' * 32}-")
+    assert not tuple(controller._windows_ipc_dir.glob(f"write-*-{'a' * 32}-*"))
+
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": False,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 85,
+            "code": "clipboard_busy",
+            "error": "clipboard busy",
+        }
+    )
+    qtbot.waitUntil(
+        lambda: len(
+            [command for command in worker.sent if command["type"] == "write_clipboard"]
+        )
+        == 2,
+        timeout=1_000,
+    )
+    assert call_count[0] == 3
+    assert worker.sent[-1]["request_id"] == request_id
+
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 86,
+        }
+    )
+    assert results == [(ClipboardWriteReceipt(request_id, ClipKind.TEXT, 86), "")]
+    controller.stop()
+    repository.close()
+
+
+def test_windows_preemption_during_transient_replay_still_reaches_second_native_attempt(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    original_prepare = system_module._prepare_windows_write_artifacts
+    second_started = threading.Event()
+    release_second = threading.Event()
+    call_count = [0]
+
+    def controlled_prepare(ipc_dir, item, request_id, session_id):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            second_started.set()
+            assert release_second.wait(2)
+        return original_prepare(ipc_dir, item, request_id, session_id)
+
+    monkeypatch.setattr(
+        system_module,
+        "_prepare_windows_write_artifacts",
+        controlled_prepare,
+    )
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    results: list[tuple[ClipboardWriteReceipt | None, str]] = []
+
+    controller.request_write(
+        ClipItem("text", ClipKind.TEXT, "hash", 1, 1, text="payload"),
+        lambda receipt, error: results.append((receipt, error)),
+    )
+    qtbot.waitUntil(lambda: bool(worker.sent), timeout=1_000)
+    request_id = str(worker.sent[-1]["request_id"])
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": False,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 90,
+            "code": "clipboard_busy",
+            "error": "clipboard busy",
+        }
+    )
+    qtbot.waitUntil(second_started.is_set, timeout=1_000)
+
+    worker.is_capture_pipeline_busy = True
+    worker.message.emit({"type": "capture_materializing", "sequence": 90})
+    worker.is_healthy = False
+    worker.health_changed.emit(False)
+    worker.session_id = "e" * 32
+    worker.is_capture_pipeline_busy = False
+    worker.is_healthy = True
+    worker.health_changed.emit(True)
+    release_second.set()
+
+    qtbot.waitUntil(
+        lambda: len(
+            [command for command in worker.sent if command["type"] == "write_clipboard"]
+        )
+        == 2,
+        timeout=1_000,
+    )
+    assert call_count[0] == 3
+    assert worker.sent[-1]["request_id"] == request_id
+    assert str(worker.sent[-1]["manifest"]).startswith(f"write-manifest-{'e' * 32}-")
+
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "ok": True,
+            "request_id": request_id,
+            "kind": "text",
+            "sequence": 91,
+        }
+    )
+    assert results == [(ClipboardWriteReceipt(request_id, ClipKind.TEXT, 91), "")]
+    controller.stop()
+    repository.close()
+
+
+def test_windows_verify_requires_matching_request_kind_and_sequence(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    receipt = ClipboardWriteReceipt("c" * 32, ClipKind.IMAGE, 51)
+    results: list[tuple[bool, str]] = []
+
+    controller.request_verify(receipt, lambda ok, error: results.append((ok, error)))
+    assert worker.sent[-1] == {
+        "type": "verify_clipboard",
+        "request_id": receipt.request_id,
+        "kind": "image",
+        "sequence": 51,
+    }
+    worker.message.emit(
+        {
+            "type": "verify_result",
+            "ok": True,
+            "request_id": receipt.request_id,
+            "kind": "image",
+            "sequence": 52,
+        }
+    )
+    assert results == []
+    worker.message.emit(
+        {
+            "type": "verify_result",
+            "ok": True,
+            "request_id": receipt.request_id,
+            "kind": "image",
+            "sequence": 51,
+        }
+    )
+    worker.message.emit(
+        {
+            "type": "verify_result",
+            "ok": True,
+            "request_id": receipt.request_id,
+            "kind": "image",
+            "sequence": 51,
+        }
+    )
+    assert results == [(True, "")]
+    controller.stop()
+    repository.close()
+
+
+def test_windows_verify_nacks_capture_pipeline_without_queueing(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    receipt = ClipboardWriteReceipt("e" * 32, ClipKind.IMAGE, 91)
+    results: list[tuple[bool, str]] = []
+    worker.is_capture_pipeline_busy = True
+
+    controller.request_verify(receipt, lambda ok, error: results.append((ok, error)))
+
+    assert results == [(False, "剪贴板内容已变化")]
+    assert worker.sent == []
+    assert controller._windows_pending_verifications == {}
+    controller.stop()
+    repository.close()
+
+
+def test_windows_capture_event_nacks_inflight_verify_and_ignores_late_result(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    receipt = ClipboardWriteReceipt("f" * 32, ClipKind.IMAGE, 92)
+    results: list[tuple[bool, str]] = []
+
+    controller.request_verify(receipt, lambda ok, error: results.append((ok, error)))
+    assert worker.sent[-1]["type"] == "verify_clipboard"
+    worker.is_capture_pipeline_busy = True
+    worker.message.emit({"type": "capture_started", "sequence": 93})
+    worker.message.emit(
+        {
+            "type": "verify_result",
+            "ok": True,
+            "request_id": receipt.request_id,
+            "kind": "image",
+            "sequence": receipt.sequence,
+        }
+    )
+
+    assert results == [(False, "剪贴板内容已变化")]
+    controller.stop()
+    repository.close()
+
+
+def test_windows_verify_reports_changed_sequence_without_waiting_for_timeout(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    receipt = ClipboardWriteReceipt("d" * 32, ClipKind.IMAGE, 61)
+    results: list[tuple[bool, str]] = []
+
+    controller.request_verify(receipt, lambda ok, error: results.append((ok, error)))
+    worker.message.emit(
+        {
+            "type": "verify_result",
+            "ok": False,
+            "request_id": receipt.request_id,
+            "kind": "image",
+            "sequence": 62,
+            "code": "verification_failed",
+            "error": "clipboard changed",
+        }
+    )
+
+    assert results == [(False, "clipboard changed")]
+    controller.stop()
     repository.close()
 
 
@@ -899,10 +1578,35 @@ class FakeWriter:
     def __init__(self, succeeds: bool = True) -> None:
         self.succeeds = succeeds
         self.writes: list[ClipItem] = []
+        self.verifications: list[ClipboardWriteReceipt] = []
 
     def write_item(self, item: ClipItem) -> bool:
         self.writes.append(item)
         return self.succeeds
+
+    def request_write(self, item: ClipItem, callback) -> None:
+        if self.write_item(item):
+            callback(ClipboardWriteReceipt("a" * 32, item.kind, len(self.writes)), "")
+        else:
+            callback(None, "")
+
+    def request_verify(self, receipt: ClipboardWriteReceipt, callback) -> None:
+        self.verifications.append(receipt)
+        callback(True, "")
+
+
+class DeferredWriter:
+    def __init__(self) -> None:
+        self.writes: list[ClipItem] = []
+        self.write_callbacks: list = []
+        self.verify_callbacks: list = []
+
+    def request_write(self, item: ClipItem, callback) -> None:
+        self.writes.append(item)
+        self.write_callbacks.append(callback)
+
+    def request_verify(self, receipt: ClipboardWriteReceipt, callback) -> None:
+        self.verify_callbacks.append((receipt, callback))
 
 
 class FakeRepository:
@@ -945,6 +1649,69 @@ def test_selection_sender_success_and_activation_fallback(qtbot) -> None:
     sender.send(clip, failed)  # type: ignore[arg-type]
     qtbot.waitUntil(lambda: len(finished) == 2, timeout=1_000)
     assert finished[-1] == ("已复制，但无法恢复目标窗口", False)
+
+
+def test_selection_sender_waits_for_write_ack_and_verify_before_paste(qtbot) -> None:
+    clip = ClipItem("id", ClipKind.TEXT, "h", 1, 1, text="hello")
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    target = FakeTarget()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: hidden.append(True),
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send(clip, target)  # type: ignore[arg-type]
+    assert hidden == []
+    assert target.activations == 0
+    assert paste.count == 0
+
+    receipt = ClipboardWriteReceipt("a" * 32, ClipKind.TEXT, 7)
+    writer.write_callbacks[0](receipt, "")
+    qtbot.waitUntil(lambda: bool(writer.verify_callbacks), timeout=1_000)
+    assert hidden == [True]
+    assert target.activations == 1
+    assert paste.count == 0
+
+    verify_callback = writer.verify_callbacks[0][1]
+    verify_callback(True, "")
+    verify_callback(True, "")  # duplicate/late ACK must not paste twice
+    assert paste.count == 1
+    assert finished == [("已发送", True)]
+
+
+def test_selection_sender_verify_failure_rewrites_once_then_cancels(qtbot) -> None:
+    clip = ClipItem("id", ClipKind.IMAGE, "h", 1, 1, image_path="image.png")
+    writer, paste = DeferredWriter(), FakePaste()
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        FakeRepository(),  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: None,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+    target = FakeTarget()
+
+    sender.send(clip, target)  # type: ignore[arg-type]
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.IMAGE, 10), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    writer.verify_callbacks[0][1](False, "changed")
+    assert writer.writes == [clip, clip]
+    writer.write_callbacks[1](ClipboardWriteReceipt("b" * 32, ClipKind.IMAGE, 11), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 2, timeout=1_000)
+    writer.verify_callbacks[1][1](False, "still changed")
+
+    assert paste.count == 0
+    assert len(finished) == 1
+    assert not finished[0][1]
+    assert "已取消自动粘贴" in finished[0][0]
 
 
 def test_selection_sender_copy_only_write_failure_and_inactive(qtbot) -> None:

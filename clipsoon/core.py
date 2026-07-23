@@ -105,6 +105,13 @@ class FileItemClaim:
     item: ClipItem | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ClipboardWriteReceipt:
+    request_id: str
+    kind: ClipKind
+    sequence: int | None = None
+
+
 def format_bytes(size: int) -> str:
     value = float(max(size, 0))
     for unit in ("B", "KB", "MB", "GB"):
@@ -147,17 +154,23 @@ class HistoryStore(Protocol):
 
     def validate_file_item(self, item_id: str) -> ValidatedFileItem | None: ...
 
-    def consume_validated_file_item(
-        self,
-        validated: ValidatedFileItem,
-        consumer: Callable[[ClipItem], bool],
-    ) -> FileItemClaim: ...
+    def claim_validated_file_item(self, validated: ValidatedFileItem) -> FileItemClaim: ...
 
     def cleanup(self, max_items: int, retention_days: int) -> int: ...
 
 
 class ClipboardAdapter(Protocol):
-    def write_item(self, item: ClipItem) -> bool: ...
+    def request_write(
+        self,
+        item: ClipItem,
+        callback: Callable[[ClipboardWriteReceipt | None, str], None],
+    ) -> None: ...
+
+    def request_verify(
+        self,
+        receipt: ClipboardWriteReceipt,
+        callback: Callable[[bool, str], None],
+    ) -> None: ...
 
 
 class ForegroundTarget(Protocol):
@@ -619,14 +632,14 @@ class HistoryRepository:
         # Continuous mutation is not a safe basis for emitting CF_HDROP.
         return None
 
-    def consume_validated_file_item(
-        self,
-        validated: ValidatedFileItem,
-        consumer: Callable[[ClipItem], bool],
-    ) -> FileItemClaim:
-        # This short critical section is intentionally filesystem-free. It
-        # closes the queued-signal window by preventing repository deletion or
-        # refresh between the revision check and the clipboard write.
+    def claim_validated_file_item(self, validated: ValidatedFileItem) -> FileItemClaim:
+        """CAS a filesystem-validated row without holding the lock across IPC.
+
+        The native clipboard broker performs the final path validation before
+        emitting CF_HDROP. This claim only closes the database refresh/delete
+        race and therefore stays both short and free of filesystem access.
+        """
+
         with self._lock:
             current = self._connection.execute(
                 "SELECT * FROM clips WHERE id = ? AND kind = ?",
@@ -637,11 +650,7 @@ class HistoryRepository:
             item = self._row_to_item(current)
             if int(current["revision"]) != validated.revision:
                 return FileItemClaim(FileItemClaimStatus.REFRESHED, item)
-            accepted = consumer(item)
-            return FileItemClaim(
-                FileItemClaimStatus.ACCEPTED if accepted else FileItemClaimStatus.REJECTED,
-                item,
-            )
+            return FileItemClaim(FileItemClaimStatus.ACCEPTED, item)
 
     def cleanup(self, max_items: int, retention_days: int) -> int:
         max_items, retention_days = max(1, int(max_items)), max(0, int(retention_days))

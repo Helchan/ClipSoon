@@ -7,10 +7,12 @@ import json
 import logging
 import os
 import plistlib
+import struct
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
@@ -23,6 +25,7 @@ from PySide6.QtGui import QClipboard, QImage
 from clipsoon.core import (
     WINDOWS_DEFAULT_HOTKEY,
     AppSettings,
+    ClipboardWriteReceipt,
     ClipItem,
     ClipKind,
     FileItemClaimStatus,
@@ -38,23 +41,150 @@ _CLIPBOARD_RETRY_DELAYS_MS = (90, 180)
 _WINDOWS_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 _WINDOWS_IMAGE_MAX_BYTES = 256 * 1024 * 1024
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-_WINDOWS_PNG_MIME = 'application/x-qt-windows-mime;value="PNG"'
-_WINDOWS_INTERNAL_WRITE_MIME = 'application/x-qt-windows-mime;value="ClipSoon.InternalWrite"'
+_WINDOWS_WRITE_DEADLINE_MS = 22_000
+_WINDOWS_VERIFY_DEADLINE_MS = 5_000
+_WINDOWS_MAX_WRITE_ATTEMPTS = 2
 _FILE_VALIDATION_TIMEOUT_MS = 3_000
 _MAX_CONCURRENT_FILE_VALIDATIONS = 2
 
 
 def _windows_ipc_session(name: str) -> str | None:
     value = name.removeprefix(".")
-    if not value.startswith(("manifest-", "clip-")):
+    prefixes = ("write-manifest-", "write-dibv5-", "write-png-", "manifest-", "clip-")
+    prefix = next((candidate for candidate in prefixes if value.startswith(candidate)), None)
+    if prefix is None:
         return None
-    parts = value.split("-", 2)
-    if len(parts) < 3:
-        return None
-    session_id = parts[1].casefold()
+    session_id = value.removeprefix(prefix).split("-", 1)[0].casefold()
     if len(session_id) != 32 or any(character not in "0123456789abcdef" for character in session_id):
         return None
     return session_id
+
+
+def _is_request_id(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        with suppress(OSError):
+            temporary.unlink()
+
+
+def _bitmap_v5_payload(image: QImage) -> bytes:
+    # Windows DIBV5 consumers use native little-endian premultiplied ARGB
+    # (BGRA bytes).  Convert in Qt, then flip complete rows in bulk instead of
+    # visiting millions of screenshot pixels in Python.
+    converted = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    width, height = converted.width(), converted.height()
+    pixel_bytes = width * height * 4
+    if width <= 0 or height <= 0 or pixel_bytes + 124 > _WINDOWS_IMAGE_MAX_BYTES:
+        raise ValueError("图片尺寸超出 Windows 剪贴板限制")
+    source = bytes(converted.constBits())
+    stride = converted.bytesPerLine()
+    if len(source) < stride * height:
+        raise ValueError("图片像素缓冲区不完整")
+    row_bytes = width * 4
+    pixels = b"".join(
+        source[row_index * stride : row_index * stride + row_bytes]
+        for row_index in range(height - 1, -1, -1)
+    )
+
+    header = bytearray(124)
+    struct.pack_into("<IiiHHIIiiII", header, 0, 124, width, height, 1, 32, 0, pixel_bytes, 0, 0, 0, 0)
+    struct.pack_into(
+        "<IIIII",
+        header,
+        40,
+        0x00FF0000,
+        0x0000FF00,
+        0x000000FF,
+        0xFF000000,
+        0x57696E20,  # LCS_WINDOWS_COLOR_SPACE
+    )
+    struct.pack_into("<I", header, 108, 4)  # LCS_GM_IMAGES
+    return bytes(header) + pixels
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedWindowsWrite:
+    session_id: str
+    manifest_name: str
+    manifest_bytes: int
+    paths: tuple[Path, ...]
+
+
+def _prepare_windows_write_artifacts(
+    ipc_dir: Path,
+    item: ClipItem,
+    request_id: str,
+    session_id: str,
+) -> _PreparedWindowsWrite:
+    if not _is_request_id(request_id) or not _is_request_id(session_id):
+        raise ValueError("Windows 剪贴板请求标识不合法")
+    ipc_dir.mkdir(parents=True, exist_ok=True)
+    manifest_name = f"write-manifest-{session_id}-{request_id}.json"
+    manifest_path = ipc_dir / manifest_name
+    created: list[Path] = []
+    manifest: dict[str, object] = {
+        "protocol": 1,
+        "session_id": session_id,
+        "request_id": request_id,
+        "kind": item.kind.value,
+    }
+    try:
+        if item.kind is ClipKind.TEXT:
+            if not item.text:
+                raise ValueError("剪贴板文本为空")
+            manifest["text"] = item.text
+        elif item.kind is ClipKind.FILES:
+            if not item.files:
+                raise ValueError("剪贴板文件列表为空")
+            manifest["files"] = list(item.files)
+        else:
+            png = Path(item.image_path).read_bytes()
+            if not png.startswith(_PNG_SIGNATURE) or not 0 < len(png) <= _WINDOWS_IMAGE_MAX_BYTES:
+                raise ValueError("剪贴板 PNG 数据不合法")
+            image = QImage.fromData(png, "PNG")
+            if image.isNull():
+                raise ValueError("剪贴板 PNG 无法解码")
+            dibv5 = _bitmap_v5_payload(image)
+            png_name = f"write-png-{session_id}-{request_id}.png"
+            dibv5_name = f"write-dibv5-{session_id}-{request_id}.bin"
+            png_path, dibv5_path = ipc_dir / png_name, ipc_dir / dibv5_name
+            _atomic_write(png_path, png)
+            created.append(png_path)
+            _atomic_write(dibv5_path, dibv5)
+            created.append(dibv5_path)
+            manifest.update(
+                {
+                    "png_file": png_name,
+                    "png_bytes": len(png),
+                    "dibv5_file": dibv5_name,
+                    "dibv5_bytes": len(dibv5),
+                }
+            )
+        encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if not 0 < len(encoded) <= _WINDOWS_MANIFEST_MAX_BYTES:
+            raise ValueError("剪贴板写入清单大小不合法")
+        _atomic_write(manifest_path, encoded)
+        created.append(manifest_path)
+        return _PreparedWindowsWrite(session_id, manifest_name, len(encoded), tuple(created))
+    except Exception:
+        for path in created:
+            with suppress(OSError):
+                path.unlink()
+        raise
 
 
 def _windows_handle(identifier: int):
@@ -311,6 +441,65 @@ class _FileItemValidationSignals(QObject):
     finished = Signal(object, str)
 
 
+class _WindowsWritePreparationSignals(QObject):
+    finished = Signal(str, object, str)
+
+
+class _WindowsWritePreparationTask(QRunnable):
+    def __init__(
+        self,
+        ipc_dir: Path,
+        item: ClipItem,
+        request_id: str,
+        session_id: str,
+    ) -> None:
+        super().__init__()
+        self.ipc_dir = ipc_dir
+        self.item = item
+        self.request_id = request_id
+        self.session_id = session_id
+        self.signals = _WindowsWritePreparationSignals()
+
+    def run(self) -> None:
+        try:
+            prepared = _prepare_windows_write_artifacts(
+                self.ipc_dir,
+                self.item,
+                self.request_id,
+                self.session_id,
+            )
+        except Exception as exc:
+            LOGGER.exception("Windows clipboard write preparation failed")
+            self.signals.finished.emit(self.request_id, None, str(exc))
+            return
+        self.signals.finished.emit(self.request_id, prepared, "")
+
+
+@dataclass(slots=True)
+class _PendingWindowsWrite:
+    request_id: str
+    item: ClipItem
+    callback: Callable[[ClipboardWriteReceipt | None, str], None]
+    deadline: float
+    attempts: int = 0
+    preparations: int = 0
+    preparing: bool = False
+    awaiting_result: bool = False
+    waiting_for_retry: bool = False
+    session_id: str = ""
+    paths: tuple[Path, ...] = ()
+
+
+@dataclass(slots=True)
+class _PendingWindowsVerify:
+    receipt: ClipboardWriteReceipt
+    callback: Callable[[bool, str], None]
+    deadline: float
+    attempts: int = 0
+    waiting_for_retry: bool = False
+    session_id: str = ""
+
+
 class _FileItemValidationTask:
     def __init__(self, repository: HistoryRepository, item_id: str) -> None:
         self.repository = repository
@@ -525,6 +714,10 @@ class ClipboardController(QObject):
         self._windows_manifest_queue: deque[tuple[int, dict[object, object]]] = deque()
         self._windows_manifest_task: _NativeClipboardStoreTask | None = None
         self._windows_capture_failures: dict[int, int] = {}
+        self._windows_pending_writes: dict[str, _PendingWindowsWrite] = {}
+        self._windows_pending_verifications: dict[str, _PendingWindowsVerify] = {}
+        self._windows_capture_pipeline_sequence: int | None = None
+        self._windows_capture_preemption_session = ""
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(220)
         self._poll_timer.timeout.connect(self._poll_native_sequence)
@@ -548,9 +741,13 @@ class ClipboardController(QObject):
 
     def stop(self) -> None:
         native_windows = sys.platform == "win32"
+        if native_windows:
+            self._fail_all_windows_requests("Windows 剪贴板宿主已停止")
         if self._windows_worker is not None:
             self._windows_worker.stop()
             self._windows_worker = None
+        self._windows_capture_pipeline_sequence = None
+        self._windows_capture_preemption_session = ""
         self._poll_timer.stop()
         self._capture_timer.stop()
         self._pending_sequence = None
@@ -703,7 +900,8 @@ class ClipboardController(QObject):
         self._cleanup_windows_ipc_orphans()
         worker = WindowsWorkerSupervisor("clipboard", self._windows_worker_arguments)
         worker.message.connect(self._on_windows_worker_message)
-        worker.failed.connect(self.failed.emit)
+        worker.failed.connect(self._on_windows_worker_failure)
+        worker.health_changed.connect(self._on_windows_worker_health_changed)
         self._windows_worker = worker
         worker.start()
 
@@ -718,10 +916,22 @@ class ClipboardController(QObject):
         if not isinstance(raw_message, dict):
             return
         kind = raw_message.get("type")
-        if kind == "clipboard":
+        if kind in {"capture_started", "capture_materializing"}:
+            sequence = raw_message.get("sequence")
+            if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence >= 0:
+                self._windows_capture_pipeline_sequence = sequence
+            self._preempt_windows_capture_pipeline(sequence)
+        elif kind == "clipboard":
+            self._windows_capture_pipeline_sequence = None
             self._queue_windows_manifest(raw_message)
-        elif kind == "error" and not raw_message.get("retrying") and not raw_message.get("fatal"):
-            self._retry_windows_capture(raw_message)
+        elif kind == "write_result":
+            self._handle_windows_write_result(raw_message)
+        elif kind == "verify_result":
+            self._handle_windows_verify_result(raw_message)
+        elif kind == "error":
+            self._windows_capture_pipeline_sequence = None
+            if not raw_message.get("retrying") and not raw_message.get("fatal"):
+                self._retry_windows_capture(raw_message)
 
     def _queue_windows_manifest(self, message: dict[object, object]) -> None:
         sequence = message.get("sequence")
@@ -895,6 +1105,11 @@ class ClipboardController(QObject):
             session_id = _windows_ipc_session(task.manifest_name)
             if session_id is not None:
                 sessions.add(session_id)
+        sessions.update(
+            pending.session_id
+            for pending in self._windows_pending_writes.values()
+            if pending.session_id
+        )
         return sessions
 
     def _cleanup_windows_ipc_orphans(self, preserve_sessions: set[str] | None = None) -> None:
@@ -906,38 +1121,71 @@ class ClipboardController(QObject):
         for path in entries:
             if path.is_symlink() or not path.is_file():
                 continue
-            if path.name.startswith(("manifest-", "clip-", ".manifest-", ".clip-")):
+            if path.name.startswith(
+                (
+                    "manifest-",
+                    "clip-",
+                    "write-manifest-",
+                    "write-png-",
+                    "write-dibv5-",
+                    ".manifest-",
+                    ".clip-",
+                    ".write-manifest-",
+                    ".write-png-",
+                    ".write-dibv5-",
+                )
+            ):
                 if _windows_ipc_session(path.name) in preserved:
                     continue
                 with suppress(OSError):
                     path.unlink()
 
-    def write_item(self, item: ClipItem) -> bool:
-        mime = QMimeData()
+    def _mime_factory(self, item: ClipItem) -> Callable[[], QMimeData] | None:
         if item.kind is ClipKind.TEXT:
-            mime.setText(item.text)
-        elif item.kind is ClipKind.FILES:
-            mime.setUrls([QUrl.fromLocalFile(path) for path in item.files])
-        else:
-            image = QImage(item.image_path)
-            if image.isNull():
-                return False
-            try:
-                png = Path(item.image_path).read_bytes()
-            except OSError:
-                return False
-            if not png.startswith(_PNG_SIGNATURE):
-                buffer = QBuffer()
-                buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-                if not image.save(buffer, "PNG"):
-                    return False
-                png = bytes(buffer.data())
+            def text_mime() -> QMimeData:
+                mime = QMimeData()
+                mime.setText(item.text)
+                return mime
+
+            return text_mime
+        if item.kind is ClipKind.FILES:
+            def files_mime() -> QMimeData:
+                mime = QMimeData()
+                mime.setUrls([QUrl.fromLocalFile(path) for path in item.files])
+                return mime
+
+            return files_mime
+
+        image = QImage(item.image_path)
+        if image.isNull():
+            return None
+        try:
+            png = Path(item.image_path).read_bytes()
+        except OSError:
+            return None
+        if not png.startswith(_PNG_SIGNATURE):
+            buffer = QBuffer()
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+            if not image.save(buffer, "PNG"):
+                return None
+            png = bytes(buffer.data())
+
+        def image_mime() -> QMimeData:
+            mime = QMimeData()
             mime.setImageData(image)
             mime.setData("image/png", png)
-            if sys.platform == "win32":
-                mime.setData(_WINDOWS_PNG_MIME, png)
+            return mime
+
+        return image_mime
+
+    def write_item(self, item: ClipItem) -> bool:
         if sys.platform == "win32":
-            mime.setData(_WINDOWS_INTERNAL_WRITE_MIME, b"1")
+            LOGGER.error("Synchronous GUI-process clipboard writes are disabled on Windows")
+            return False
+        mime_factory = self._mime_factory(item)
+        if mime_factory is None:
+            return False
+        mime = mime_factory()
         try:
             self._self_write = True
             self.clipboard.setMimeData(mime, QClipboard.Mode.Clipboard)
@@ -949,6 +1197,466 @@ class ClipboardController(QObject):
             return False
         finally:
             self._self_write = False
+
+    def request_write(
+        self,
+        item: ClipItem,
+        callback: Callable[[ClipboardWriteReceipt | None, str], None],
+    ) -> None:
+        if sys.platform != "win32":
+            request_id = uuid.uuid4().hex
+            if self.write_item(item):
+                callback(
+                    ClipboardWriteReceipt(request_id, item.kind, self._sequence_number()),
+                    "",
+                )
+            else:
+                callback(None, "无法写入系统剪贴板")
+            return
+        worker = self._windows_worker
+        if worker is None:
+            callback(None, "Windows 剪贴板宿主不可用")
+            return
+        request_id = uuid.uuid4().hex
+        pending = _PendingWindowsWrite(
+            request_id,
+            item,
+            callback,
+            time.monotonic() + (_WINDOWS_WRITE_DEADLINE_MS / 1_000),
+        )
+        self._windows_pending_writes[request_id] = pending
+        QTimer.singleShot(
+            _WINDOWS_WRITE_DEADLINE_MS,
+            lambda request_id=request_id: self._windows_write_timed_out(request_id),
+        )
+        if self._windows_capture_pipeline_busy(worker):
+            pending.waiting_for_retry = True
+            self._preempt_windows_capture_pipeline(
+                self._windows_capture_pipeline_sequence
+            )
+            return
+        if not worker.is_healthy or not _is_request_id(worker.session_id):
+            pending.waiting_for_retry = True
+            return
+        self._prepare_windows_write(pending)
+
+    def request_verify(
+        self,
+        receipt: ClipboardWriteReceipt,
+        callback: Callable[[bool, str], None],
+    ) -> None:
+        if sys.platform != "win32":
+            callback(True, "")
+            return
+        worker = self._windows_worker
+        if (
+            worker is None
+            or not _is_request_id(receipt.request_id)
+            or receipt.sequence is None
+            or receipt.sequence <= 0
+        ):
+            callback(False, "Windows 剪贴板宿主不可用")
+            return
+        if (
+            self._windows_capture_pipeline_busy(worker)
+            or self._windows_capture_preemption_session == worker.session_id
+        ):
+            callback(False, "剪贴板内容已变化")
+            return
+        if not worker.is_healthy:
+            callback(False, "Windows 剪贴板宿主不可用")
+            return
+        if receipt.request_id in self._windows_pending_verifications:
+            callback(False, "剪贴板验证请求已在处理中")
+            return
+        pending = _PendingWindowsVerify(
+            receipt,
+            callback,
+            time.monotonic() + (_WINDOWS_VERIFY_DEADLINE_MS / 1_000),
+        )
+        self._windows_pending_verifications[receipt.request_id] = pending
+        QTimer.singleShot(
+            _WINDOWS_VERIFY_DEADLINE_MS,
+            lambda request_id=receipt.request_id: self._windows_verify_timed_out(request_id),
+        )
+        if not self._send_windows_verify(pending):
+            self._finish_windows_verify(receipt.request_id, False, "无法发送剪贴板验证请求")
+
+    @staticmethod
+    def _windows_capture_pipeline_busy(worker: WindowsWorkerSupervisor) -> bool:
+        return bool(getattr(worker, "is_capture_pipeline_busy", False))
+
+    def _preempt_windows_capture_pipeline(self, sequence: object = None) -> None:
+        # Verification is a guard immediately before Ctrl+V. Once an external
+        # capture starts, its receipt cannot still describe the clipboard.
+        for request_id in tuple(self._windows_pending_verifications):
+            self._finish_windows_verify(request_id, False, "剪贴板内容已变化")
+
+        if not self._windows_pending_writes:
+            return
+        worker = self._windows_worker
+        if worker is None:
+            return
+
+        if (
+            isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+            and sequence >= 0
+        ):
+            # Preemption intentionally abandons this external capture. Advance
+            # the restart cursor so the replacement helper does not recapture
+            # the same sequence and starve the user-initiated write again.
+            with self._windows_capture_lock:
+                self._windows_accepted_sequence = sequence
+                self._last_sequence = sequence
+            self._windows_capture_failures.pop(sequence, None)
+
+        for pending in tuple(self._windows_pending_writes.values()):
+            pending.awaiting_result = False
+            pending.waiting_for_retry = True
+            self._cleanup_windows_write_paths(pending.paths)
+            pending.paths = ()
+
+        session_id = worker.session_id
+        if (
+            not _is_request_id(session_id)
+            or self._windows_capture_preemption_session == session_id
+        ):
+            return
+        self._windows_capture_preemption_session = session_id
+        worker.restart()
+
+    def _prepare_windows_write(self, pending: _PendingWindowsWrite) -> None:
+        worker = self._windows_worker
+        if time.monotonic() >= pending.deadline:
+            self._finish_windows_write(pending.request_id, None, "Windows 剪贴板宿主不可用")
+            return
+        if worker is None:
+            self._finish_windows_write(pending.request_id, None, "Windows 剪贴板宿主不可用")
+            return
+        if (
+            self._windows_capture_pipeline_busy(worker)
+            or self._windows_capture_preemption_session == worker.session_id
+        ):
+            pending.waiting_for_retry = True
+            if self._windows_capture_pipeline_busy(worker):
+                self._preempt_windows_capture_pipeline(
+                    self._windows_capture_pipeline_sequence
+                )
+            return
+        if not worker.is_healthy or not _is_request_id(worker.session_id):
+            pending.waiting_for_retry = True
+            return
+        pending.preparations += 1
+        pending.preparing = True
+        pending.awaiting_result = False
+        pending.waiting_for_retry = False
+        pending.session_id = worker.session_id
+        task = _WindowsWritePreparationTask(
+            self._windows_ipc_dir,
+            pending.item,
+            pending.request_id,
+            pending.session_id,
+        )
+        self._active_tasks.add(task)
+        task.signals.finished.connect(
+            lambda request_id, prepared, error, task=task: self._windows_write_prepared(
+                task,
+                request_id,
+                prepared,
+                error,
+            )
+        )
+        self._thread_pool.start(task)
+
+    def _windows_write_prepared(
+        self,
+        task: _WindowsWritePreparationTask,
+        request_id: str,
+        prepared: object,
+        error: str,
+    ) -> None:
+        self._active_tasks.discard(task)
+        pending = self._windows_pending_writes.get(request_id)
+        if pending is None:
+            if isinstance(prepared, _PreparedWindowsWrite):
+                self._cleanup_windows_write_paths(prepared.paths)
+            return
+        pending.preparing = False
+        worker = self._windows_worker
+        stale_preparation = (
+            pending.waiting_for_retry
+            or worker is None
+            or not worker.is_healthy
+            or worker.session_id != task.session_id
+            or self._windows_capture_preemption_session == task.session_id
+            or self._windows_capture_pipeline_busy(worker)
+        )
+        if stale_preparation:
+            if isinstance(prepared, _PreparedWindowsWrite):
+                self._cleanup_windows_write_paths(prepared.paths)
+            pending.awaiting_result = False
+            pending.waiting_for_retry = True
+            if time.monotonic() >= pending.deadline:
+                self._finish_windows_write(
+                    request_id,
+                    None,
+                    "Windows 剪贴板写入确认超时",
+                )
+                return
+            if worker is not None and self._windows_capture_pipeline_busy(worker):
+                self._preempt_windows_capture_pipeline(
+                    self._windows_capture_pipeline_sequence
+                )
+                return
+            if (
+                worker is not None
+                and worker.is_healthy
+                and _is_request_id(worker.session_id)
+                and worker.session_id != task.session_id
+                and self._windows_capture_preemption_session != worker.session_id
+            ):
+                # Preparation/session churn is bounded by the request deadline,
+                # not by the two native SetClipboardData attempts. A stale
+                # preparation must not consume the one transient native replay.
+                self._prepare_windows_write(pending)
+            return
+        if error or not isinstance(prepared, _PreparedWindowsWrite):
+            self._finish_windows_write(
+                request_id,
+                None,
+                f"无法准备剪贴板内容：{error or '无效的写入清单'}",
+            )
+            return
+        if (
+            worker is None
+            or not worker.is_healthy
+            or worker.session_id != prepared.session_id
+            or time.monotonic() >= pending.deadline
+        ):
+            self._cleanup_windows_write_paths(prepared.paths)
+            if worker is not None and worker.is_healthy:
+                self._prepare_windows_write(pending)
+            else:
+                pending.waiting_for_retry = True
+            return
+        pending.paths = prepared.paths
+        pending.session_id = prepared.session_id
+        pending.attempts += 1
+        pending.awaiting_result = True
+        sent = worker.send(
+            {
+                "type": "write_clipboard",
+                "request_id": request_id,
+                "kind": pending.item.kind.value,
+                "manifest": prepared.manifest_name,
+                "manifest_bytes": prepared.manifest_bytes,
+            }
+        )
+        if not sent:
+            pending.awaiting_result = False
+            self._finish_windows_write(request_id, None, "无法发送 Windows 剪贴板写入请求")
+
+    def _handle_windows_write_result(self, message: dict[object, object]) -> None:
+        request_id = message.get("request_id")
+        if not _is_request_id(request_id):
+            return
+        pending = self._windows_pending_writes.get(request_id)
+        worker = self._windows_worker
+        message_session = message.get("session_id")
+        if (
+            pending is None
+            or message.get("kind") != pending.item.kind.value
+            or not pending.awaiting_result
+            or pending.waiting_for_retry
+            or worker is None
+            or not worker.is_healthy
+            or worker.session_id != pending.session_id
+            or self._windows_capture_preemption_session == pending.session_id
+            or (
+                isinstance(message_session, str)
+                and message_session != pending.session_id
+            )
+        ):
+            return
+        sequence = message.get("sequence")
+        if (
+            message.get("ok") is True
+            and isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+            and sequence > 0
+        ):
+            receipt = ClipboardWriteReceipt(request_id, pending.item.kind, sequence)
+            self._last_sequence = sequence
+            self._suppressed_sequence = sequence
+            self._finish_windows_write(request_id, receipt, "")
+            return
+        code = str(message.get("code") or "")
+        if (
+            code in {"clipboard_busy", "verification_failed", "close_failed"}
+            and pending.attempts < _WINDOWS_MAX_WRITE_ATTEMPTS
+            and time.monotonic() < pending.deadline
+        ):
+            # These failures describe a contested/indeterminate Win32
+            # transaction, not bad source data. Rebuild all session artifacts
+            # and replay the same logical request exactly once.
+            pending.awaiting_result = False
+            self._cleanup_windows_write_paths(pending.paths)
+            pending.paths = ()
+            self._prepare_windows_write(pending)
+            return
+        error = str(message.get("error") or code or "原生剪贴板写入失败")
+        self._finish_windows_write(request_id, None, error)
+
+    def _send_windows_verify(self, pending: _PendingWindowsVerify) -> bool:
+        worker = self._windows_worker
+        if (
+            worker is None
+            or not worker.is_healthy
+            or time.monotonic() >= pending.deadline
+            or self._windows_capture_pipeline_busy(worker)
+            or self._windows_capture_preemption_session == worker.session_id
+        ):
+            return False
+        pending.attempts += 1
+        pending.waiting_for_retry = False
+        pending.session_id = worker.session_id
+        return worker.send(
+            {
+                "type": "verify_clipboard",
+                "request_id": pending.receipt.request_id,
+                "kind": pending.receipt.kind.value,
+                "sequence": pending.receipt.sequence,
+            }
+        )
+
+    def _handle_windows_verify_result(self, message: dict[object, object]) -> None:
+        request_id = message.get("request_id")
+        if not _is_request_id(request_id):
+            return
+        pending = self._windows_pending_verifications.get(request_id)
+        worker = self._windows_worker
+        message_session = message.get("session_id")
+        if (
+            pending is None
+            or message.get("kind") != pending.receipt.kind.value
+            or pending.waiting_for_retry
+            or worker is None
+            or not worker.is_healthy
+            or worker.session_id != pending.session_id
+            or self._windows_capture_pipeline_busy(worker)
+            or self._windows_capture_preemption_session == pending.session_id
+            or (
+                isinstance(message_session, str)
+                and message_session != pending.session_id
+            )
+        ):
+            return
+        if message.get("ok") is True:
+            if message.get("sequence") != pending.receipt.sequence:
+                return
+            self._finish_windows_verify(request_id, True, "")
+            return
+        error = str(message.get("error") or message.get("code") or "剪贴板内容已变化")
+        self._finish_windows_verify(request_id, False, error)
+
+    def _on_windows_worker_failure(self, message: str) -> None:
+        self.failed.emit(message)
+        worker = self._windows_worker
+        if worker is None or not worker.is_healthy:
+            self._on_windows_worker_health_changed(False)
+
+    def _on_windows_worker_health_changed(self, healthy: bool) -> None:
+        if not healthy:
+            now = time.monotonic()
+            for pending in tuple(self._windows_pending_writes.values()):
+                if pending.attempts >= _WINDOWS_MAX_WRITE_ATTEMPTS or now >= pending.deadline:
+                    self._finish_windows_write(
+                        pending.request_id,
+                        None,
+                        "Windows 剪贴板宿主在写入期间中断",
+                    )
+                    continue
+                pending.awaiting_result = False
+                self._cleanup_windows_write_paths(pending.paths)
+                pending.paths = ()
+                pending.waiting_for_retry = True
+            for pending in tuple(self._windows_pending_verifications.values()):
+                if pending.attempts >= _WINDOWS_MAX_WRITE_ATTEMPTS or now >= pending.deadline:
+                    self._finish_windows_verify(
+                        pending.receipt.request_id,
+                        False,
+                        "Windows 剪贴板宿主在验证期间中断",
+                    )
+                else:
+                    pending.waiting_for_retry = True
+            return
+
+        worker = self._windows_worker
+        if (
+            self._windows_capture_preemption_session
+            and (
+                worker is None
+                or worker.session_id == self._windows_capture_preemption_session
+            )
+        ):
+            return
+        self._windows_capture_preemption_session = ""
+        self._windows_capture_pipeline_sequence = None
+        for pending in tuple(self._windows_pending_writes.values()):
+            if pending.waiting_for_retry and not pending.preparing:
+                self._prepare_windows_write(pending)
+        for pending in tuple(self._windows_pending_verifications.values()):
+            if pending.waiting_for_retry and not self._send_windows_verify(pending):
+                self._finish_windows_verify(
+                    pending.receipt.request_id,
+                    False,
+                    "无法重试剪贴板验证",
+                )
+
+    def _windows_write_timed_out(self, request_id: str) -> None:
+        if request_id in self._windows_pending_writes:
+            self._finish_windows_write(request_id, None, "Windows 剪贴板写入确认超时")
+
+    def _windows_verify_timed_out(self, request_id: str) -> None:
+        if request_id in self._windows_pending_verifications:
+            self._finish_windows_verify(request_id, False, "Windows 剪贴板验证超时")
+
+    def _finish_windows_write(
+        self,
+        request_id: str,
+        receipt: ClipboardWriteReceipt | None,
+        error: str,
+    ) -> None:
+        pending = self._windows_pending_writes.pop(request_id, None)
+        if pending is None:
+            return
+        self._cleanup_windows_write_paths(pending.paths)
+        try:
+            pending.callback(receipt, error)
+        except Exception:
+            LOGGER.exception("Windows clipboard write callback failed")
+
+    def _finish_windows_verify(self, request_id: str, ok: bool, error: str) -> None:
+        pending = self._windows_pending_verifications.pop(request_id, None)
+        if pending is None:
+            return
+        try:
+            pending.callback(ok, error)
+        except Exception:
+            LOGGER.exception("Windows clipboard verification callback failed")
+
+    def _fail_all_windows_requests(self, error: str) -> None:
+        for request_id in tuple(self._windows_pending_writes):
+            self._finish_windows_write(request_id, None, error)
+        for request_id in tuple(self._windows_pending_verifications):
+            self._finish_windows_verify(request_id, False, error)
+
+    @staticmethod
+    def _cleanup_windows_write_paths(paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            with suppress(OSError):
+                path.unlink()
 
     def _sequence_number(self) -> int | None:
         try:
@@ -1354,56 +2062,78 @@ class SelectionSender(QObject):
         self._busy = False
         self._validation_tasks: set[_FileItemValidationTask] = set()
         self._validation_generation = 0
+        self._send_generation = 0
         self._file_validation_timeout_ms = max(50, int(file_validation_timeout_ms))
 
     def send(self, item: ClipItem, target: ForegroundTargetHandle | None) -> None:
         if self._busy:
             return
         self._busy = True
+        self._send_generation += 1
+        send_generation = self._send_generation
         if item.kind is ClipKind.FILES:
             if any(task.item_id == item.id for task in self._validation_tasks):
-                self._busy = False
-                self.finished.emit("原文件仍在验证，请稍后重试", False)
+                self._finish_send(send_generation, "原文件仍在验证，请稍后重试", False)
                 return
             if len(self._validation_tasks) >= _MAX_CONCURRENT_FILE_VALIDATIONS:
-                self._busy = False
-                self.finished.emit("后台文件验证繁忙，请稍后重试", False)
+                self._finish_send(send_generation, "后台文件验证繁忙，请稍后重试", False)
                 return
             self._validation_generation += 1
-            generation = self._validation_generation
-            self._start_file_item_validation(item.id, target, generation)
+            validation_generation = self._validation_generation
+            self._start_file_item_validation(
+                item.id,
+                target,
+                validation_generation,
+                send_generation,
+            )
             QTimer.singleShot(
                 self._file_validation_timeout_ms,
-                lambda: self._file_item_validation_timed_out(generation),
+                lambda: self._file_item_validation_timed_out(
+                    validation_generation,
+                    send_generation,
+                ),
             )
             return
-        self._write_and_dispatch(item, target)
+        self._request_item_write(item, target, send_generation)
 
     def _start_file_item_validation(
         self,
         item_id: str,
         target: ForegroundTargetHandle | None,
-        generation: int,
+        validation_generation: int,
+        send_generation: int,
     ) -> None:
         task = _FileItemValidationTask(self.repository, item_id)
         self._validation_tasks.add(task)
         task.signals.finished.connect(
             lambda validated, error, task=task, target=target: self._file_item_validated(
-                task, validated, error, target, generation
+                task,
+                validated,
+                error,
+                target,
+                validation_generation,
+                send_generation,
             )
         )
         threading.Thread(
             target=task.run,
-            name=f"ClipSoon-file-validation-{generation}",
+            name=f"ClipSoon-file-validation-{validation_generation}",
             daemon=True,
         ).start()
 
-    def _file_item_validation_timed_out(self, generation: int) -> None:
-        if generation != self._validation_generation or not self._busy:
+    def _file_item_validation_timed_out(
+        self,
+        validation_generation: int,
+        send_generation: int,
+    ) -> None:
+        if (
+            validation_generation != self._validation_generation
+            or send_generation != self._send_generation
+            or not self._busy
+        ):
             return
         self._validation_generation += 1
-        self._busy = False
-        self.finished.emit("原文件验证超时，请重试", False)
+        self._finish_send(send_generation, "原文件验证超时，请重试", False)
 
     def _file_item_validated(
         self,
@@ -1411,90 +2141,240 @@ class SelectionSender(QObject):
         validated: object,
         error: str,
         target: ForegroundTargetHandle | None,
-        generation: int,
+        validation_generation: int,
+        send_generation: int,
     ) -> None:
         self._validation_tasks.discard(task)
-        if generation != self._validation_generation or not self._busy:
+        if (
+            validation_generation != self._validation_generation
+            or send_generation != self._send_generation
+            or not self._busy
+        ):
             return
         if error:
             self._validation_generation += 1
-            self._busy = False
-            self.finished.emit(f"无法验证原文件：{error}", False)
+            self._finish_send(send_generation, f"无法验证原文件：{error}", False)
             return
         if not isinstance(validated, ValidatedFileItem):
             self._validation_generation += 1
-            self._busy = False
-            self.finished.emit("原文件已不存在，已从历史移除", False)
+            self._finish_send(send_generation, "原文件已不存在，已从历史移除", False)
             return
         try:
-            claim = self.repository.consume_validated_file_item(
-                validated,
-                self.clipboard.write_item,
-            )
+            claim = self.repository.claim_validated_file_item(validated)
         except Exception as exc:
-            LOGGER.exception("Validated file clipboard write failed")
+            LOGGER.exception("Validated file item claim failed")
             self._validation_generation += 1
-            self._busy = False
-            self.finished.emit(f"无法写入系统剪贴板：{exc}", False)
+            self._finish_send(send_generation, f"无法确认原文件：{exc}", False)
             return
         if claim.status is FileItemClaimStatus.MISSING:
             self._validation_generation += 1
-            self._busy = False
-            self.finished.emit("原文件已不存在，已从历史移除", False)
+            self._finish_send(send_generation, "原文件已不存在，已从历史移除", False)
             return
         if claim.status is FileItemClaimStatus.REFRESHED:
             item_id = claim.item.id if claim.item is not None else validated.item.id
-            self._start_file_item_validation(item_id, target, generation)
+            self._validation_generation += 1
+            refreshed_generation = self._validation_generation
+            self._start_file_item_validation(
+                item_id,
+                target,
+                refreshed_generation,
+                send_generation,
+            )
+            QTimer.singleShot(
+                self._file_validation_timeout_ms,
+                lambda: self._file_item_validation_timed_out(
+                    refreshed_generation,
+                    send_generation,
+                ),
+            )
             return
         self._validation_generation += 1
-        if claim.status is FileItemClaimStatus.REJECTED or claim.item is None:
-            self._busy = False
-            self.finished.emit("无法写入系统剪贴板", False)
+        if claim.status is not FileItemClaimStatus.ACCEPTED or claim.item is None:
+            self._finish_send(send_generation, "无法确认原文件", False)
             return
-        self._dispatch_written(claim.item, target)
+        self._request_item_write(claim.item, target, send_generation)
 
-    def _write_and_dispatch(
+    def _request_item_write(
         self,
         item: ClipItem,
         target: ForegroundTargetHandle | None,
+        send_generation: int,
     ) -> None:
-        if not self.clipboard.write_item(item):
-            self._busy = False
-            self.finished.emit("无法写入系统剪贴板", False)
+        self.clipboard.request_write(
+            item,
+            lambda receipt, error: self._item_write_finished(
+                item,
+                target,
+                send_generation,
+                receipt,
+                error,
+            ),
+        )
+
+    def _item_write_finished(
+        self,
+        item: ClipItem,
+        target: ForegroundTargetHandle | None,
+        send_generation: int,
+        receipt: ClipboardWriteReceipt | None,
+        error: str,
+    ) -> None:
+        if send_generation != self._send_generation or not self._busy:
             return
-        self._dispatch_written(item, target)
+        if receipt is None or receipt.kind is not item.kind:
+            message = f"无法写入系统剪贴板：{error}" if error else "无法写入系统剪贴板"
+            self._finish_send(send_generation, message, False)
+            return
+        self._dispatch_written(item, target, receipt, send_generation)
 
     def _dispatch_written(
         self,
         item: ClipItem,
         target: ForegroundTargetHandle | None,
+        receipt: ClipboardWriteReceipt,
+        send_generation: int,
     ) -> None:
         self.repository.mark_used(item.id)
         self._hide_panel()
         settings = self._settings()
         if not settings.paste_after_selection or target is None:
-            self._busy = False
-            self.finished.emit("已复制到剪贴板", True)
+            self._finish_send(send_generation, "已复制到剪贴板", True)
             return
-        QTimer.singleShot(35, lambda: self._activate_then_paste(target, settings.paste_delay_ms))
+        QTimer.singleShot(
+            35,
+            lambda: self._activate_then_verify(
+                item,
+                target,
+                receipt,
+                settings.paste_delay_ms,
+                send_generation,
+            ),
+        )
 
-    def _activate_then_paste(self, target: ForegroundTargetHandle, delay_ms: int) -> None:
+    def _activate_then_verify(
+        self,
+        item: ClipItem,
+        target: ForegroundTargetHandle,
+        receipt: ClipboardWriteReceipt,
+        delay_ms: int,
+        send_generation: int,
+    ) -> None:
+        if send_generation != self._send_generation or not self._busy:
+            return
         if not target.activate():
-            self._busy = False
-            self.finished.emit("已复制，但无法恢复目标窗口", False)
+            self._finish_send(send_generation, "已复制，但无法恢复目标窗口", False)
             return
-        QTimer.singleShot(delay_ms, lambda: self._paste(target))
+        QTimer.singleShot(
+            delay_ms,
+            lambda: self._verify_before_paste(
+                item,
+                target,
+                receipt,
+                send_generation,
+                rewrite_count=0,
+            ),
+        )
 
-    def _paste(self, target: ForegroundTargetHandle) -> None:
+    def _verify_before_paste(
+        self,
+        item: ClipItem,
+        target: ForegroundTargetHandle,
+        receipt: ClipboardWriteReceipt,
+        send_generation: int,
+        *,
+        rewrite_count: int,
+    ) -> None:
+        if send_generation != self._send_generation or not self._busy:
+            return
         # Some macOS apps report activation asynchronously. A successful native
         # activate call is accepted, but a positively different foreground is not.
         if not target.is_active():
-            self._busy = False
-            self.finished.emit("已复制，但目标窗口未激活", False)
+            self._finish_send(send_generation, "已复制，但目标窗口未激活", False)
+            return
+        self.clipboard.request_verify(
+            receipt,
+            lambda ok, error: self._clipboard_verified(
+                item,
+                target,
+                send_generation,
+                rewrite_count,
+                ok,
+                error,
+            ),
+        )
+
+    def _clipboard_verified(
+        self,
+        item: ClipItem,
+        target: ForegroundTargetHandle,
+        send_generation: int,
+        rewrite_count: int,
+        ok: bool,
+        error: str,
+    ) -> None:
+        if send_generation != self._send_generation or not self._busy:
+            return
+        if not ok:
+            if rewrite_count >= 1:
+                message = (
+                    f"剪贴板验证失败，已取消自动粘贴：{error}"
+                    if error
+                    else "剪贴板验证失败，已取消自动粘贴"
+                )
+                self._finish_send(send_generation, message, False)
+                return
+            self.clipboard.request_write(
+                item,
+                lambda receipt, write_error: self._rewrite_finished(
+                    item,
+                    target,
+                    send_generation,
+                    receipt,
+                    write_error,
+                ),
+            )
+            return
+        if not target.is_active():
+            self._finish_send(send_generation, "已复制，但目标窗口未激活", False)
             return
         pasted = self.paste_adapter.paste()
+        self._finish_send(
+            send_generation,
+            "已发送" if pasted else "已复制，但自动粘贴失败",
+            pasted,
+        )
+
+    def _rewrite_finished(
+        self,
+        item: ClipItem,
+        target: ForegroundTargetHandle,
+        send_generation: int,
+        receipt: ClipboardWriteReceipt | None,
+        error: str,
+    ) -> None:
+        if send_generation != self._send_generation or not self._busy:
+            return
+        if receipt is None or receipt.kind is not item.kind:
+            message = (
+                f"剪贴板重写失败，已取消自动粘贴：{error}"
+                if error
+                else "剪贴板重写失败，已取消自动粘贴"
+            )
+            self._finish_send(send_generation, message, False)
+            return
+        self._verify_before_paste(
+            item,
+            target,
+            receipt,
+            send_generation,
+            rewrite_count=1,
+        )
+
+    def _finish_send(self, send_generation: int, message: str, success: bool) -> None:
+        if send_generation != self._send_generation:
+            return
         self._busy = False
-        self.finished.emit("已发送" if pasted else "已复制，但自动粘贴失败", pasted)
+        self.finished.emit(message, success)
 
 
 def _canonical_key(key: str) -> str:
