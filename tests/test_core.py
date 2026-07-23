@@ -402,14 +402,14 @@ def test_prune_missing_file_items_keeps_indeterminate_os_errors(
     file_path = tmp_path / "temporarily-unavailable.txt"
     file_path.write_text("available", encoding="utf-8")
     item = repo.add_files((str(file_path),))
-    original_stat = Path.stat
+    original_stat = core_module._stat_file_path
 
-    def guarded_stat(path: Path, *args, **kwargs):
-        if path == file_path:
+    def guarded_stat(path: str):
+        if path == str(file_path):
             raise PermissionError("temporarily unavailable")
-        return original_stat(path, *args, **kwargs)
+        return original_stat(path)
 
-    monkeypatch.setattr(Path, "stat", guarded_stat)
+    monkeypatch.setattr(core_module, "_stat_file_path", guarded_stat)
 
     assert repo.prune_missing_file_items() == ()
     assert repo.get(item.id) == item
@@ -429,12 +429,12 @@ def test_file_missing_probe_preserves_items_when_storage_root_is_unavailable(
     storage_root: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def unavailable_stat(path: Path, *_args, **_kwargs):
-        if str(path) in {file_path, storage_root}:
-            raise FileNotFoundError(str(path))
+    def unavailable_stat(path: str):
+        if path in {file_path, storage_root}:
+            raise FileNotFoundError(path)
         raise AssertionError(f"unexpected path probe: {path}")
 
-    monkeypatch.setattr(Path, "stat", unavailable_stat)
+    monkeypatch.setattr(core_module, "_stat_file_path", unavailable_stat)
 
     assert not core_module._file_path_is_definitively_missing(file_path)
 
@@ -446,15 +446,15 @@ def test_file_missing_probe_removes_unc_child_when_share_is_reachable(
     storage_root = "\\\\server\\share\\"
     probes: list[str] = []
 
-    def reachable_root_stat(path: Path, *_args, **_kwargs):
-        probes.append(str(path))
-        if str(path) == file_path:
-            raise FileNotFoundError(str(path))
-        if str(path) == storage_root:
+    def reachable_root_stat(path: str):
+        probes.append(path)
+        if path == file_path:
+            raise FileNotFoundError(path)
+        if path == storage_root:
             return object()
         raise AssertionError(f"unexpected path probe: {path}")
 
-    monkeypatch.setattr(Path, "stat", reachable_root_stat)
+    monkeypatch.setattr(core_module, "_stat_file_path", reachable_root_stat)
 
     assert core_module._file_path_is_definitively_missing(file_path)
     assert probes == [file_path, storage_root, file_path, storage_root]
@@ -467,18 +467,18 @@ def test_file_missing_probe_preserves_child_that_recovers_on_second_probe(
     storage_root = "\\\\server\\share\\"
     file_probes = 0
 
-    def recovered_stat(path: Path, *_args, **_kwargs):
+    def recovered_stat(path: str):
         nonlocal file_probes
-        if str(path) == file_path:
+        if path == file_path:
             file_probes += 1
             if file_probes == 1:
-                raise FileNotFoundError(str(path))
+                raise FileNotFoundError(path)
             return object()
-        if str(path) == storage_root:
+        if path == storage_root:
             return object()
         raise AssertionError(f"unexpected path probe: {path}")
 
-    monkeypatch.setattr(Path, "stat", recovered_stat)
+    monkeypatch.setattr(core_module, "_stat_file_path", recovered_stat)
 
     assert not core_module._file_path_is_definitively_missing(file_path)
     assert file_probes == 2
@@ -491,18 +491,18 @@ def test_file_missing_probe_preserves_child_if_root_disconnects_during_confirmat
     storage_root = "\\\\server\\share\\"
     root_probes = 0
 
-    def disconnecting_stat(path: Path, *_args, **_kwargs):
+    def disconnecting_stat(path: str):
         nonlocal root_probes
-        if str(path) == file_path:
-            raise FileNotFoundError(str(path))
-        if str(path) == storage_root:
+        if path == file_path:
+            raise FileNotFoundError(path)
+        if path == storage_root:
             root_probes += 1
             if root_probes == 2:
-                raise FileNotFoundError(str(path))
+                raise FileNotFoundError(path)
             return object()
         raise AssertionError(f"unexpected path probe: {path}")
 
-    monkeypatch.setattr(Path, "stat", disconnecting_stat)
+    monkeypatch.setattr(core_module, "_stat_file_path", disconnecting_stat)
 
     assert not core_module._file_path_is_definitively_missing(file_path)
     assert root_probes == 2

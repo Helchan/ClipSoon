@@ -757,7 +757,7 @@ def _safe_file_size(path: Path) -> int:
 
 def _file_path_is_definitively_missing(path: str) -> bool:
     try:
-        Path(path).stat()
+        _stat_file_path(path)
     except (FileNotFoundError, NotADirectoryError):
         storage_root = _file_storage_root(path)
         if storage_root is None or _same_storage_path(path, storage_root):
@@ -769,7 +769,7 @@ def _file_path_is_definitively_missing(path: str) -> bool:
             # and the individual path can be confirmed missing.
             return False
         try:
-            Path(path).stat()
+            _stat_file_path(path)
         except (FileNotFoundError, NotADirectoryError):
             # Confirm the root again after the second child probe. This closes
             # the race where a share briefly recovers between the first child
@@ -783,6 +783,12 @@ def _file_path_is_definitively_missing(path: str) -> bool:
         # indeterminate I/O failure must not permanently erase history.
         return False
     return False
+
+
+def _stat_file_path(path: str) -> os.stat_result:
+    """Keep filesystem probing injectable without patching ``Path.stat`` globally."""
+
+    return Path(path).stat()
 
 
 def _file_storage_root(path: str) -> str | None:
@@ -799,7 +805,7 @@ def _file_storage_root(path: str) -> str | None:
 
 def _storage_root_is_reachable(storage_root: str) -> bool:
     try:
-        Path(storage_root).stat()
+        _stat_file_path(storage_root)
     except OSError:
         return False
     return True
