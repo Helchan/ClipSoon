@@ -293,16 +293,14 @@ def _smoke_windows_input_delivery(
     user32.IsClipboardFormatAvailable.restype = ctypes.c_int32
     user32.RegisterClipboardFormatW.argtypes = (ctypes.c_wchar_p,)
     user32.RegisterClipboardFormatW.restype = message_type
-    user32.SendMessageTimeoutW.argtypes = (
+    user32.GetWindowTextLengthW.argtypes = (hwnd_type,)
+    user32.GetWindowTextLengthW.restype = ctypes.c_int32
+    user32.GetWindowTextW.argtypes = (
         hwnd_type,
-        message_type,
-        ctypes.c_size_t,
-        ctypes.c_ssize_t,
-        message_type,
-        message_type,
-        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_wchar_p,
+        ctypes.c_int32,
     )
-    user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+    user32.GetWindowTextW.restype = ctypes.c_int32
     user32.DestroyWindow.argtypes = (hwnd_type,)
     user32.DestroyWindow.restype = ctypes.c_int32
     user32.PostThreadMessageW.argtypes = (
@@ -346,11 +344,7 @@ def _smoke_windows_input_delivery(
     sw_show = 5
     wm_quit = 0x0012
     wm_paste = 0x0302
-    wm_gettext = 0x000D
-    wm_gettextlength = 0x000E
     wm_focus_child = 0x8001
-    smto_block = 0x0001
-    smto_abort_if_hung = 0x0002
     cf_dib = 8
     cf_dibv5 = 17
     png_format = int(user32.RegisterClipboardFormatW("PNG"))
@@ -358,6 +352,8 @@ def _smoke_windows_input_delivery(
         raise ctypes.WinError(ctypes.get_last_error())
     image_paste_observed = threading.Event()
     image_paste_formats_available = [False]
+    text_paste_observed = threading.Event()
+    pasted_text = [""]
     subclass_callbacks: list[object] = []
     module = kernel32.GetModuleHandleW(None)
 
@@ -442,10 +438,10 @@ def _smoke_windows_input_delivery(
                 )
                 if not top or not edit:
                     raise ctypes.WinError(ctypes.get_last_error())
-                if role == "target" and probe_kind == "image":
+                if role == "target":
 
                     @subclass_procedure_type
-                    def observe_image_paste(
+                    def observe_paste(
                         window: int,
                         message_id: int,
                         word_parameter: int,
@@ -453,24 +449,63 @@ def _smoke_windows_input_delivery(
                         _subclass_id: int,
                         _reference_data: int,
                     ) -> int:
-                        if int(message_id) == wm_paste:
-                            image_paste_formats_available[0] = all(
-                                user32.IsClipboardFormatAvailable(
-                                    message_type(format_id)
+                        if int(message_id) != wm_paste:
+                            return int(
+                                comctl32.DefSubclassProc(
+                                    hwnd_type(window),
+                                    message_type(message_id),
+                                    word_parameter,
+                                    long_parameter,
                                 )
-                                for format_id in (png_format, cf_dibv5, cf_dib)
                             )
-                            image_paste_observed.set()
-                        return int(
-                            comctl32.DefSubclassProc(
-                                hwnd_type(window),
-                                message_type(message_id),
-                                word_parameter,
-                                long_parameter,
-                            )
+                        paste_observed = (
+                            image_paste_observed
+                            if probe_kind == "image"
+                            else text_paste_observed
                         )
+                        try:
+                            if probe_kind == "image":
+                                image_paste_formats_available[0] = all(
+                                    user32.IsClipboardFormatAvailable(
+                                        message_type(format_id)
+                                    )
+                                    for format_id in (png_format, cf_dibv5, cf_dib)
+                                )
+                                return int(
+                                    comctl32.DefSubclassProc(
+                                        hwnd_type(window),
+                                        message_type(message_id),
+                                        word_parameter,
+                                        long_parameter,
+                                    )
+                                )
 
-                    subclass_callback = observe_image_paste
+                            result = int(
+                                comctl32.DefSubclassProc(
+                                    hwnd_type(window),
+                                    message_type(message_id),
+                                    word_parameter,
+                                    long_parameter,
+                                )
+                            )
+                            length = int(
+                                user32.GetWindowTextLengthW(hwnd_type(window))
+                            )
+                            buffer = ctypes.create_unicode_buffer(length + 1)
+                            user32.GetWindowTextW(
+                                hwnd_type(window),
+                                buffer,
+                                len(buffer),
+                            )
+                            pasted_text[0] = buffer.value
+                            return result
+                        except BaseException as exc:
+                            failures.append(exc)
+                            return 0
+                        finally:
+                            paste_observed.set()
+
+                    subclass_callback = observe_paste
                     subclass_callbacks.append(subclass_callback)
                     subclass_installed = bool(
                         comctl32.SetWindowSubclass(
@@ -646,41 +681,12 @@ def _smoke_windows_input_delivery(
                     "PNG, CF_DIBV5, and CF_DIB were not all available during WM_PASTE"
                 )
         else:
-            deadline = time.monotonic() + 3
-            received = ""
-            while time.monotonic() < deadline:
-                length_result = ctypes.c_size_t()
-                if not user32.SendMessageTimeoutW(
-                    hwnd_type(edit),
-                    message_type(wm_gettextlength),
-                    0,
-                    0,
-                    smto_block | smto_abort_if_hung,
-                    200,
-                    ctypes.byref(length_result),
-                ):
-                    raise RuntimeError("Win32 EDIT did not answer WM_GETTEXTLENGTH")
-                length = int(length_result.value)
-                buffer = ctypes.create_unicode_buffer(length + 1)
-                text_result = ctypes.c_size_t()
-                if not user32.SendMessageTimeoutW(
-                    hwnd_type(edit),
-                    message_type(wm_gettext),
-                    len(buffer),
-                    ctypes.cast(buffer, ctypes.c_void_p).value or 0,
-                    smto_block | smto_abort_if_hung,
-                    200,
-                    ctypes.byref(text_result),
-                ):
-                    raise RuntimeError("Win32 EDIT did not answer WM_GETTEXT")
-                received = buffer.value
-                if received == expected_text:
-                    break
-                time.sleep(0.02)
-            if received != expected_text:
+            if not text_paste_observed.wait(3):
+                raise RuntimeError("Win32 EDIT did not receive WM_PASTE for text data")
+            if pasted_text[0] != expected_text:
                 raise RuntimeError(
                     "Win32 EDIT paste mismatch: "
-                    f"expected={expected_text!r} actual={received!r}"
+                    f"expected={expected_text!r} actual={pasted_text[0]!r}"
                 )
     finally:
         cleanup_failures: list[str] = []

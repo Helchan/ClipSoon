@@ -54,8 +54,10 @@ def test_windows_helper_smoke_exercises_eager_native_clipboard_formats() -> None
     assert "_smoke_windows_input_delivery" in smoke
     assert 'f"--windows-helper={role}"' in smoke
     assert '_run_packaged_helper(executable, "paste", [])' in smoke
-    assert "SendMessageTimeoutW" in smoke
     assert "SetWindowSubclass" in smoke
+    assert "text_paste_observed.wait(3)" in smoke
+    assert "did not receive WM_PASTE for text data" in smoke
+    assert "GetWindowTextW" in smoke
     assert "image_paste_observed.wait(2)" in smoke
     assert "did not receive WM_PASTE for image data" in smoke
     assert "were not all available during WM_PASTE" in smoke
