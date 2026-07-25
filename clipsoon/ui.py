@@ -8,6 +8,7 @@ import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -53,7 +54,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFileIconProvider,
     QFrame,
     QGraphicsDropShadowEffect,
@@ -155,6 +155,67 @@ _PREVIEW_SIZE_BUCKET = 64
 _FILE_REVISION_TTL_SECONDS = 1.0
 
 
+@dataclass(frozen=True)
+class _ThemeColors:
+    """Semantic colors shared by Qt stylesheets and custom-painted controls."""
+
+    window: str
+    card: str
+    panel: str
+    control: str
+    text: str
+    muted: str
+    border: str
+    accent: str
+    accent_focus: str
+    hover: str
+    thumbnail: str
+    popup: str
+    menu: str
+    menu_hover: str
+    menu_separator: str
+
+
+_LIGHT_COLORS = _ThemeColors(
+    window="#F7F8FC",
+    card="rgba(248, 249, 253, 250)",
+    panel="#F0F2F8",
+    control="#E9ECF4",
+    text="#171A24",
+    muted="#62697A",
+    border="rgba(45, 53, 76, 32)",
+    accent="#5264E8",
+    accent_focus="#6677F5",
+    hover="#E3E8F4",
+    thumbnail="#E7EBF5",
+    popup="#FAFBFE",
+    menu="#F8F9FD",
+    menu_hover="#E0E6F3",
+    menu_separator="#D5DAE5",
+)
+_DARK_COLORS = _ThemeColors(
+    window="#1C1F27",
+    card="rgba(29, 32, 40, 248)",
+    panel="#252934",
+    control="#303541",
+    text="#F2F4F8",
+    muted="#B1B7C6",
+    border="rgba(255, 255, 255, 28)",
+    accent="#5264E8",
+    accent_focus="#7180F5",
+    hover="#3A4050",
+    thumbnail="#343A48",
+    popup="#292D39",
+    menu="#2A2F3B",
+    menu_hover="#444B5C",
+    menu_separator="#454C5C",
+)
+
+
+def _theme_colors(dark: bool) -> _ThemeColors:
+    return _DARK_COLORS if dark else _LIGHT_COLORS
+
+
 class ClipListModel(QAbstractListModel):
     def __init__(self) -> None:
         super().__init__()
@@ -187,15 +248,22 @@ class SearchIcon(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._dark_theme = False
         self.setFixedSize(30, 30)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName("设置")
+
+    def set_dark_theme(self, dark: bool) -> None:
+        if self._dark_theme != dark:
+            self._dark_theme = dark
+            self.update()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#6574FF"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        colors = _theme_colors(self._dark_theme)
+        painter.setPen(QPen(QColor(colors.accent), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(4, 3, 18, 18)
         painter.drawLine(19, 19, 26, 26)
@@ -454,10 +522,11 @@ class ClipDelegate(QStyledItemDelegate):
         rect = option.rect.adjusted(4, 1, -5, -1)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = index.row() == self.hovered_row
+        colors = _theme_colors(self.dark_theme)
         if selected or hovered:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#5B6CFF") if selected else _hover_color(self.dark_theme))
-            painter.drawRoundedRect(rect, 5, 5)
+            painter.setBrush(QColor(colors.accent) if selected else _hover_color(self.dark_theme))
+            painter.drawRoundedRect(rect, 8, 8)
 
         thumb_rect = self._thumbnail_rect(rect)
         self._paint_thumbnail(painter, thumb_rect, item, selected)
@@ -484,9 +553,10 @@ class ClipDelegate(QStyledItemDelegate):
         return QRect(row_rect.left() + 8, top, size, size)
 
     def _paint_thumbnail(self, painter: QPainter, rect: QRect, item: ClipItem, selected: bool) -> None:
+        colors = _theme_colors(self.dark_theme)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 28) if selected else QColor("#E9ECF5"))
-        painter.drawRoundedRect(rect, 9, 9)
+        painter.setBrush(QColor(255, 255, 255, 32) if selected else QColor(colors.thumbnail))
+        painter.drawRoundedRect(rect, 8, 8)
         if item.kind is ClipKind.IMAGE:
             pixmap = self._image_thumbnail(item.image_path, rect.size() * 2)
             if not pixmap.isNull():
@@ -505,7 +575,7 @@ class ClipDelegate(QStyledItemDelegate):
                     target = self._centered_file_icon_rect(rect)
                     painter.drawPixmap(target, pixmap, pixmap.rect())
                     return
-        color = QColor("#FFFFFF") if selected else QColor("#5664E8")
+        color = QColor("#FFFFFF") if selected else QColor(colors.accent)
         painter.setPen(color)
         font = painter.font()
         font.setPointSize(16)
@@ -657,6 +727,7 @@ class SettingsDialog(QDialog):
     clear_requested = Signal()
     reveal_requested = Signal()
     accessibility_requested = Signal()
+    settings_changed = Signal(object)
 
     _HOTKEYS = {
         "双击 Ctrl": "double:ctrl",
@@ -674,6 +745,7 @@ class SettingsDialog(QDialog):
         accessibility_granted: bool | None = None,
     ) -> None:
         super().__init__(parent)
+        self._updating_controls = False
         self.setWindowTitle("ClipSoon 设置")
         self.setModal(True)
         self.setFixedWidth(580)
@@ -681,6 +753,7 @@ class SettingsDialog(QDialog):
             settings.theme == "system"
             and QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
         )
+        self._dark_theme = dark
         self.setStyleSheet(_style_sheet(dark))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 10, 22, 10)
@@ -782,7 +855,7 @@ class SettingsDialog(QDialog):
         self.theme.addItem("浅色", "light")
         self.theme.addItem("深色", "dark")
         self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
-        add_row(history_form, 3, "外观", self.theme)
+        add_row(history_form, 3, "主题", self.theme)
 
         # A QComboBox popup is a separate top-level window on macOS.  It does
         # not reliably inherit the dialog stylesheet, so an explicitly dark
@@ -867,17 +940,19 @@ class SettingsDialog(QDialog):
         data_layout.addLayout(data_row)
         layout.addWidget(data_section)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
-        buttons.rejected.connect(self.reject)
-        buttons.accepted.connect(self._validate_accept)
         footer = QHBoxLayout()
         footer.addStretch()
-        footer.addWidget(buttons)
+        self.close_button = QPushButton("关闭")
+        self.close_button.setToolTip("关闭设置")
+        self.close_button.clicked.connect(self.reject)
+        footer.addWidget(self.close_button)
+        self.reset_button = QPushButton("重置")
+        self.reset_button.setToolTip("恢复默认设置")
+        self.reset_button.clicked.connect(self._reset)
+        footer.addWidget(self.reset_button)
         layout.addLayout(footer)
+
+        self._connect_immediate_changes()
 
     def values(self) -> dict[str, object]:
         if self.hotkey_mode is None:
@@ -905,7 +980,35 @@ class SettingsDialog(QDialog):
             "launch_at_login": self.launch_at_login.isChecked(),
         }
 
-    def _validate_accept(self) -> None:
+    def _connect_immediate_changes(self) -> None:
+        if self.hotkey_mode is not None:
+            self.hotkey_mode.currentTextChanged.connect(self._hotkey_mode_changed)
+        self.custom_hotkey.editingFinished.connect(self._emit_hotkey_change)
+        for spin_box in (
+            self.interval,
+            self.maximum,
+            self.retention,
+            self.delay,
+            self.selection_memory,
+        ):
+            spin_box.valueChanged.connect(self._emit_settings_changed)
+        self.theme.currentIndexChanged.connect(self._emit_settings_changed)
+        for checkbox in (
+            self.capture,
+            self.paste,
+            self.hide,
+            self.remember_selection,
+            self.launch_at_login,
+        ):
+            checkbox.toggled.connect(self._emit_settings_changed)
+
+    def _hotkey_mode_changed(self, value: str) -> None:
+        self.custom_hotkey.setEnabled(value == "自定义组合键")
+        self._emit_hotkey_change()
+
+    def _emit_hotkey_change(self) -> None:
+        if self._updating_controls:
+            return
         recorded = self.custom_hotkey.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
         custom = (
             self.hotkey_mode is None
@@ -919,11 +1022,68 @@ class SettingsDialog(QDialog):
         if custom and platform_error:
             QMessageBox.warning(self, "快捷键无效", platform_error)
             return
-        self.accept()
+        self._emit_settings_changed()
+
+    def _emit_settings_changed(self, *_args: object) -> None:
+        if not self._updating_controls:
+            self.settings_changed.emit(self.values())
+
+    def apply_settings(self, settings: AppSettings) -> None:
+        """Reflect the persisted value while leaving the dialog open."""
+        self._updating_controls = True
+        try:
+            hotkey = settings.hotkey
+            if self.hotkey_mode is None:
+                self.custom_hotkey.setKeySequence(QKeySequence(_hotkey_display(hotkey)))
+            else:
+                label = next(
+                    (label for label, value in self._available_hotkeys.items() if value == hotkey),
+                    "自定义组合键",
+                )
+                self.hotkey_mode.setCurrentText(label)
+                if hotkey.startswith("combo:"):
+                    self.custom_hotkey.setKeySequence(QKeySequence(_hotkey_display(hotkey)))
+                self.custom_hotkey.setEnabled(label == "自定义组合键")
+            self.interval.setValue(settings.double_tap_interval_ms)
+            self.maximum.setValue(settings.max_history_items)
+            self.retention.setValue(settings.retention_days)
+            self.delay.setValue(settings.paste_delay_ms)
+            self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
+            self.capture.setChecked(settings.capture_enabled)
+            self.paste.setChecked(settings.paste_after_selection)
+            self.hide.setChecked(settings.hide_on_deactivate)
+            self.remember_selection.setChecked(settings.remember_selection)
+            self.selection_memory.setValue(settings.selection_memory_seconds)
+            self.selection_memory.setEnabled(settings.remember_selection)
+            self.launch_at_login.setChecked(settings.launch_at_login)
+        finally:
+            self._updating_controls = False
+
+        dark = settings.theme == "dark" or (
+            settings.theme == "system"
+            and QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        )
+        self._dark_theme = dark
+        self.setStyleSheet(_style_sheet(dark))
+        for combo in (self.hotkey_mode, self.theme):
+            if combo is not None:
+                _style_combo_popup(combo, dark)
+
+    def _reset(self) -> None:
+        defaults = AppSettings(
+            hotkey=WINDOWS_DEFAULT_HOTKEY if sys.platform == "win32" else AppSettings().hotkey
+        )
+        self.apply_settings(defaults)
+        self._emit_settings_changed()
 
     def _confirm_clear(self) -> None:
-        answer = QMessageBox.question(self, "清除历史", "清除所有未置顶的历史？此操作无法撤销。")
-        if answer == QMessageBox.StandardButton.Yes:
+        if _confirm_destructive_action(
+            self,
+            "清除历史",
+            "清除所有未置顶的历史？此操作无法撤销。",
+            "清除历史",
+            dark=self._dark_theme,
+        ):
             self.clear_requested.emit()
 
     def _request_reveal(self) -> None:
@@ -1097,6 +1257,11 @@ class ClipPanel(QWidget):
         self.preview_stack.addWidget(self.file_preview)
         self.preview_stack.addWidget(self.file_text_preview)
         detail_layout.addWidget(self.preview_stack, 1)
+        self.information_divider = QFrame()
+        self.information_divider.setObjectName("informationDivider")
+        self.information_divider.setFrameShape(QFrame.Shape.NoFrame)
+        self.information_divider.setFixedHeight(1)
+        detail_layout.addWidget(self.information_divider)
         information_title = QLabel("信息")
         information_title.setObjectName("informationTitle")
         detail_layout.addWidget(information_title)
@@ -1382,16 +1547,18 @@ class ClipPanel(QWidget):
             and QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
         )
         self._dark_theme = dark
+        colors = _theme_colors(dark)
         if sys.platform == "win32":
             palette = self.palette()
             palette.setColor(
                 QPalette.ColorRole.Window,
-                QColor("#1C1D24" if dark else "#F9FAFD"),
+                QColor(colors.window),
             )
             self.setPalette(palette)
         delegate = self.list.itemDelegate()
         if isinstance(delegate, ClipDelegate):
             delegate.set_dark_theme(dark)
+        self.search_icon.set_dark_theme(dark)
         self.setStyleSheet(_style_sheet(dark))
         self._sync_search_box_height()
 
@@ -1610,10 +1777,14 @@ class ClipPanel(QWidget):
         selected = menu.exec(self.list.viewport().mapToGlobal(position))
         if selected is delete_action:
             self._request_delete_selected()
-        elif selected is clear_action:
-            answer = QMessageBox.question(self, "清空历史", "清空全部剪贴板历史？此操作无法撤销。")
-            if answer == QMessageBox.StandardButton.Yes:
-                self.clear_requested.emit()
+        elif selected is clear_action and _confirm_destructive_action(
+            self,
+            "清空历史",
+            "清空全部剪贴板历史？此操作无法撤销。",
+            "确定",
+            dark=self._dark_theme,
+        ):
+            self.clear_requested.emit()
 
 
 def create_tray_icon(parent: QWidget) -> tuple[QSystemTrayIcon, QMenu, dict[str, QAction]]:
@@ -1621,7 +1792,7 @@ def create_tray_icon(parent: QWidget) -> tuple[QSystemTrayIcon, QMenu, dict[str,
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor("#5B6CFF"))
+    painter.setBrush(QColor(_LIGHT_COLORS.accent))
     painter.setPen(Qt.PenStyle.NoPen)
     painter.drawRoundedRect(5, 5, 54, 54, 16, 16)
     painter.setPen(QPen(QColor("white"), 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
@@ -1645,43 +1816,67 @@ def create_tray_icon(parent: QWidget) -> tuple[QSystemTrayIcon, QMenu, dict[str,
 
 
 def _style_sheet(dark: bool) -> str:
-    bg = "rgba(28, 29, 36, 248)" if dark else "rgba(249, 250, 253, 250)"
-    panel = "#242630" if dark else "#F1F3F9"
-    text = "#F7F7FA" if dark else "#161821"
-    muted = "#A6A9B7" if dark else "#707586"
-    border = "rgba(255,255,255,24)" if dark else "rgba(46,52,76,26)"
-    input_bg = "#343743" if dark else "#EAECF4"
+    colors = _theme_colors(dark)
+    information_divider = "rgba(255, 255, 255, 18)" if dark else "rgba(45, 53, 76, 18)"
     return f"""
-        QWidget {{ color: {text}; font-size: 10pt; }}
-        #card {{ background: {bg}; border: 1px solid {border}; border-radius: 20px; }}
-        #searchBox {{ background: transparent; border: 2px solid #6574FF; border-radius: 10px; }}
+        QWidget {{ color: {colors.text}; font-size: 10pt; }}
+        #card {{ background: {colors.card}; border: 1px solid {colors.border}; border-radius: 16px; }}
+        #searchBox {{ background: transparent; border: 2px solid {colors.accent_focus}; border-radius: 10px; }}
         #search {{ background: transparent; border: none; font-size: 16pt; padding: 0 2px; }}
-        QToolButton {{ border: none; border-radius: 9px; padding: 7px 10px; background: transparent; }}
-        QToolButton:hover {{ background: {input_bg}; }}
-        QToolButton[filterChip="true"] {{ color: {muted}; font-size: 13pt; font-weight: 500; padding: 5px 12px; }}
-        QToolButton[filterChip="true"]:checked {{ color: white; background: #5B6CFF; }}
-        #historyList {{ background: transparent; border: none; outline: none; font-size: 13pt; }}
-        #detail {{ background: {panel}; border: 1px solid {border}; border-radius: 15px; }}
-        #textPreview, #fileTextPreview {{ font-size: 13pt; padding: 11px; }}
-        #informationTitle {{ font-size: 13pt; font-weight: 650; padding-top: 6px; }}
-        #informationLabel {{ color: {muted}; font-size: 13pt; font-weight: 500; }}
-        #informationValue {{ font-size: 13pt; }}
-        #muted {{ color: {muted}; font-size: 9pt; }}
-        #muted a {{ color: #6574FF; text-decoration: none; }}
-        #platformNote {{ background: {input_bg}; border: 1px solid {border}; border-radius: 10px; }}
-        #dialogTitle {{ font-size: 16pt; font-weight: 650; }}
-        #settingsSubtitle {{ color: {muted}; font-size: 9pt; }}
-        #settingsSection {{ background: {panel}; border: 1px solid {border}; border-radius: 11px; }}
-        #settingsSectionTitle {{ font-size: 11pt; font-weight: 650; }}
-        #settingsFieldLabel {{ color: {muted}; font-size: 9pt; }}
-        QPlainTextEdit, QLineEdit, QComboBox, QSpinBox {{
-            background: {input_bg}; border: 1px solid {border}; border-radius: 9px; padding: 7px;
+        QToolButton {{ border: none; border-radius: 8px; padding: 7px 10px; background: transparent; }}
+        QToolButton:hover {{ background: {colors.control}; }}
+        QToolButton[filterChip="true"] {{
+            color: {colors.muted}; font-size: 13pt; font-weight: 500; padding: 5px 12px;
         }}
-        QComboBox:disabled, QLineEdit:disabled {{ color: {muted}; background: {panel}; }}
-        QPlainTextEdit {{ selection-background-color: #5B6CFF; }}
-        QPushButton {{ background: {input_bg}; border: 1px solid {border}; border-radius: 8px; padding: 7px 12px; }}
-        QPushButton:hover {{ border-color: #7A86FF; }}
-        QDialog {{ background: {bg}; }}
+        QToolButton[filterChip="true"]:checked {{ color: white; background: {colors.accent}; }}
+        #historyList {{ background: transparent; border: none; outline: none; font-size: 13pt; }}
+        #detail {{ background: {colors.panel}; border: 1px solid {colors.border}; border-radius: 12px; }}
+        #textPreview, #fileTextPreview {{ font-size: 13pt; padding: 11px; }}
+        #informationDivider {{
+            background: {information_divider}; margin: 3px 8px 1px; min-height: 1px; max-height: 1px;
+        }}
+        #informationTitle {{ font-size: 13pt; font-weight: 650; padding: 6px 0 0 0; }}
+        #informationLabel, #informationValue {{
+            color: {colors.muted}; font-size: 13pt; font-weight: 500;
+        }}
+        #muted {{ color: {colors.muted}; font-size: 9pt; }}
+        #muted a {{ color: {colors.accent_focus}; text-decoration: none; }}
+        #platformNote {{ background: {colors.control}; border: 1px solid {colors.border}; border-radius: 10px; }}
+        #dialogTitle {{ font-size: 16pt; font-weight: 650; }}
+        #settingsSubtitle {{ color: {colors.muted}; font-size: 9pt; }}
+        #settingsSection {{ background: {colors.panel}; border: 1px solid {colors.border}; border-radius: 12px; }}
+        #settingsSectionTitle {{ font-size: 11pt; font-weight: 650; }}
+        #settingsFieldLabel {{ color: {colors.muted}; font-size: 9pt; }}
+        QPlainTextEdit, QLineEdit, QComboBox, QSpinBox {{
+            background: {colors.control}; border: 1px solid {colors.border}; border-radius: 10px; padding: 7px;
+        }}
+        QComboBox:disabled, QLineEdit:disabled {{ color: {colors.muted}; background: {colors.panel}; }}
+        QPlainTextEdit {{ selection-background-color: {colors.accent}; }}
+        QPushButton {{
+            background: {colors.control}; border: 1px solid {colors.border};
+            border-radius: 10px; padding: 7px 12px;
+        }}
+        QPushButton:hover {{ border-color: {colors.accent_focus}; }}
+        QDialog {{ background: {colors.window}; }}
+    """
+
+
+def _confirmation_style_sheet(dark: bool) -> str:
+    colors = _theme_colors(dark)
+    return f"""
+        QDialog {{ background: transparent; }}
+        #confirmationCard {{
+            background: {colors.card}; border: 1px solid {colors.border}; border-radius: 16px;
+        }}
+        #confirmationTitle {{ font-size: 14pt; font-weight: 650; }}
+        #confirmationMessage {{ color: {colors.muted}; font-size: 11pt; }}
+        #confirmationCancel, #confirmationConfirm {{
+            border-radius: 9px; padding: 7px 10px;
+        }}
+        #confirmationCancel {{ background: {colors.control}; border: 1px solid {colors.border}; }}
+        #confirmationCancel:hover {{ border-color: {colors.accent_focus}; }}
+        #confirmationConfirm {{ background: {colors.accent}; border: 1px solid {colors.accent}; color: white; }}
+        #confirmationConfirm:hover {{ background: {colors.accent_focus}; border-color: {colors.accent_focus}; }}
     """
 
 
@@ -1782,11 +1977,10 @@ def _read_text_file_preview(files: Sequence[str]) -> str | None:
 
 
 def _style_combo_popup(combo: QComboBox, dark: bool) -> None:
-    popup_background = "#242630" if dark else "#FFFFFF"
-    popup_hover = "#454957" if dark else "#E3E7F1"
-    text = "#F7F7FA" if dark else "#161821"
-    muted = "#8F93A3" if dark else "#8A8E9C"
-    border = "#484B58" if dark else "#D7DAE3"
+    colors = _theme_colors(dark)
+    popup_background = colors.popup
+    popup_hover = colors.hover
+    border = "#484E5E" if dark else "#D2D8E5"
     view = combo.view()
     container = view.window()
     container.setObjectName("comboPopup")
@@ -1803,48 +1997,114 @@ def _style_combo_popup(combo: QComboBox, dark: bool) -> None:
     palette.setColor(QPalette.ColorRole.Base, QColor(popup_background))
     palette.setColor(QPalette.ColorRole.AlternateBase, QColor(popup_background))
     palette.setColor(QPalette.ColorRole.Window, QColor(popup_background))
-    palette.setColor(QPalette.ColorRole.Text, QColor(text))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(text))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor("#5B6CFF"))
+    palette.setColor(QPalette.ColorRole.Text, QColor(colors.text))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(colors.text))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(colors.accent))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(muted))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(colors.muted))
     view.setStyleSheet(
-        f"QAbstractItemView {{ background: {popup_background}; color: {text}; "
+        f"QAbstractItemView {{ background: {popup_background}; color: {colors.text}; "
         "border: none; outline: none; padding: 2px; }"
         "QAbstractItemView::item { min-height: 28px; padding: 3px 8px; }"
-        f"QAbstractItemView::item:hover {{ background: {popup_hover}; color: {text}; }}"
-        "QAbstractItemView::item:selected { background: #5B6CFF; color: #FFFFFF; }"
-        f"QAbstractItemView::item:disabled {{ color: {muted}; }}"
+        f"QAbstractItemView::item:hover {{ background: {popup_hover}; color: {colors.text}; }}"
+        f"QAbstractItemView::item:selected {{ background: {colors.accent}; color: #FFFFFF; }}"
+        f"QAbstractItemView::item:disabled {{ color: {colors.muted}; }}"
     )
     # Apply the palette after QSS: some platform styles repolish the popup view
     # when a stylesheet is installed and otherwise restore the system accent.
     view.setPalette(palette)
 
 
+class _DestructiveConfirmationDialog(QDialog):
+    """Application-styled confirmation that avoids a platform QMessageBox."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        title: str,
+        text: str,
+        confirm_text: str,
+        *,
+        dark: bool,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setAccessibleName(title)
+        self.setModal(True)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedWidth(420)
+        self.setStyleSheet(_confirmation_style_sheet(dark))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 14)
+        card = QFrame()
+        card.setObjectName("confirmationCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(22, 20, 22, 18)
+        card_layout.setSpacing(8)
+        title_label = QLabel(title)
+        title_label.setObjectName("confirmationTitle")
+        message = QLabel(text)
+        message.setObjectName("confirmationMessage")
+        message.setWordWrap(True)
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(message)
+        card_layout.addSpacing(8)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch()
+        self.cancel_button = QPushButton("取消")
+        self.cancel_button.setObjectName("confirmationCancel")
+        self.confirm_button = QPushButton(confirm_text)
+        self.confirm_button.setObjectName("confirmationConfirm")
+        self.cancel_button.clicked.connect(self.reject)
+        self.confirm_button.clicked.connect(self.accept)
+        self.cancel_button.setDefault(True)
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.confirm_button)
+        card_layout.addLayout(buttons)
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(0, 0, 0, 72 if dark else 48))
+        card.setGraphicsEffect(shadow)
+        root.addWidget(card)
+
+
+def _confirm_destructive_action(
+    parent: QWidget,
+    title: str,
+    text: str,
+    confirm_text: str,
+    *,
+    dark: bool = False,
+) -> bool:
+    prompt = _DestructiveConfirmationDialog(parent, title, text, confirm_text, dark=dark)
+    return prompt.exec() == QDialog.DialogCode.Accepted
+
+
 def _compact_menu(menu: QMenu, *, dark: bool | None = None) -> None:
     if dark is None:
         dark = menu.palette().color(QPalette.ColorRole.Window).lightness() < 128
-    background = "#2B2E38" if dark else "#F7F7F8"
-    text = "#F7F7FA" if dark else "#161821"
-    disabled = "#858998" if dark else "#9699A3"
-    separator = "#4A4D59" if dark else "#D5D7DE"
-    hover_background = "#515665" if dark else "#CBD2E3"
+    colors = _theme_colors(dark)
+    disabled = "#9299A9" if dark else "#757C8D"
     menu.setStyleSheet(
-        f"QMenu {{ background: {background}; color: {text}; padding: 2px; }}"
-        "QMenu::item { padding: 5px 7px; border-radius: 4px; }"
-        f"QMenu::item:selected {{ background: {hover_background}; color: {text}; }}"
+        f"QMenu {{ background: {colors.menu}; color: {colors.text}; padding: 2px; }}"
+        "QMenu::item { padding: 5px 7px; border-radius: 6px; }"
+        f"QMenu::item:selected {{ background: {colors.menu_hover}; color: {colors.text}; }}"
         f"QMenu::item:disabled {{ color: {disabled}; }}"
-        f"QMenu::separator {{ background: {separator}; height: 1px; margin: 2px 4px; }}"
+        f"QMenu::separator {{ background: {colors.menu_separator}; height: 1px; margin: 2px 4px; }}"
     )
     text_width = max(
         (menu.fontMetrics().horizontalAdvance(action.text()) for action in menu.actions() if not action.isSeparator()),
         default=0,
     )
-    menu.setFixedWidth(max(68, text_width + 18))
+    menu.setFixedWidth(text_width + 10)
 
 
 def _hover_color(dark: bool) -> QColor:
-    return QColor(255, 255, 255, 24) if dark else QColor("#E7EAF1")
+    return QColor(_theme_colors(dark).hover)
 
 
 def _elide(painter: QPainter, text: str, width: int) -> str:

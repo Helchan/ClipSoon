@@ -15,7 +15,7 @@ from pathlib import Path
 from platformdirs import user_data_path
 from PySide6.QtCore import QLockFile, QObject, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QApplication, QDialog, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from clipsoon import __version__
 from clipsoon.core import (
@@ -380,35 +380,51 @@ class ClipSoonApplication(QObject):
         dialog.clear_requested.connect(self.clear_history)
         dialog.reveal_requested.connect(self.open_data_directory)
         dialog.accessibility_requested.connect(self.open_accessibility_settings)
-        accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        if accepted:
-            old = self.settings.value
-            values = dialog.values()
-            requested_launch_at_login = bool(values["launch_at_login"])
-            launch_message = ""
-            if requested_launch_at_login or requested_launch_at_login != old.launch_at_login:
-                success, launch_message = self.launch_at_login.set_enabled(requested_launch_at_login)
-                if not success:
-                    values["launch_at_login"] = old.launch_at_login
+        dialog.settings_changed.connect(lambda values: self._apply_settings(values, dialog))
+        dialog.exec()
+        self.panel.keep_open(False)
+
+    def _apply_settings(self, values: dict[str, object], dialog: SettingsDialog | None = None) -> None:
+        """Persist and activate a setting change made in the open dialog."""
+        old = self.settings.value
+        requested_launch_at_login = bool(values["launch_at_login"])
+        launch_message = ""
+        if requested_launch_at_login != old.launch_at_login:
+            success, launch_message = self.launch_at_login.set_enabled(requested_launch_at_login)
+            if not success:
+                values = {**values, "launch_at_login": old.launch_at_login}
+        try:
             new = self.settings.update(**values)
-            self.panel.apply_theme()
-            hotkey_changed = old.hotkey != new.hotkey
-            hotkey_restart_required = hotkey_changed or (
-                not PlatformBridge.is_windows()
-                and old.double_tap_interval_ms != new.double_tap_interval_ms
-            )
-            if hotkey_restart_required:
-                if PlatformBridge.is_windows() and hotkey_changed:
-                    self._pending_hotkey_rollback = self._confirmed_windows_hotkey or old
-                    self._pending_hotkey_candidate = new.hotkey
-                self.hotkey.start(new)
-            if old.capture_enabled != new.capture_enabled:
-                self.clipboard.sync_cursor()
+        except OSError as exc:
+            LOGGER.exception("Could not persist settings")
+            self.panel.set_status(f"无法保存设置：{exc}")
+            if dialog is not None:
+                dialog.apply_settings(old)
+            return
+
+        if dialog is not None:
+            dialog.apply_settings(new)
+        self.panel.apply_theme()
+        hotkey_changed = old.hotkey != new.hotkey
+        hotkey_restart_required = hotkey_changed or (
+            not PlatformBridge.is_windows()
+            and old.double_tap_interval_ms != new.double_tap_interval_ms
+        )
+        if hotkey_restart_required:
+            if PlatformBridge.is_windows() and hotkey_changed:
+                self._pending_hotkey_rollback = self._confirmed_windows_hotkey or old
+                self._pending_hotkey_candidate = new.hotkey
+            self.hotkey.start(new)
+        if old.capture_enabled != new.capture_enabled:
+            self.clipboard.sync_cursor()
+        if (
+            old.max_history_items != new.max_history_items
+            or old.retention_days != new.retention_days
+        ):
             self.repository.cleanup(new.max_history_items, new.retention_days)
             self._reload_history()
-            if launch_message:
-                self.panel.set_status(launch_message)
-        self.panel.keep_open(False)
+        if launch_message:
+            self.panel.set_status(launch_message)
 
     def _save_panel_position(self, x: int, y: int) -> None:
         if self.settings.value.panel_x == x and self.settings.value.panel_y == y:

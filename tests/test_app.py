@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 from clipsoon.app import ClipSoonApplication, _WindowsPanelGuard
 from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, JsonSettingsStore
 from clipsoon.system import ForegroundTargetHandle, HotkeyActivationContext, PlatformBridge
+from clipsoon.ui import SettingsDialog
 
 
 def test_windows_panel_guard_hides_on_first_outside_click_without_prior_activation() -> None:
@@ -41,6 +42,27 @@ def test_windows_panel_guard_keeps_inside_click_and_can_sync_ignored_input() -> 
     assert not guard.should_hide(foreground=101, primary_button_down=True, cursor_inside=False)
     assert not guard.should_hide(foreground=101, primary_button_down=False, cursor_inside=False)
     assert guard.should_hide(foreground=101, primary_button_down=True, cursor_inside=False)
+
+
+def test_settings_dialog_applies_changes_and_reset_without_a_save_step(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+    dialog = SettingsDialog(application.settings.value, accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.settings_changed.connect(lambda values: application._apply_settings(values, dialog))
+
+    dialog.theme.setCurrentIndex(dialog.theme.findData("dark"))
+    assert application.settings.value.theme == "dark"
+    assert JsonSettingsStore(tmp_path / "settings.json").load().theme == "dark"
+
+    dialog.maximum.setValue(800)
+    assert application.settings.value.max_history_items == 800
+
+    dialog.reset_button.click()
+    assert application.settings.value.theme == "system"
+    assert application.settings.value.max_history_items == 500
+    application.shutdown()
 
 
 @pytest.mark.parametrize(

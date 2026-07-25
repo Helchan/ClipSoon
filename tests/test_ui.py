@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFrame,
     QLabel,
     QMenu,
@@ -29,6 +30,7 @@ from clipsoon.ui import (
     _bucketed_size,
     _ByteLruCache,
     _compact_menu,
+    _DestructiveConfirmationDialog,
     _hotkey_display,
     _hover_color,
     _parse_hotkey,
@@ -140,6 +142,9 @@ def test_settings_and_custom_hotkey_validation(qtbot) -> None:
         for label in dialog.findChildren(QLabel)
     )
     assert not hasattr(dialog, "version_label")
+    assert dialog.close_button.text() == "关闭"
+    assert dialog.reset_button.text() == "重置"
+    assert not dialog.findChildren(QDialogButtonBox)
 
 
 def test_windows_settings_only_offer_registered_combo_and_hide_double_interval(
@@ -171,7 +176,7 @@ def test_windows_settings_only_offer_registered_combo_and_hide_double_interval(
         lambda _parent, _title, message: warnings.append(message),
     )
     dialog.custom_hotkey.clear()
-    dialog._validate_accept()
+    dialog._emit_hotkey_change()
     assert warnings == ["组合键必须包含 Ctrl/Shift/Alt/Command 和一个普通键。"]
     assert dialog.result() == QDialog.DialogCode.Rejected
     assert dialog.interval.isHidden()
@@ -230,6 +235,9 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
         controls.insert(0, dialog.hotkey_mode)
     visible_controls = [control for control in controls if not control.isHidden()]
     assert len({control.width() for control in visible_controls}) == 1
+    assert dialog.close_button.geometry().left() < dialog.reset_button.geometry().left()
+    assert "主题" in [label.text() for label in dialog.findChildren(QLabel, "settingsFieldLabel")]
+    assert "外观" not in [label.text() for label in dialog.findChildren(QLabel, "settingsFieldLabel")]
 
 
 def test_state_memory_setting_is_an_optional_three_second_default(qtbot) -> None:
@@ -244,6 +252,39 @@ def test_state_memory_setting_is_an_optional_three_second_default(qtbot) -> None
     assert dialog.selection_memory.isEnabled()
     assert dialog.values()["remember_selection"] is True
     assert dialog.values()["selection_memory_seconds"] == 3
+
+
+def test_settings_changes_and_reset_are_emitted_immediately(qtbot) -> None:
+    dialog = SettingsDialog(
+        AppSettings(theme="light", max_history_items=750, capture_enabled=False),
+        accessibility_granted=True,
+    )
+    qtbot.addWidget(dialog)
+    changes: list[dict[str, object]] = []
+    dialog.settings_changed.connect(changes.append)
+
+    dialog.theme.setCurrentIndex(dialog.theme.findData("dark"))
+    assert changes[-1]["theme"] == "dark"
+
+    dialog.reset_button.click()
+    assert changes[-1]["theme"] == "system"
+    assert changes[-1]["max_history_items"] == 500
+    assert changes[-1]["capture_enabled"] is True
+
+
+def test_destructive_confirmation_uses_the_clipsoon_dialog(qtbot) -> None:
+    parent = QLabel()
+    qtbot.addWidget(parent)
+    dialog = _DestructiveConfirmationDialog(parent, "清空历史", "确认清空？", "确定", dark=False)
+    qtbot.addWidget(dialog)
+
+    assert dialog.windowFlags() & Qt.WindowType.FramelessWindowHint
+    assert dialog.cancel_button.text() == "取消"
+    assert dialog.confirm_button.text() == "确定"
+    assert dialog.cancel_button.isDefault()
+    assert dialog.findChild(QFrame, "confirmationCard") is not None
+    assert "min-width" not in dialog.styleSheet()
+    assert "padding: 7px 10px" in dialog.styleSheet()
 
 
 def test_launch_at_login_setting_round_trips_through_dialog(qtbot) -> None:
@@ -267,13 +308,13 @@ def test_dark_settings_combo_popups_use_readable_theme_colors(qtbot) -> None:
             continue
         view = combo.view()
         palette = view.palette()
-        assert palette.color(QPalette.ColorRole.Base) == QColor("#242630")
-        assert palette.color(QPalette.ColorRole.Text) == QColor("#F7F7FA")
-        assert "background: #242630" in view.styleSheet()
-        assert "color: #F7F7FA" in view.styleSheet()
-        assert "background: #5B6CFF; color: #FFFFFF" in view.styleSheet()
-        assert "background: #242630" in view.window().styleSheet()
-        assert view.window().palette().color(QPalette.ColorRole.Window) == QColor("#242630")
+        assert palette.color(QPalette.ColorRole.Base) == QColor("#292D39")
+        assert palette.color(QPalette.ColorRole.Text) == QColor("#F2F4F8")
+        assert "background: #292D39" in view.styleSheet()
+        assert "color: #F2F4F8" in view.styleSheet()
+        assert "background: #5264E8; color: #FFFFFF" in view.styleSheet()
+        assert "background: #292D39" in view.window().styleSheet()
+        assert view.window().palette().color(QPalette.ColorRole.Window) == QColor("#292D39")
 
     dialog.theme.showPopup()
     qtbot.waitUntil(dialog.theme.view().isVisible, timeout=500)
@@ -281,7 +322,7 @@ def test_dark_settings_combo_popups_use_readable_theme_colors(qtbot) -> None:
     rendered = popup.viewport().grab().toImage()
     normal_rect = popup.visualRect(popup.model().index(0, 0))
     sample_x = rendered.width() - 5
-    assert rendered.pixelColor(sample_x, normal_rect.center().y()) == QColor("#242630")
+    assert rendered.pixelColor(sample_x, normal_rect.center().y()) == QColor("#292D39")
 
 
 def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -> None:
@@ -292,8 +333,8 @@ def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -
         if combo is None:
             continue
         palette = combo.view().palette()
-        assert palette.color(QPalette.ColorRole.Base) == QColor("#FFFFFF")
-        assert palette.color(QPalette.ColorRole.Text) == QColor("#161821")
+        assert palette.color(QPalette.ColorRole.Base) == QColor("#FAFBFE")
+        assert palette.color(QPalette.ColorRole.Text) == QColor("#171A24")
 
 
 def test_open_data_directory_closes_settings_before_emitting(qtbot, monkeypatch) -> None:
@@ -346,6 +387,17 @@ def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
     assert information_title.font().pointSizeF() == 13
     assert panel.info_type_label.font().pointSizeF() == 13
     assert panel.info_type_value.font().pointSizeF() == 13
+    assert panel.information_divider.frameShape() == QFrame.Shape.NoFrame
+    assert panel.info_type_label.font().weight() == panel.info_type_value.font().weight()
+    assert panel.info_detail_label.font().weight() == panel.info_detail_value.font().weight()
+    style = _style_sheet(False)
+    assert "#informationLabel, #informationValue" in style
+    assert "color: #62697A; font-size: 13pt; font-weight: 500;" in style
+    assert (
+        "#informationDivider {\n            background: rgba(45, 53, 76, 18); "
+        "margin: 3px 8px 1px; min-height: 1px; max-height: 1px;\n        }" in style
+    )
+    assert "#informationTitle { font-size: 13pt; font-weight: 650; padding: 6px 0 0 0; }" in style
     assert panel.search_icon.size() == QSize(30, 30)
     text_height = panel.search.fontMetrics().tightBoundingRect("Ag").height()
     assert panel.search_box.height() == text_height * 2 + 4
@@ -1103,10 +1155,10 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
 
     _compact_menu(menu)
 
-    expected = max(68, menu.fontMetrics().horizontalAdvance("删除所选") + 18)
+    expected = menu.fontMetrics().horizontalAdvance("删除所选") + 10
     assert menu.width() == expected
     assert "QMenu::item:selected" in menu.styleSheet()
-    assert "background: #CBD2E3" in menu.styleSheet()
+    assert "background: #E0E6F3" in menu.styleSheet()
 
     menu.show()
     qtbot.waitExposed(menu)
@@ -1115,9 +1167,9 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     qtbot.wait(20)
 
     rendered = menu.grab().toImage()
-    background_sample = QPoint(action_rect.right() - 4, action_rect.center().y())
+    background_sample = QPoint(rendered.width() - 4, action_rect.center().y())
     assert menu.activeAction() is delete_action
-    assert rendered.pixelColor(background_sample) == QColor("#CBD2E3")
+    assert rendered.pixelColor(background_sample) == QColor("#E0E6F3")
 
 
 def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
@@ -1130,10 +1182,10 @@ def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     _compact_menu(menu, dark=True)
 
     style = menu.styleSheet()
-    assert "background: #2B2E38" in style
-    assert "color: #F7F7FA" in style
-    assert "background: #515665" in style
-    assert "background: #4A4D59" in style
+    assert "background: #2A2F3B" in style
+    assert "color: #F2F4F8" in style
+    assert "background: #444B5C" in style
+    assert "background: #454C5C" in style
 
 
 def test_filter_and_list_background_align_with_bordered_search(qtbot) -> None:
@@ -1185,7 +1237,7 @@ def test_hover_background_is_visible_but_weaker_than_selection(qtbot) -> None:
     rendered = panel.list.viewport().grab().toImage()
     sample_at = panel.list.visualRect(second).center()
     sample_at.setX(panel.list.visualRect(second).right() - 10)
-    assert hover != QColor("#5B6CFF")
+    assert hover != QColor("#5264E8")
     assert hover != panel.palette().color(panel.backgroundRole())
     assert hovered_row == 1
     assert rendered.pixelColor(sample_at) == hover
@@ -1195,3 +1247,18 @@ def test_hover_background_is_visible_but_weaker_than_selection(qtbot) -> None:
     qtbot.mouseMove(panel.list.viewport(), blank)
     qtbot.wait(20)
     assert panel.list.itemDelegate().hovered_row == -1
+
+
+def test_dark_list_thumbnails_use_the_dark_surface_token(qtbot) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme="dark"))
+    qtbot.addWidget(panel)
+    panel.set_items([clip("selected", "selected", 2), clip("unselected", "unselected", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    row = panel.model.index(1)
+    thumbnail = ClipDelegate._thumbnail_rect(panel.list.visualRect(row))
+    rendered = panel.list.viewport().grab().toImage()
+    background_sample = QPoint(thumbnail.right() - 3, thumbnail.bottom() - 3)
+
+    assert rendered.pixelColor(background_sample) == QColor("#343A48")
