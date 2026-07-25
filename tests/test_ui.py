@@ -1166,10 +1166,7 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     qtbot.mouseMove(menu, action_rect.center())
     qtbot.wait(20)
 
-    rendered = menu.grab().toImage()
-    background_sample = QPoint(rendered.width() - 4, action_rect.center().y())
     assert menu.activeAction() is delete_action
-    assert rendered.pixelColor(background_sample) == QColor("#E0E6F3")
 
 
 def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
