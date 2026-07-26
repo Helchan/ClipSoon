@@ -1496,6 +1496,10 @@ class SettingsDialog(QDialog):
         _install_app_owned_caret_style()
         super().__init__(parent)
         self._updating_controls = False
+        # A QKeySequenceEdit can emit ``editingFinished`` while Qt tears down
+        # a focused editor.  That is not a user edit and must never create a
+        # modal validation prompt while this dialog is closing.
+        self._closing = False
         self._theme_settings = settings
         self._native_backdrop_active = False
         self._appearance = _theme_appearance(settings)
@@ -1829,7 +1833,7 @@ class SettingsDialog(QDialog):
         self._emit_hotkey_change()
 
     def _emit_hotkey_change(self) -> None:
-        if self._updating_controls:
+        if self._updating_controls or self._closing:
             return
         recorded = self.custom_hotkey.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
         custom = (
@@ -1855,6 +1859,16 @@ class SettingsDialog(QDialog):
             )
             return
         self._emit_settings_changed()
+
+    def done(self, result: int) -> None:
+        """Mark teardown before child editors can emit late focus signals."""
+
+        self._closing = True
+        super().done(result)
+
+    def closeEvent(self, event) -> None:
+        self._closing = True
+        super().closeEvent(event)
 
     def _emit_settings_changed(self, *_args: object) -> None:
         if not self._updating_controls:

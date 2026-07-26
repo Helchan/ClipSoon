@@ -2424,6 +2424,27 @@ def test_settings_text_editors_use_the_same_app_owned_blinking_caret(qtbot, them
     assert_editor_tokens()
 
 
+def test_windows_settings_close_ignores_late_empty_hotkey_editing_finished(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        ui_module,
+        "_show_themed_warning",
+        lambda _parent, title, *_args, **_kwargs: warnings.append(title),
+    )
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    dialog.close()
+    dialog.custom_hotkey.setKeySequence(QKeySequence())
+    dialog._emit_hotkey_change()
+
+    assert dialog._closing
+    assert warnings == []
+
+
 def test_empty_action_and_closed_context_menu_restore_the_permanent_search_focus(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
