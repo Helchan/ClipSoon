@@ -585,7 +585,6 @@ class _ThemedTextCaret(QObject):
 
     def __init__(self, editor: QLineEdit, *, focus_owner: QWidget | None = None) -> None:
         super().__init__(editor)
-        _install_app_owned_caret_style()
         self._editor = editor
         self._focus_owner = focus_owner if focus_owner is not None else editor
         self._window = editor.window()
@@ -597,6 +596,7 @@ class _ThemedTextCaret(QObject):
         self._sync_timer = QTimer(self)
         self._sync_timer.setSingleShot(True)
         self._sync_timer.timeout.connect(self._refresh)
+        _install_app_owned_caret_style()
 
         # The global proxy sees this marker while QLineEdit paints.  That
         # removes the native white caret for both visible and hidden phases.
@@ -640,15 +640,20 @@ class _ThemedTextCaret(QObject):
             self._sync_timer.start(0)
 
     def _should_draw(self) -> bool:
+        editor = getattr(self, "_editor", None)
+        focus_owner = getattr(self, "_focus_owner", None)
+        window = getattr(self, "_window", None)
+        if editor is None or focus_owner is None or window is None:
+            return False
         if (
             self._ime_composing
-            or not self._editor.isVisible()
-            or not self._editor.isEnabled()
-            or self._editor.isReadOnly()
-            or not (self._editor.hasFocus() or self._focus_owner.hasFocus())
+            or not editor.isVisible()
+            or not editor.isEnabled()
+            or editor.isReadOnly()
+            or not (editor.hasFocus() or focus_owner.hasFocus())
         ):
             return False
-        return self._window.isActiveWindow()
+        return window.isActiveWindow()
 
     def _refresh(self) -> None:
         if not self._should_draw():
@@ -662,7 +667,11 @@ class _ThemedTextCaret(QObject):
             self._overlay.hide()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self._editor and event.type() == QEvent.Type.InputMethod:
+        editor = getattr(self, "_editor", None)
+        blink_timer = getattr(self, "_blink_timer", None)
+        if editor is None or blink_timer is None:
+            return False
+        if watched is editor and event.type() == QEvent.Type.InputMethod:
             input_event = event if isinstance(event, QInputMethodEvent) else None
             self._ime_composing = bool(input_event and input_event.preeditString())
             self._restart_blink()
