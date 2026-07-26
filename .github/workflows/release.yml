@@ -10,7 +10,8 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  # A corrected re-push of one release tag supersedes a stalled prior run.
+  cancel-in-progress: true
 
 jobs:
   validate-version:
@@ -69,12 +70,16 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\python.exe -m pip install -e ".[dev,package]"
 
-      - name: Verify Windows source
+      - name: Lint Windows source
         shell: pwsh
         run: |
           .\.venv\Scripts\python.exe -m ruff check .
+
+      - name: Verify Windows source
+        shell: pwsh
+        run: |
           $env:QT_QPA_PLATFORM = "offscreen"
-          .\.venv\Scripts\python.exe -m pytest -q
+          .\.venv\Scripts\python.exe -m pytest -vv --durations=20 --timeout=90 --timeout-method=thread
 
       - name: Build Windows package
         shell: pwsh

@@ -17,8 +17,10 @@ def test_release_version_is_consistent() -> None:
 
 def test_tag_release_workflow_builds_requested_platforms() -> None:
     workflow = (PROJECT_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert 'tags:\n      - "v*"' in workflow
+    assert "cancel-in-progress: true" in workflow
     assert "runs-on: windows-latest" in workflow
     assert "timeout-minutes: 30" in workflow
     assert "architecture: x64" in workflow
@@ -30,6 +32,9 @@ def test_tag_release_workflow_builds_requested_platforms() -> None:
     assert "contents: write" in workflow
     assert "gh release create" in workflow
     assert "scripts\\smoke_windows_helpers.py dist\\ClipSoon\\ClipSoon.exe" in workflow
+    assert "- name: Lint Windows source" in workflow
+    assert "pytest -vv --durations=20 --timeout=90 --timeout-method=thread" in workflow
+    assert "pytest-timeout>=2.3,<3" in project["project"]["optional-dependencies"]["dev"]
 
 
 def test_windows_helper_smoke_uses_only_registered_combo_hotkeys() -> None:
