@@ -101,14 +101,20 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
     assert observed == [value]
     unsubscribe()
     settings.update(theme="not-a-theme", hotkey="bad")
-    assert settings.value.theme == "system"
+    assert settings.value.theme == "liquid_glass"
     assert settings.value.hotkey == "double:ctrl"
 
 
-def test_liquid_glass_theme_is_a_valid_persisted_setting(tmp_path: Path) -> None:
+def test_frosted_material_theme_is_the_default_and_legacy_system_migrates(
+    tmp_path: Path,
+) -> None:
     store = JsonSettingsStore(tmp_path / "settings.json")
-    store.save(AppSettings(theme="liquid_glass"))
+    legacy = tmp_path / "settings.json"
+    legacy.write_text('{"theme": "system"}\n', encoding="utf-8")
 
+    assert AppSettings().theme == "liquid_glass"
+    assert store.load().theme == "liquid_glass"
+    store.save(AppSettings(theme="liquid_glass"))
     assert store.load().theme == "liquid_glass"
     assert AppSettings(theme="liquid_glass").validated().theme == "liquid_glass"
 

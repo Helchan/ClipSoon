@@ -396,6 +396,10 @@ class ClipSoonApplication(QObject):
         self.panel.set_status(f"已移除 {len(removed_ids)} 条源文件不存在的记录")
 
     def show_settings(self) -> None:
+        if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            self._settings_dialog.raise_()
+            self._settings_dialog.activateWindow()
+            return
         self.panel.keep_open(True)
         dialog = SettingsDialog(
             self.settings.value,
@@ -408,22 +412,30 @@ class ClipSoonApplication(QObject):
         dialog.settings_changed.connect(lambda values: self._apply_settings(values, dialog))
         dialog.native_window_shown.connect(lambda: self._sync_new_native_window(dialog))
         self._settings_dialog = dialog
-        try:
-            dialog.exec()
-        finally:
+
+        def settings_finished() -> None:
+            if self._settings_dialog is not dialog:
+                return
             if sys.platform == "darwin":
-                # A modal dialog's Qt NSView can be torn down after ``exec``.  Its
-                # sibling effect must not outlive that view in the parent hierarchy.
+                # The dialog's Qt NSView can be torn down after close. Its
+                # sibling effect must not outlive that view in the parent
+                # hierarchy.
                 self._macos_backdrop.remove(int(dialog.winId()))
             self._settings_dialog = None
             self.panel.keep_open(False)
-            # Modal teardown can briefly leave the command panel without a
+            # Dialog teardown can briefly leave the command panel without a
             # focus widget or inactive behind its just-dismissed child. Restore
             # its permanent typing target after the dialog closes; a second,
-            # short delayed pass wins over the platform's deferred modal-focus
-            # restoration on Windows.
+            # short delayed pass wins over the platform's deferred focus
+            # restoration.
             self._restore_panel_search_focus()
             self._settings_focus_restore_timer.start(35)
+            dialog.deleteLater()
+
+        dialog.finished.connect(settings_finished)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _restore_panel_search_focus(self) -> None:
         if self.panel.isVisible() and QApplication.activeModalWidget() is None:
@@ -480,6 +492,18 @@ class ClipSoonApplication(QObject):
             elif was_active:
                 PlatformBridge.clear_windows_desktop_acrylic(window_id)
         elif sys.platform == "darwin":
+            qt_app = QApplication.instance()
+            platform_name = (
+                qt_app.platformName().casefold()
+                if isinstance(qt_app, QApplication)
+                else ""
+            )
+            if (
+                platform_name in {"offscreen", "minimal"}
+                and isinstance(self._macos_backdrop, MacosBackdropController)
+            ):
+                window.set_native_backdrop_active(False)
+                return
             window_id = int(window.winId())
             if window.uses_liquid_glass_theme():
                 # Keep the visible material card exactly aligned with the
@@ -766,6 +790,9 @@ class ClipSoonApplication(QObject):
             self._system_theme_signals_connected = False
         self.hotkey.stop()
         self.clipboard.stop()
+        if self._settings_dialog is not None:
+            self._settings_dialog.close()
+            self._settings_dialog = None
         if sys.platform == "darwin":
             self._macos_backdrop.remove(int(self.panel.winId()))
         QThreadPool.globalInstance().waitForDone(3_000)

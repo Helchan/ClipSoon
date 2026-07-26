@@ -4,7 +4,7 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import QRunnable, Qt, QThreadPool, QTimer
+from PySide6.QtCore import QRunnable, Qt, QThreadPool
 from PySide6.QtWidgets import QApplication
 
 import clipsoon.app as app_module
@@ -61,7 +61,7 @@ def test_settings_dialog_applies_changes_and_reset_without_a_save_step(qtbot, tm
     assert application.settings.value.max_history_items == 800
 
     dialog.reset_button.click()
-    assert application.settings.value.theme == "system"
+    assert application.settings.value.theme == "liquid_glass"
     assert application.settings.value.max_history_items == 500
     application.shutdown()
 
@@ -74,16 +74,18 @@ def test_closing_settings_returns_focus_to_the_permanent_search_target(qtbot, tm
     qtbot.waitExposed(application.panel)
     application.panel.search.clearFocus()
 
-    def close_active_modal() -> None:
-        modal = QApplication.activeModalWidget()
-        assert modal is not None
-        modal.reject()
-
-    QTimer.singleShot(0, close_active_modal)
     application.show_settings()
+    dialog = application._settings_dialog
+    assert dialog is not None
+    assert QApplication.activeModalWidget() is None
+    assert application.panel._keep_open
 
+    dialog.reject()
+
+    qtbot.waitUntil(lambda: application._settings_dialog is None, timeout=500)
     qtbot.waitUntil(application.panel.search.hasFocus, timeout=500)
     assert not application.panel.search_icon.hasFocus()
+    assert not application.panel._keep_open
     application.shutdown()
 
 
@@ -92,7 +94,7 @@ def test_windows_settings_close_reactivates_panel_before_restoring_search_focus(
     tmp_path,
     monkeypatch,
 ) -> None:
-    """Windows restores a closed dialog's child focus after ``exec()`` returns."""
+    """Windows needs the panel reactivated after the settings window closes."""
 
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)
@@ -101,28 +103,45 @@ def test_windows_settings_close_reactivates_panel_before_restoring_search_focus(
     qtbot.waitExposed(application.panel)
     original_platform = app_module.sys.platform
 
-    def close_active_modal() -> None:
-        modal = QApplication.activeModalWidget()
-        if modal is None:
-            QTimer.singleShot(0, close_active_modal)
-            return
-        modal.reject()
-
     try:
         # Instantiate the app using the local platform, then exercise the
         # Windows-only settings shell. This avoids creating a real Windows
         # clipboard worker on the non-Windows test host.
         monkeypatch.setattr(app_module.sys, "platform", "win32")
         application.panel.search.clearFocus()
-        QTimer.singleShot(0, close_active_modal)
         application.show_settings()
+        dialog = application._settings_dialog
+        assert dialog is not None
+        assert QApplication.activeModalWidget() is None
 
+        dialog.reject()
+
+        qtbot.waitUntil(lambda: application._settings_dialog is None, timeout=500)
         qtbot.waitUntil(application.panel.search.hasFocus, timeout=500)
         assert application.panel.isActiveWindow()
         assert QApplication.focusWidget() is application.panel.search
     finally:
         monkeypatch.setattr(app_module.sys, "platform", original_platform)
         application.shutdown()
+
+
+def test_show_settings_reuses_existing_non_blocking_window(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+
+    application.show_settings()
+    first = application._settings_dialog
+    assert first is not None
+    assert first.isVisible()
+    assert QApplication.activeModalWidget() is None
+
+    application.show_settings()
+
+    assert application._settings_dialog is first
+    first.reject()
+    qtbot.waitUntil(lambda: application._settings_dialog is None, timeout=500)
+    application.shutdown()
 
 
 def test_clear_current_tab_history_preserves_other_kinds(qtbot, tmp_path) -> None:
@@ -151,7 +170,7 @@ def test_clear_current_tab_history_preserves_other_kinds(qtbot, tmp_path) -> Non
     application.shutdown()
 
 
-@pytest.mark.parametrize("theme", ("system", "liquid_glass"))
+@pytest.mark.parametrize("theme", ("liquid_glass",))
 def test_system_appearance_signals_refresh_dynamic_theme_and_open_settings_dialog(
     qtbot,
     tmp_path,

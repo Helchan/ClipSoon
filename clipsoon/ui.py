@@ -54,6 +54,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QRadialGradient,
+    QRegion,
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -208,7 +209,7 @@ _LIGHT_COLORS = _ThemeColors(
     accent_focus="#6677F5",
     hover="#E3E8F4",
     thumbnail="#E7EBF5",
-    popup="#FAFBFE",
+    popup="#EEF2F8",
     menu="#F8F9FD",
     menu_hover="#E0E6F3",
     menu_separator="#D5DAE5",
@@ -231,6 +232,13 @@ _DARK_COLORS = _ThemeColors(
     menu_separator="#454C5C",
 )
 
+_SETTINGS_THEME_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("磨砂质感（随系统）", "liquid_glass"),
+    ("浅色", "light"),
+    ("深色", "dark"),
+)
+_SETTINGS_THEME_KEYS = {key for _, key in _SETTINGS_THEME_OPTIONS}
+
 _GLASS_LIGHT_FALLBACK_COLORS = _ThemeColors(
     window="#EEF4FF",
     card="rgba(247, 251, 255, 248)",
@@ -243,7 +251,7 @@ _GLASS_LIGHT_FALLBACK_COLORS = _ThemeColors(
     accent_focus="#3D78EE",
     hover="#DCE9FC",
     thumbnail="#D6E4FA",
-    popup="#F9FBFF",
+    popup="#EAF2FA",
     menu="#F7FAFF",
     menu_hover="#DCE9FC",
     menu_separator="#C8D7EF",
@@ -277,7 +285,7 @@ _GLASS_LIGHT_NATIVE_COLORS = _ThemeColors(
     accent_focus="#3B78ED",
     hover="#D5E5FD",
     thumbnail="#CCDCF7",
-    popup="#F8FBFF",
+    popup="#EAF2F8",
     menu="#F7FAFF",
     menu_hover="#DCE9FC",
     menu_separator="#C8D7EF",
@@ -335,6 +343,10 @@ def _theme_colors(theme: bool | _ThemeAppearance) -> _ThemeColors:
     return _GLASS_DARK_FALLBACK_COLORS if appearance.dark else _GLASS_LIGHT_FALLBACK_COLORS
 
 
+def _settings_theme_key(theme: str) -> str:
+    return theme if theme in _SETTINGS_THEME_KEYS else "liquid_glass"
+
+
 def _surface_divider_token(appearance: _ThemeAppearance) -> tuple[str, QColor]:
     """Return the shared quiet divider in QSS and painter forms."""
 
@@ -379,8 +391,24 @@ def _accent_foreground(appearance: _ThemeAppearance) -> str:
 _APP_OWNED_CARET_PROPERTY = "_clipsoon_app_owned_caret"
 _APP_OWNED_CARET_STYLE: _AppOwnedCaretStyle | None = None
 _COMPACT_MENU_PROPERTY = "_clipsoon_compact_menu"
+_COMPACT_MENU_HAS_ICONS_PROPERTY = "_clipsoon_compact_menu_has_icons"
 _COMPACT_MENU_ICON_SIZE = 14
 _COMPACT_MENU_ICON_GAP = 6
+_COMPACT_MENU_HORIZONTAL_INSET = 10
+_COMPACT_MENU_VERTICAL_INSET = 5
+_COMPACT_MENU_CORNER_RADIUS = 10
+_POPUP_ITEM_FONT_SIZE_PT = 12
+_SETTINGS_TITLE_FONT_SIZE_PT = 13
+_SETTINGS_SECTION_FONT_SIZE_PT = 12
+_SETTINGS_CONTROL_FONT_SIZE_PT = 12
+_SETTINGS_LABEL_FONT_SIZE_PT = 11
+_SETTINGS_HELP_FONT_SIZE_PT = 10
+_SETTINGS_CHECKBOX_INDICATOR_SIZE = 13
+_SETTINGS_CONTROL_MIN_HEIGHT = 34
+_SETTINGS_LABEL_COLUMN_WIDTH = 112
+_SETTINGS_FORM_COLUMN_GAP = 14
+_SETTINGS_CHECKBOX_ROW_HEIGHT = 26
+_SETTINGS_EXTERNAL_DISMISS_POLL_MS = 25
 
 
 class _AppOwnedCaretStyle(QProxyStyle):
@@ -396,7 +424,7 @@ class _AppOwnedCaretStyle(QProxyStyle):
         if (
             metric == QStyle.PixelMetric.PM_SmallIconSize
             and isinstance(widget, QMenu)
-            and bool(widget.property(_COMPACT_MENU_PROPERTY))
+            and bool(widget.property(_COMPACT_MENU_HAS_ICONS_PROPERTY))
         ):
             # QMenu normally reserves a platform-sized icon gutter. The
             # contextual menu has a deliberately smaller 14 px icon column,
@@ -410,6 +438,45 @@ class _AppOwnedCaretStyle(QProxyStyle):
         ):
             return 0
         return super().pixelMetric(metric, option, widget)
+
+
+class _CompactMenuFrameFilter(QObject):
+    """Keep custom context menus physically rounded, not only stylesheet-rounded."""
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            isinstance(watched, QMenu)
+            and bool(watched.property(_COMPACT_MENU_PROPERTY))
+            and event.type() in {QEvent.Type.Show, QEvent.Type.Resize}
+        ):
+            _balance_compact_menu_action_margins(watched)
+            _apply_compact_menu_mask(watched)
+        return super().eventFilter(watched, event)
+
+
+def _apply_compact_menu_mask(menu: QMenu) -> None:
+    rect = menu.rect()
+    if rect.isEmpty():
+        return
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(rect), _COMPACT_MENU_CORNER_RADIUS, _COMPACT_MENU_CORNER_RADIUS)
+    menu.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+
+def _balance_compact_menu_action_margins(menu: QMenu) -> None:
+    """Compensate Qt's native action geometry so hover pills sit visually centered."""
+
+    action = next((candidate for candidate in menu.actions() if not candidate.isSeparator()), None)
+    if action is None:
+        return
+    rect = menu.actionGeometry(action)
+    if rect.isEmpty():
+        return
+    left_margin = rect.x()
+    right_margin = menu.width() - rect.x() - rect.width()
+    if left_margin <= right_margin:
+        return
+    menu.setFixedWidth(menu.width() + left_margin - right_margin)
 
 
 def _install_app_owned_caret_style(qt_app: QApplication | None = None) -> None:
@@ -914,16 +981,16 @@ class _SettingsCheckBox(QCheckBox):
         painter = QPainter(self)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        bounds = QRectF(indicator).adjusted(0.65, 0.65, -0.65, -0.65)
+        bounds = QRectF(indicator).adjusted(0.55, 0.55, -0.55, -0.55)
         painter.setBrush(fill)
-        painter.setPen(QPen(border, 1.15))
-        painter.drawRoundedRect(bounds, 3.5, 3.5)
+        painter.setPen(QPen(border, 1.0))
+        painter.drawRoundedRect(bounds, 3.0, 3.0)
 
         if checked:
             check_color = QColor(_accent_foreground(self._appearance))
             if not enabled:
                 check_color.setAlpha(165)
-            check_pen = QPen(check_color, 1.9)
+            check_pen = QPen(check_color, 1.55)
             check_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             check_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(check_pen)
@@ -938,7 +1005,7 @@ class _SettingsCheckBox(QCheckBox):
         elif partially_checked:
             dash_color = QColor(colors.text)
             dash_color.setAlpha(210 if enabled else 130)
-            dash_pen = QPen(dash_color, 1.7)
+            dash_pen = QPen(dash_color, 1.35)
             dash_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(dash_pen)
             painter.drawLine(
@@ -1464,21 +1531,26 @@ class ImagePreview(QLabel):
     def _render(self) -> None:
         if not self._path or self.width() < 20 or self.height() < 20:
             return
-        bounds = QSize(max(1, self.width() - 20), max(1, self.height() - 20))
-        decode_bounds = _bucketed_size(bounds)
+        logical_bounds = QSize(max(1, self.width() - 20), max(1, self.height() - 20))
+        device_scale = max(1.0, float(self.devicePixelRatioF()))
+        physical_bounds = _scaled_size(logical_bounds, device_scale)
+        decode_bounds = _bucketed_size(physical_bounds)
         image = self._image_loader.request(self._path, decode_bounds, keep_aspect=True)
         if image is None:
             return
         if image.isNull():
             self.setText("无法预览图片")
             return
-        self.setPixmap(
-            QPixmap.fromImage(image).scaled(
-                bounds,
+        pixmap = QPixmap.fromImage(image)
+        display_size = _fit_image_size(pixmap.size(), physical_bounds, allow_upscale=False)
+        if display_size != pixmap.size():
+            pixmap = pixmap.scaled(
+                display_size,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-        )
+        pixmap.setDevicePixelRatio(device_scale)
+        self.setPixmap(pixmap)
 
     def _image_loaded(self, key: ImageLoadKey, image: QImage) -> None:
         if key[0] == self._path:
@@ -1529,12 +1601,17 @@ class SettingsDialog(QDialog):
         self._closing = False
         self._theme_settings = settings
         self._native_backdrop_active = False
+        self._external_dismiss_filter_installed = False
+        self._external_dismiss_armed = False
+        self._external_dismiss_timer = QTimer(self)
+        self._external_dismiss_timer.setInterval(_SETTINGS_EXTERNAL_DISMISS_POLL_MS)
+        self._external_dismiss_timer.timeout.connect(self._poll_external_dismiss)
         self._appearance = _theme_appearance(settings)
         self._dark_theme = self._appearance.dark
         self.setObjectName("settingsDialog")
         self.setWindowTitle("ClipSoon 设置")
         self.setAccessibleName("ClipSoon 设置")
-        self.setModal(True)
+        self.setModal(False)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setFixedWidth(580)
         if sys.platform == "win32":
@@ -1555,8 +1632,8 @@ class SettingsDialog(QDialog):
             )
         )
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 12, 18, 14)
-        layout.setSpacing(6)
+        layout.setContentsMargins(18, 10, 18, 12)
+        layout.setSpacing(4)
 
         header = QHBoxLayout()
         header.setContentsMargins(2, 0, 0, 0)
@@ -1571,8 +1648,8 @@ class SettingsDialog(QDialog):
             frame = QFrame()
             frame.setObjectName("settingsSection")
             section_layout = QVBoxLayout(frame)
-            section_layout.setContentsMargins(14, 7, 14, 7)
-            section_layout.setSpacing(5)
+            section_layout.setContentsMargins(14, 6, 14, 6)
+            section_layout.setSpacing(3)
             section_title = QLabel(title_text)
             section_title.setObjectName("settingsSectionTitle")
             section_layout.addWidget(section_title)
@@ -1581,9 +1658,9 @@ class SettingsDialog(QDialog):
         def form_grid() -> QGridLayout:
             grid = QGridLayout()
             grid.setContentsMargins(0, 0, 0, 0)
-            grid.setHorizontalSpacing(14)
-            grid.setVerticalSpacing(4)
-            grid.setColumnMinimumWidth(0, 104)
+            grid.setHorizontalSpacing(_SETTINGS_FORM_COLUMN_GAP)
+            grid.setVerticalSpacing(2)
+            grid.setColumnMinimumWidth(0, _SETTINGS_LABEL_COLUMN_WIDTH)
             grid.setColumnStretch(1, 1)
             return grid
 
@@ -1591,7 +1668,7 @@ class SettingsDialog(QDialog):
             label = QLabel(text)
             label.setObjectName("settingsFieldLabel")
             label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            control.setMinimumHeight(32)
+            control.setMinimumHeight(_SETTINGS_CONTROL_MIN_HEIGHT)
             control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             grid.addWidget(label, row, 0)
             grid.addWidget(control, row, 1)
@@ -1652,11 +1729,9 @@ class SettingsDialog(QDialog):
         add_row(history_form, 2, "恢复等待", self.delay)
 
         self.theme = QComboBox()
-        self.theme.addItem("跟随系统", "system")
-        self.theme.addItem("浅色", "light")
-        self.theme.addItem("深色", "dark")
-        self.theme.addItem("磨砂质感（随系统）", "liquid_glass")
-        self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
+        for label, value in _SETTINGS_THEME_OPTIONS:
+            self.theme.addItem(label, value)
+        self.theme.setCurrentIndex(max(0, self.theme.findData(_settings_theme_key(settings.theme))))
         add_row(history_form, 3, "主题", self.theme)
 
         # A QComboBox popup is a separate top-level window on macOS.  It does
@@ -1698,14 +1773,19 @@ class SettingsDialog(QDialog):
         # Native QCheckBox metrics differ enough across macOS scales that a
         # content-driven grid can place consecutive labels on top of one
         # another. Give this compact three-row group an explicit row rhythm.
-        checkbox_row_height = 23
+        checkbox_row_height = _SETTINGS_CHECKBOX_ROW_HEIGHT
         for checkbox in behavior_checkboxes:
             checkbox.setFixedHeight(checkbox_row_height)
             checkbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         behavior_options = QGridLayout()
-        behavior_options.setContentsMargins(118, 3, 0, 0)
+        behavior_options.setContentsMargins(
+            _SETTINGS_LABEL_COLUMN_WIDTH + _SETTINGS_FORM_COLUMN_GAP,
+            3,
+            0,
+            0,
+        )
         behavior_options.setHorizontalSpacing(18)
-        behavior_options.setVerticalSpacing(4)
+        behavior_options.setVerticalSpacing(2)
         behavior_options.setRowMinimumHeight(0, checkbox_row_height)
         behavior_options.setRowMinimumHeight(1, checkbox_row_height)
         behavior_options.setRowMinimumHeight(2, checkbox_row_height)
@@ -1723,7 +1803,7 @@ class SettingsDialog(QDialog):
         self.accessibility_button = None
         platform_message = ""
         if sys.platform == "darwin" and accessibility_granted is not True:
-            platform_message = "需要 macOS 辅助功能权限，才能监听全局快捷键并自动粘贴。"
+            platform_message = "需要辅助功能权限以监听快捷键并自动粘贴。"
         elif sys.platform == "win32":
             platform_message = (
                 "Windows 使用系统注册的组合快捷键，不使用双击修饰键监听。"
@@ -1733,8 +1813,8 @@ class SettingsDialog(QDialog):
             platform_note = QFrame()
             platform_note.setObjectName("platformNote")
             platform_layout = QHBoxLayout(platform_note)
-            platform_layout.setContentsMargins(10, 7, 10, 7)
-            platform_layout.setSpacing(8)
+            platform_layout.setContentsMargins(9, 5, 9, 5)
+            platform_layout.setSpacing(6)
             note = QLabel(platform_message)
             note.setWordWrap(True)
             platform_layout.addWidget(note, 1)
@@ -1891,11 +1971,105 @@ class SettingsDialog(QDialog):
         """Mark teardown before child editors can emit late focus signals."""
 
         self._closing = True
+        self._remove_external_dismiss_filter()
         super().done(result)
 
     def closeEvent(self, event) -> None:
         self._closing = True
+        self._remove_external_dismiss_filter()
         super().closeEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._remove_external_dismiss_filter()
+        super().hideEvent(event)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if self._closing or not self.isVisible() or self._has_active_popup_or_child_modal():
+            return super().eventFilter(watched, event)
+        event_type = event.type()
+        if (
+            event_type == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+            and event.key() == Qt.Key.Key_Escape
+        ):
+            self.reject()
+            return True
+        if event_type in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.NonClientAreaMouseButtonPress,
+        ) and isinstance(event, QMouseEvent):
+            global_pos = self._mouse_global_position(event)
+            if global_pos is not None and self._dismiss_for_external_point(global_pos):
+                return True
+        if event_type == QEvent.Type.ApplicationDeactivate:
+            self.reject()
+        return super().eventFilter(watched, event)
+
+    def _install_external_dismiss_filter(self) -> None:
+        if self._external_dismiss_filter_installed:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.installEventFilter(self)
+        self._external_dismiss_filter_installed = True
+        self._external_dismiss_armed = not bool(QApplication.mouseButtons())
+        self._external_dismiss_timer.start()
+
+    def _remove_external_dismiss_filter(self) -> None:
+        if not self._external_dismiss_filter_installed:
+            return
+        self._external_dismiss_timer.stop()
+        self._external_dismiss_armed = False
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+        self._external_dismiss_filter_installed = False
+
+    def _has_active_popup_or_child_modal(self) -> bool:
+        if QApplication.activePopupWidget() is not None:
+            return True
+        active_modal = QApplication.activeModalWidget()
+        return active_modal is not None and active_modal is not self
+
+    def _global_geometry(self) -> QRect:
+        return QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
+
+    def _mouse_global_position(self, event: QMouseEvent) -> QPoint | None:
+        with suppress(AttributeError):
+            return event.globalPosition().toPoint()
+        with suppress(AttributeError):
+            return event.globalPos()
+        return None
+
+    def _poll_external_dismiss(self) -> None:
+        self._poll_external_dismiss_state()
+
+    def _poll_external_dismiss_state(
+        self,
+        *,
+        buttons: object | None = None,
+        cursor_pos: QPoint | None = None,
+    ) -> bool:
+        if self._closing or not self.isVisible() or self._has_active_popup_or_child_modal():
+            return False
+        active_buttons = QApplication.mouseButtons() if buttons is None else buttons
+        if not bool(active_buttons):
+            self._external_dismiss_armed = True
+            return False
+        if not self._external_dismiss_armed:
+            return False
+        global_pos = QCursor.pos() if cursor_pos is None else cursor_pos
+        return self._dismiss_for_external_point(global_pos)
+
+    def _dismiss_for_external_point(self, global_pos: QPoint) -> bool:
+        if not self._external_dismiss_armed:
+            return False
+        if self._global_geometry().contains(global_pos):
+            return False
+        self.reject()
+        return True
 
     def _emit_settings_changed(self, *_args: object) -> None:
         if not self._updating_controls:
@@ -1921,7 +2095,7 @@ class SettingsDialog(QDialog):
             self.maximum.setValue(settings.max_history_items)
             self.retention.setValue(settings.retention_days)
             self.delay.setValue(settings.paste_delay_ms)
-            self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
+            self.theme.setCurrentIndex(max(0, self.theme.findData(_settings_theme_key(settings.theme))))
             self.capture.setChecked(settings.capture_enabled)
             self.paste.setChecked(settings.paste_after_selection)
             self.hide_on_deactivate_checkbox.setChecked(settings.hide_on_deactivate)
@@ -1994,6 +2168,7 @@ class SettingsDialog(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._install_external_dismiss_filter()
         self.native_window_shown.emit()
         QTimer.singleShot(0, self._focus_primary_setting)
 
@@ -3281,14 +3456,17 @@ def _style_sheet(
         #settingsDialog #platformNote {{
             background: {overlay}; border: 1px solid {settings_control_border}; border-radius: 10px;
         }}
-        #settingsWindowTitle {{ font-size: 12pt; font-weight: 650; }}
-        #settingsSubtitle {{ color: {colors.muted}; font-size: 9pt; }}
+        #settingsWindowTitle {{ font-size: {_SETTINGS_TITLE_FONT_SIZE_PT}pt; font-weight: 650; }}
+        #settingsSubtitle {{ color: {colors.muted}; font-size: {_SETTINGS_HELP_FONT_SIZE_PT}pt; }}
         #settingsSection {{ background: {settings_background}; border: {settings_border}; border-radius: 12px; }}
-        #settingsSectionTitle {{ font-size: 11pt; font-weight: 650; }}
-        #settingsFieldLabel {{ color: {colors.muted}; font-size: 9pt; }}
+        #settingsSectionTitle {{ font-size: {_SETTINGS_SECTION_FONT_SIZE_PT}pt; font-weight: 650; }}
+        #settingsFieldLabel {{
+            color: {colors.muted}; font-size: {_SETTINGS_LABEL_FONT_SIZE_PT}pt; font-weight: 500;
+        }}
         #settingsDialog QPlainTextEdit, #settingsDialog QLineEdit,
         #settingsDialog QKeySequenceEdit, #settingsDialog QComboBox, #settingsDialog QSpinBox {{
-            background: {overlay}; border: 1px solid {settings_control_border}; border-radius: 10px; padding: 7px;
+            background: {overlay}; border: 1px solid {settings_control_border}; border-radius: 10px; padding: 6px 8px;
+            font-size: {_SETTINGS_CONTROL_FONT_SIZE_PT}pt;
             selection-background-color: {colors.accent}; selection-color: {accent_foreground};
         }}
         #settingsDialog QPlainTextEdit:focus, #settingsDialog QLineEdit:focus,
@@ -3303,15 +3481,19 @@ def _style_sheet(
         #settingsDialog QKeySequenceEdit:disabled, #settingsDialog QSpinBox:disabled {{
             color: {colors.muted}; background: {colors.panel};
         }}
-        #settingsDialog QCheckBox {{ color: {colors.text}; }}
+        #settingsDialog QCheckBox {{
+            color: {colors.text}; spacing: 6px; font-size: {_SETTINGS_CONTROL_FONT_SIZE_PT}pt;
+        }}
         #settingsDialog QCheckBox:disabled {{ color: {colors.muted}; }}
         #settingsDialog QCheckBox::indicator {{
-            width: 16px; height: 16px; image: none; background: transparent; border: none;
+            width: {_SETTINGS_CHECKBOX_INDICATOR_SIZE}px;
+            height: {_SETTINGS_CHECKBOX_INDICATOR_SIZE}px;
+            image: none; background: transparent; border: none;
         }}
         #settingsDialog QPlainTextEdit {{ selection-background-color: {colors.accent}; }}
         #settingsDialog QPushButton {{
             background: {overlay}; border: 1px solid {settings_control_border};
-            border-radius: 10px; padding: 7px 12px;
+            border-radius: 10px; padding: 6px 13px; font-size: {_SETTINGS_CONTROL_FONT_SIZE_PT}pt;
         }}
         #settingsDialog QPushButton:hover {{ border-color: {colors.accent_focus}; }}
         #settingsDialog QPushButton:focus {{ border: 1px solid {colors.accent_focus}; }}
@@ -3397,10 +3579,29 @@ def _read_scaled_image(path: str, bounds: QSize, keep_aspect: bool) -> QImage:
     if keep_aspect:
         natural = reader.size()
         if natural.isValid():
-            scaled_size = QSize(natural)
-            scaled_size.scale(bounds, Qt.AspectRatioMode.KeepAspectRatio)
+            scaled_size = _fit_image_size(natural, bounds, allow_upscale=False)
     reader.setScaledSize(scaled_size)
     return reader.read()
+
+
+def _fit_image_size(source: QSize, bounds: QSize, *, allow_upscale: bool) -> QSize:
+    if not source.isValid() or source.isEmpty():
+        return QSize(max(1, bounds.width()), max(1, bounds.height()))
+    if not bounds.isValid() or bounds.isEmpty():
+        return QSize(max(1, source.width()), max(1, source.height()))
+    fitted = QSize(source)
+    fitted.scale(bounds, Qt.AspectRatioMode.KeepAspectRatio)
+    if allow_upscale or fitted.width() < source.width() or fitted.height() < source.height():
+        return fitted
+    return QSize(source)
+
+
+def _scaled_size(size: QSize, scale: float) -> QSize:
+    normalized = max(1.0, float(scale))
+    return QSize(
+        max(1, round(size.width() * normalized)),
+        max(1, round(size.height() * normalized)),
+    )
 
 
 def _image_cost(image: QImage) -> int:
@@ -3485,7 +3686,7 @@ def _style_combo_popup(combo: QComboBox, theme: bool | _ThemeAppearance) -> None
     accent_foreground = _accent_foreground(appearance)
     popup_background = colors.popup
     popup_hover = colors.hover
-    border = "#484E5E" if appearance.dark else "#D2D8E5"
+    border = _settings_control_border_token(appearance)[0]
     view = combo.view()
     container = view.window()
     container.setObjectName("comboPopup")
@@ -3509,8 +3710,8 @@ def _style_combo_popup(combo: QComboBox, theme: bool | _ThemeAppearance) -> None
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(colors.muted))
     view.setStyleSheet(
         f"QAbstractItemView {{ background: {popup_background}; color: {colors.text}; "
-        "border: none; outline: none; padding: 2px; }"
-        "QAbstractItemView::item { min-height: 28px; padding: 3px 8px; }"
+        f"border: none; outline: none; padding: 2px; font-size: {_POPUP_ITEM_FONT_SIZE_PT}pt; }}"
+        "QAbstractItemView::item { min-height: 30px; padding: 4px 8px; }"
         f"QAbstractItemView::item:hover {{ background: {popup_hover}; color: {colors.text}; }}"
         f"QAbstractItemView::item:selected {{ background: {colors.accent}; color: {accent_foreground}; }}"
         f"QAbstractItemView::item:disabled {{ color: {colors.muted}; }}"
@@ -3776,26 +3977,42 @@ def _compact_menu(
     # Icon menus use the root inset as their sole outer whitespace. Qt adds
     # its own icon gutter inside each item, so duplicating item insets would
     # leave a visibly oversized gap before the text and a wider right edge.
-    surface_inset = 4
+    # Horizontal and vertical insets are split intentionally: the menu needs
+    # side breathing room without recreating large blank caps above and below.
+    horizontal_inset = _COMPACT_MENU_HORIZONTAL_INSET
+    vertical_inset = _COMPACT_MENU_VERTICAL_INSET
     item_inset = 0 if has_icons else 8
     # Menus with icons get a 14 px icon column and a deliberate 6 px text
     # allocation; plain text menus do not reserve an empty icon gutter.
     icon_column_width = (_COMPACT_MENU_ICON_SIZE + _COMPACT_MENU_ICON_GAP) if has_icons else 0
-    menu.setProperty(_COMPACT_MENU_PROPERTY, has_icons)
+    menu.setProperty(_COMPACT_MENU_PROPERTY, True)
+    menu.setProperty(_COMPACT_MENU_HAS_ICONS_PROPERTY, has_icons)
     menu.setStyleSheet(
-        f"QMenu {{ background: {colors.menu}; color: {colors.text}; padding: {surface_inset}px; }}"
-        f"QMenu::item {{ padding: 5px {item_inset}px 5px {item_inset}px; border-radius: 6px; }}"
+        f"QMenu {{ background: {colors.menu}; color: {colors.text}; "
+        f"padding: {vertical_inset}px {horizontal_inset}px; "
+        f"border: 1px solid {colors.menu_separator}; "
+        f"border-radius: {_COMPACT_MENU_CORNER_RADIUS}px; "
+        f"font-size: {_POPUP_ITEM_FONT_SIZE_PT}pt; }}"
+        f"QMenu::item {{ padding: 6px {item_inset}px 6px {item_inset}px; border-radius: 6px; }}"
         f"QMenu::item:selected {{ background: {colors.menu_hover}; color: {colors.text}; }}"
         f"QMenu::item:disabled {{ color: {disabled}; }}"
         f"QMenu::separator {{ background: {colors.menu_separator}; height: 1px; margin: 2px {item_inset}px; }}"
     )
+    if not isinstance(getattr(menu, "_clipsoon_frame_filter", None), _CompactMenuFrameFilter):
+        menu._clipsoon_frame_filter = _CompactMenuFrameFilter(menu)  # type: ignore[attr-defined]
+        menu.installEventFilter(menu._clipsoon_frame_filter)  # type: ignore[attr-defined]
+    font = QFont(menu.font())
+    font.setPointSize(_POPUP_ITEM_FONT_SIZE_PT)
+    menu.setFont(font)
+    text_metrics = QFontMetrics(font)
     text_width = max(
-        (menu.fontMetrics().horizontalAdvance(action.text()) for action in menu.actions() if not action.isSeparator()),
+        (text_metrics.horizontalAdvance(action.text()) for action in menu.actions() if not action.isSeparator()),
         default=0,
     )
     # The icon column and its text gap are explicit, while the root and item
     # insets remain mirrored so no action has unexplained right-side padding.
-    menu.setFixedWidth(text_width + icon_column_width + 2 * (surface_inset + item_inset))
+    menu.setFixedWidth(text_width + icon_column_width + 2 * (horizontal_inset + item_inset))
+    _balance_compact_menu_action_margins(menu)
 
 
 def _hover_color(theme: bool | _ThemeAppearance) -> QColor:

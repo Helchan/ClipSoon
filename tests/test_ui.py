@@ -19,7 +19,18 @@ from PySide6.QtCore import (
     QTimer,
     QVariantAnimation,
 )
-from PySide6.QtGui import QColor, QImage, QInputMethodEvent, QKeyEvent, QKeySequence, QPainter, QPalette
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QImage,
+    QInputMethodEvent,
+    QKeyEvent,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPalette,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -216,6 +227,7 @@ def test_settings_and_custom_hotkey_validation(qtbot) -> None:
     assert _hotkey_display("combo:ctrl+plus").endswith("++")
     assert dialog.findChildren(QFrame, "settingsSection")
     assert dialog.findChild(QFrame, "settingsSection") is not None
+    assert not dialog.isModal()
     assert not any(
         label.text() == "配置快捷键、历史记录与粘贴行为"
         for label in dialog.findChildren(QLabel)
@@ -336,6 +348,54 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
     assert "外观" not in [label.text() for label in dialog.findChildren(QLabel, "settingsFieldLabel")]
 
 
+def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(theme="liquid_glass"), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    title = dialog.findChild(QLabel, "settingsWindowTitle")
+    section_title = dialog.findChildren(QLabel, "settingsSectionTitle")[0]
+    field_label = dialog.findChildren(QLabel, "settingsFieldLabel")[0]
+    subtitle = dialog.findChild(QLabel, "settingsSubtitle")
+
+    assert title.font().pointSizeF() == ui_module._SETTINGS_TITLE_FONT_SIZE_PT
+    assert section_title.font().pointSizeF() == ui_module._SETTINGS_SECTION_FONT_SIZE_PT
+    assert field_label.font().pointSizeF() == ui_module._SETTINGS_LABEL_FONT_SIZE_PT
+    assert subtitle.font().pointSizeF() == ui_module._SETTINGS_HELP_FONT_SIZE_PT
+
+    controls = (
+        dialog.custom_hotkey,
+        dialog.interval,
+        dialog.maximum,
+        dialog.retention,
+        dialog.delay,
+        dialog.theme,
+        dialog.selection_memory,
+    )
+    for control in controls:
+        if control.isHidden():
+            continue
+        assert control.font().pointSizeF() == ui_module._SETTINGS_CONTROL_FONT_SIZE_PT
+        assert control.height() >= ui_module._SETTINGS_CONTROL_MIN_HEIGHT
+
+    for checkbox in (
+        dialog.capture,
+        dialog.paste,
+        dialog.hide_on_deactivate_checkbox,
+        dialog.remember_selection,
+        dialog.launch_at_login,
+    ):
+        assert checkbox.font().pointSizeF() == ui_module._SETTINGS_CONTROL_FONT_SIZE_PT
+        assert checkbox.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT
+
+    assert dialog.close_button.font().pointSizeF() == ui_module._SETTINGS_CONTROL_FONT_SIZE_PT
+    assert dialog.reset_button.font().pointSizeF() == ui_module._SETTINGS_CONTROL_FONT_SIZE_PT
+    assert field_label.font().pointSizeF() > subtitle.font().pointSizeF()
+    assert dialog.maximum.font().pointSizeF() > field_label.font().pointSizeF()
+    assert dialog.height() < 700
+
+
 def test_settings_behavior_checkboxes_have_stable_non_overlapping_rows(qtbot) -> None:
     for theme in ("light", "dark", "liquid_glass"):
         dialog = SettingsDialog(AppSettings(theme=theme), accessibility_granted=True)
@@ -343,11 +403,24 @@ def test_settings_behavior_checkboxes_have_stable_non_overlapping_rows(qtbot) ->
         dialog.show()
         qtbot.waitExposed(dialog)
 
-        assert dialog.capture.height() == 23, theme
-        assert dialog.paste.height() == 23, theme
-        assert dialog.hide_on_deactivate_checkbox.height() == 23, theme
-        assert dialog.remember_selection.height() == 23, theme
-        assert dialog.launch_at_login.height() == 23, theme
+        assert dialog.capture.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT, theme
+        assert dialog.paste.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT, theme
+        assert (
+            dialog.hide_on_deactivate_checkbox.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT
+        ), theme
+        assert dialog.remember_selection.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT, theme
+        assert dialog.launch_at_login.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT, theme
+        option = QStyleOptionButton()
+        dialog.capture.initStyleOption(option)
+        indicator = dialog.capture.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator,
+            option,
+            dialog.capture,
+        )
+        assert indicator.size() == QSize(
+            ui_module._SETTINGS_CHECKBOX_INDICATOR_SIZE,
+            ui_module._SETTINGS_CHECKBOX_INDICATOR_SIZE,
+        ), theme
         assert dialog.capture.geometry().bottom() < dialog.hide_on_deactivate_checkbox.geometry().top(), theme
         assert dialog.paste.geometry().bottom() < dialog.remember_selection.geometry().top(), theme
         assert (
@@ -374,6 +447,114 @@ def test_frameless_settings_footer_has_an_app_owned_close_control(qtbot) -> None
     assert not dialog.close_button.hasFocus()
     qtbot.mouseClick(dialog.close_button, Qt.MouseButton.LeftButton)
     assert dialog.result() == QDialog.DialogCode.Rejected
+
+
+def test_frameless_settings_can_close_with_escape_from_child_editor(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    dialog.custom_hotkey.setFocus(Qt.FocusReason.OtherFocusReason)
+    qtbot.keyPress(dialog.custom_hotkey, Qt.Key.Key_Escape)
+
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert not dialog.isVisible()
+
+
+def test_frameless_settings_can_close_when_clicking_outside(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    inside_global = dialog.mapToGlobal(QPoint(18, 18))
+    inside = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPointF(18, 18),
+        QPointF(inside_global),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(dialog, inside)
+    assert dialog.isVisible()
+
+    outside_point = QPoint(dialog.width() + 24, dialog.height() + 24)
+    outside_global = dialog.mapToGlobal(outside_point)
+    outside = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPointF(outside_point),
+        QPointF(outside_global),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(dialog, outside)
+
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert not dialog.isVisible()
+
+
+def test_frameless_settings_dismisses_main_panel_click_even_without_widget_mouse_event(
+    qtbot,
+) -> None:
+    panel = ClipPanel(AppSettings)
+    panel.resize(900, 700)
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    dialog = SettingsDialog(AppSettings(), panel, accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.move(panel.mapToGlobal(QPoint(260, 120)))
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    panel_click = panel.mapToGlobal(QPoint(24, 24))
+    assert not dialog._global_geometry().contains(panel_click)
+
+    dismissed = dialog._poll_external_dismiss_state(
+        buttons=Qt.MouseButton.LeftButton,
+        cursor_pos=panel_click,
+    )
+
+    assert dismissed
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert not dialog.isVisible()
+
+
+def test_frameless_settings_from_tray_waits_for_open_click_release_then_closes_outside(
+    qtbot,
+) -> None:
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    outside_point = dialog.mapToGlobal(QPoint(dialog.width() + 24, dialog.height() + 24))
+    dialog._external_dismiss_armed = False
+
+    assert not dialog._poll_external_dismiss_state(
+        buttons=Qt.MouseButton.LeftButton,
+        cursor_pos=outside_point,
+    )
+    assert dialog.isVisible()
+
+    assert not dialog._poll_external_dismiss_state(
+        buttons=Qt.MouseButton.NoButton,
+        cursor_pos=outside_point,
+    )
+    assert dialog._external_dismiss_armed
+
+    dismissed = dialog._poll_external_dismiss_state(
+        buttons=Qt.MouseButton.LeftButton,
+        cursor_pos=outside_point,
+    )
+
+    assert dismissed
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert not dialog.isVisible()
 
 
 def test_state_memory_setting_is_an_optional_three_second_default(qtbot) -> None:
@@ -403,7 +584,7 @@ def test_settings_changes_and_reset_are_emitted_immediately(qtbot) -> None:
     assert changes[-1]["theme"] == "dark"
 
     dialog.reset_button.click()
-    assert changes[-1]["theme"] == "system"
+    assert changes[-1]["theme"] == "liquid_glass"
     assert changes[-1]["max_history_items"] == 500
     assert changes[-1]["capture_enabled"] is True
 
@@ -551,6 +732,7 @@ def test_settings_checkboxes_use_the_active_theme_and_keep_a_visible_checkmark(q
             option,
             checkbox,
         )
+        assert indicator.width() < checkbox.fontMetrics().height(), theme
         origin = checkbox.mapTo(dialog, indicator.topLeft())
         image = dialog.grab().toImage()
         return [
@@ -622,16 +804,27 @@ def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -
         if combo is None:
             continue
         palette = combo.view().palette()
-        assert palette.color(QPalette.ColorRole.Base) == QColor("#FAFBFE")
+        assert palette.color(QPalette.ColorRole.Base) == QColor("#EEF2F8")
         assert palette.color(QPalette.ColorRole.Text) == QColor("#171A24")
 
 
 def test_frosted_material_theme_is_selectable_and_uses_a_readable_popup_palette(qtbot) -> None:
     dialog = SettingsDialog(AppSettings(theme="liquid_glass"), accessibility_granted=True)
     qtbot.addWidget(dialog)
+    legacy_dialog = SettingsDialog(AppSettings(theme="system"), accessibility_granted=True)
+    qtbot.addWidget(legacy_dialog)
 
     assert dialog.theme.currentData() == "liquid_glass"
     assert dialog.theme.currentText() == "磨砂质感（随系统）"
+    assert dialog.theme.itemData(0) == "liquid_glass"
+    assert legacy_dialog.theme.currentData() == "liquid_glass"
+    assert f"font-size: {ui_module._POPUP_ITEM_FONT_SIZE_PT}pt" in dialog.theme.view().styleSheet()
+    assert [dialog.theme.itemText(index) for index in range(dialog.theme.count())] == [
+        "磨砂质感（随系统）",
+        "浅色",
+        "深色",
+    ]
+    assert dialog.theme.findText("跟随系统") == -1
     assert dialog.theme.findText("玻璃半透（随系统）") == -1
     assert dialog.theme.findText("液态玻璃（随系统）") == -1
     assert dialog.theme.findText("柔光半透（随系统）") == -1
@@ -639,9 +832,9 @@ def test_frosted_material_theme_is_selectable_and_uses_a_readable_popup_palette(
         if combo is None:
             continue
         palette = combo.view().palette()
-        assert palette.color(QPalette.ColorRole.Base) == QColor("#F9FBFF")
+        assert palette.color(QPalette.ColorRole.Base) == QColor("#EAF2FA")
         assert palette.color(QPalette.ColorRole.Text) == QColor("#142039")
-        assert "background: #F9FBFF" in combo.view().styleSheet()
+        assert "background: #EAF2FA" in combo.view().styleSheet()
         assert "background: #2C63D9; color: #FFFFFF" in combo.view().styleSheet()
 
 
@@ -847,7 +1040,7 @@ def test_frosted_settings_controls_share_the_main_panel_divider_material(
 
     assert _settings_control_border_token(appearance)[0] == divider_color
     assert "#settingsDialog QPlainTextEdit, #settingsDialog QLineEdit," in style
-    assert f"border: 1px solid {divider_color}; border-radius: 10px; padding: 7px;" in style
+    assert f"border: 1px solid {divider_color}; border-radius: 10px; padding: 6px 8px;" in style
     assert "#settingsDialog QComboBox::drop-down {" in style
     assert f"border: none; border-left: 1px solid {divider_color}; width: 27px;" in style
     assert "#settingsDialog QPushButton {" in style
@@ -1860,6 +2053,70 @@ def test_copied_image_file_uses_detail_image_preview(qtbot, tmp_path: Path) -> N
     assert panel.list.itemDelegate().sizeHint(QStyleOptionViewItem(), panel.model.index(0)).height() == 44
 
 
+def test_detail_image_preview_does_not_upscale_small_images(qtbot, tmp_path: Path) -> None:
+    path = tmp_path / "small-preview.png"
+    image = QImage(40, 24, QImage.Format.Format_RGB32)
+    image.fill(QColor("#3986e8"))
+    assert image.save(str(path), "PNG")
+    preview = ImagePreview()
+    preview.resize(360, 320)
+    qtbot.addWidget(preview)
+    preview.show()
+
+    preview.set_path(str(path))
+
+    qtbot.waitUntil(
+        lambda: preview.pixmap() is not None and not preview.pixmap().isNull(),
+        timeout=1_000,
+    )
+    assert preview.pixmap().size() == QSize(40, 24)
+
+
+def test_detail_image_preview_treats_image_pixels_as_physical_on_high_dpi(qtbot, tmp_path: Path) -> None:
+    class RetinaPreview(ImagePreview):
+        def devicePixelRatioF(self) -> float:  # noqa: N802 - Qt API override
+            return 2.0
+
+    path = tmp_path / "retina-preview.png"
+    image = QImage(162, 126, QImage.Format.Format_RGB32)
+    image.fill(QColor("#3986e8"))
+    assert image.save(str(path), "PNG")
+    preview = RetinaPreview()
+    preview.resize(360, 320)
+    qtbot.addWidget(preview)
+    preview.show()
+
+    preview.set_path(str(path))
+
+    qtbot.waitUntil(
+        lambda: preview.pixmap() is not None and not preview.pixmap().isNull(),
+        timeout=1_000,
+    )
+    pixmap = preview.pixmap()
+    assert pixmap.size() == QSize(81, 63)
+    assert pixmap.deviceIndependentSize().width() == 81
+    assert pixmap.deviceIndependentSize().height() == 63
+
+
+def test_detail_image_preview_scales_large_images_down_to_fit(qtbot, tmp_path: Path) -> None:
+    path = tmp_path / "large-preview.png"
+    image = QImage(800, 400, QImage.Format.Format_RGB32)
+    image.fill(QColor("#3986e8"))
+    assert image.save(str(path), "PNG")
+    preview = ImagePreview()
+    preview.resize(360, 320)
+    qtbot.addWidget(preview)
+    preview.show()
+
+    preview.set_path(str(path))
+
+    qtbot.waitUntil(
+        lambda: preview.pixmap() is not None and not preview.pixmap().isNull(),
+        timeout=1_000,
+    )
+    assert preview.pixmap().size() == QSize(340, 170)
+
+
 def test_large_image_decode_does_not_block_selection(qtbot, tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "large.jpg"
     path.write_bytes(b"image placeholder")
@@ -2161,26 +2418,41 @@ def test_detail_information_for_text_and_image(qtbot) -> None:
 
 
 def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
-    panel = ClipPanel(AppSettings)
+    panel = ClipPanel(lambda: AppSettings(theme="light"))
     qtbot.addWidget(panel)
     panel.set_items([clip("selected", "item", 1)])
     menu, delete_action, _clear_action, _settings_action = panel._create_list_menu()
     qtbot.addWidget(menu)
 
-    expected = menu.fontMetrics().horizontalAdvance("删除") + (14 + 6) + 2 * (4 + 0)
-    assert menu.width() == expected
+    font = QFont(menu.font())
+    font.setPointSize(ui_module._POPUP_ITEM_FONT_SIZE_PT)
+    expected = (
+        QFontMetrics(font).horizontalAdvance("删除")
+        + (ui_module._COMPACT_MENU_ICON_SIZE + ui_module._COMPACT_MENU_ICON_GAP)
+        + 2 * ui_module._COMPACT_MENU_HORIZONTAL_INSET
+    )
+    assert menu.width() >= expected
     assert menu.style().pixelMetric(QStyle.PixelMetric.PM_SmallIconSize, None, menu) == 14
-    assert "QMenu::item { padding: 5px 0px 5px 0px; border-radius: 6px; }" in menu.styleSheet()
+    assert f"font-size: {ui_module._POPUP_ITEM_FONT_SIZE_PT}pt" in menu.styleSheet()
+    assert (
+        f"padding: {ui_module._COMPACT_MENU_VERTICAL_INSET}px "
+        f"{ui_module._COMPACT_MENU_HORIZONTAL_INSET}px"
+    ) in menu.styleSheet()
+    assert f"border-radius: {ui_module._COMPACT_MENU_CORNER_RADIUS}px" in menu.styleSheet()
+    assert "QMenu::item { padding: 6px 0px 6px 0px; border-radius: 6px; }" in menu.styleSheet()
     assert "QMenu::item:selected" in menu.styleSheet()
     assert "background: #E0E6F3" in menu.styleSheet()
 
     menu.show()
     qtbot.waitExposed(menu)
     action_rect = menu.actionGeometry(delete_action)
+    assert action_rect.x() == menu.width() - action_rect.x() - action_rect.width()
     qtbot.mouseMove(menu, action_rect.center())
     qtbot.wait(20)
 
     assert menu.activeAction() is delete_action
+    assert not menu.mask().isEmpty()
+    assert not menu.mask().contains(QPoint(0, 0))
 
 
 def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
@@ -2213,6 +2485,8 @@ def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     style = menu.styleSheet()
     assert "background: #2A2F3B" in style
     assert "color: #F2F4F8" in style
+    assert f"font-size: {ui_module._POPUP_ITEM_FONT_SIZE_PT}pt" in style
+    assert f"border-radius: {ui_module._COMPACT_MENU_CORNER_RADIUS}px" in style
     assert "background: #444B5C" in style
     assert "background: #454C5C" in style
 
@@ -2507,7 +2781,7 @@ def test_empty_action_and_closed_context_menu_restore_the_permanent_search_focus
 
 
 def test_hover_background_is_visible_but_weaker_than_selection(qtbot) -> None:
-    panel = ClipPanel(AppSettings)
+    panel = ClipPanel(lambda: AppSettings(theme="light"))
     qtbot.addWidget(panel)
     panel.set_items([clip("first", "first", 2), clip("second", "second", 1)])
     panel.show_panel()
