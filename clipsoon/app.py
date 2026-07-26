@@ -21,6 +21,7 @@ from clipsoon import __version__
 from clipsoon.core import (
     WINDOWS_DEFAULT_HOTKEY,
     AppSettings,
+    ClipKind,
     HistoryRepository,
     JsonSettingsStore,
     ObservableSettings,
@@ -226,7 +227,7 @@ class ClipSoonApplication(QObject):
         self.panel.send_requested.connect(lambda item: self.sender.send(item, self.target))
         self.panel.settings_requested.connect(self.show_settings)
         self.panel.delete_requested.connect(self._delete_many)
-        self.panel.clear_requested.connect(self.clear_all_history)
+        self.panel.clear_requested.connect(self.clear_current_tab_history)
         self.panel.accessibility_requested.connect(self.open_accessibility_settings)
         self.panel.position_changed.connect(self._save_panel_position)
         self.sender.finished.connect(self._send_finished)
@@ -585,10 +586,22 @@ class ClipSoonApplication(QObject):
         self.panel.set_status(f"已清除 {removed} 条未置顶历史")
 
     def clear_all_history(self) -> None:
+        self.clear_current_tab_history(None)
+
+    def clear_current_tab_history(self, kind: ClipKind | None) -> None:
         self.clipboard.sync_cursor()
-        removed = self.repository.clear_all()
+        if kind is None:
+            removed = self.repository.clear_all()
+            kind_label = ""
+        else:
+            removed = self.repository.clear_kind(kind)
+            kind_label = {
+                ClipKind.TEXT: "文本",
+                ClipKind.IMAGE: "截图",
+                ClipKind.FILES: "文件",
+            }[kind]
         self._reload_history()
-        self.panel.set_status(f"已清空 {removed} 条历史")
+        self.panel.set_status(f"已清空 {removed} 条{kind_label}历史")
 
     def open_accessibility_settings(self) -> None:
         if PlatformBridge.request_accessibility_permission():

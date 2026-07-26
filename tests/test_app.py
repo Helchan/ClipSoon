@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 import clipsoon.app as app_module
 from clipsoon.app import ClipSoonApplication, _WindowsPanelGuard
-from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, JsonSettingsStore
+from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, ClipKind, JsonSettingsStore
 from clipsoon.system import ForegroundTargetHandle, HotkeyActivationContext, PlatformBridge
 from clipsoon.ui import SettingsDialog
 
@@ -84,6 +84,32 @@ def test_closing_settings_returns_focus_to_the_permanent_search_target(qtbot, tm
 
     qtbot.waitUntil(application.panel.search.hasFocus, timeout=500)
     assert not application.panel.search_icon.hasFocus()
+    application.shutdown()
+
+
+def test_clear_current_tab_history_preserves_other_kinds(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+    source = tmp_path / "source.txt"
+    source.write_text("source", encoding="utf-8")
+    text = application.repository.add_text("text")
+    image = application.repository.add_image(b"image-bytes", 1, 1)
+    files = application.repository.add_files((str(source),))
+    application._reload_history()
+
+    application.clear_current_tab_history(ClipKind.IMAGE)
+
+    assert application.repository.get(image.id) is None
+    assert application.repository.get(text.id) == text
+    assert application.repository.get(files.id) == files
+    assert application.panel.status.text() == "已清空 1 条截图历史"
+    assert {item.id for item in application.panel._items} == {text.id, files.id}
+
+    application.clear_all_history()
+
+    assert application.repository.list_items() == []
+    assert application.panel.status.text() == "已清空 2 条历史"
     application.shutdown()
 
 

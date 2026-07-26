@@ -341,6 +341,29 @@ def test_batch_delete_and_clear_all(tmp_path: Path) -> None:
     repo.close()
 
 
+def test_clear_kind_keeps_other_history_and_removes_orphan_image(tmp_path: Path) -> None:
+    repo = HistoryRepository(tmp_path)
+    source = tmp_path / "source.txt"
+    source.write_text("source", encoding="utf-8")
+    text = repo.add_text("text")
+    image = repo.add_image(b"image-bytes", 1, 1)
+    files = repo.add_files((str(source),))
+
+    assert Path(image.image_path).exists()
+    assert repo.clear_kind(ClipKind.IMAGE) == 1
+    assert repo.get(image.id) is None
+    assert not Path(image.image_path).exists()
+    assert repo.get(text.id) == text
+    assert repo.get(files.id) == files
+
+    assert repo.clear_kind(ClipKind.TEXT) == 1
+    assert repo.get(text.id) is None
+    assert repo.get(files.id) == files
+    assert repo.clear_kind(ClipKind.FILES) == 1
+    assert repo.list_items() == []
+    repo.close()
+
+
 def test_prune_missing_file_items_keeps_complete_files_and_directories(tmp_path: Path) -> None:
     repo = HistoryRepository(tmp_path)
     file_path = tmp_path / "available.txt"

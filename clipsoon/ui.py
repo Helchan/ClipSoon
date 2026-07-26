@@ -334,6 +334,23 @@ def _theme_colors(theme: bool | _ThemeAppearance) -> _ThemeColors:
     return _GLASS_DARK_FALLBACK_COLORS if appearance.dark else _GLASS_LIGHT_FALLBACK_COLORS
 
 
+def _surface_divider_token(appearance: _ThemeAppearance) -> tuple[str, QColor]:
+    """Return the shared quiet divider in QSS and painter forms."""
+
+    if appearance.dark:
+        return "rgba(224, 238, 255, 46)", QColor(224, 238, 255, 46)
+    return "rgba(35, 65, 98, 38)", QColor(35, 65, 98, 38)
+
+
+def _settings_control_border_token(appearance: _ThemeAppearance) -> tuple[str, QColor]:
+    """Return an idle settings-control edge without changing standard themes."""
+
+    if appearance.liquid_glass:
+        return _surface_divider_token(appearance)
+    token = _theme_colors(appearance).border
+    return token, QColor(token)
+
+
 def _active_foreground(appearance: _ThemeAppearance) -> str:
     """Return the readable foreground for an active semantic surface.
 
@@ -360,6 +377,9 @@ def _accent_foreground(appearance: _ThemeAppearance) -> str:
 
 _APP_OWNED_CARET_PROPERTY = "_clipsoon_app_owned_caret"
 _APP_OWNED_CARET_STYLE: _AppOwnedCaretStyle | None = None
+_COMPACT_MENU_PROPERTY = "_clipsoon_compact_menu"
+_COMPACT_MENU_ICON_SIZE = 14
+_COMPACT_MENU_ICON_GAP = 6
 
 
 class _AppOwnedCaretStyle(QProxyStyle):
@@ -372,6 +392,16 @@ class _AppOwnedCaretStyle(QProxyStyle):
     """
 
     def pixelMetric(self, metric, option=None, widget=None) -> int:
+        if (
+            metric == QStyle.PixelMetric.PM_SmallIconSize
+            and isinstance(widget, QMenu)
+            and bool(widget.property(_COMPACT_MENU_PROPERTY))
+        ):
+            # QMenu normally reserves a platform-sized icon gutter. The
+            # contextual menu has a deliberately smaller 14 px icon column,
+            # so the symbol and label read as one compact action while the
+            # outer whitespace remains symmetric.
+            return _COMPACT_MENU_ICON_SIZE
         if (
             metric == QStyle.PixelMetric.PM_TextCursorWidth
             and isinstance(widget, QLineEdit)
@@ -833,14 +863,14 @@ class _SettingsCheckBox(QCheckBox):
             fill = QColor(colors.accent)
             border = QColor(colors.accent_focus if hovered or focused else colors.accent)
         elif self._appearance.liquid_glass:
-            if self._appearance.dark:
-                fill = QColor(223, 240, 255, 30)
-                border = QColor(205, 230, 255, 82)
-            else:
-                fill = QColor(255, 255, 255, 76)
-                border = QColor(255, 255, 255, 148)
+            _, border = _settings_control_border_token(self._appearance)
+            fill = (
+                QColor(223, 240, 255, 27)
+                if self._appearance.dark
+                else QColor(232, 244, 255, 54)
+            )
             if hovered:
-                fill.setAlpha(min(160, fill.alpha() + 24))
+                fill.setAlpha(min(112, fill.alpha() + 24))
         elif self._appearance.dark:
             fill = QColor("#303541")
             border = QColor("#697184")
@@ -1470,6 +1500,7 @@ class SettingsDialog(QDialog):
         self._native_backdrop_active = False
         self._appearance = _theme_appearance(settings)
         self._dark_theme = self._appearance.dark
+        self.setObjectName("settingsDialog")
         self.setWindowTitle("ClipSoon 设置")
         self.setAccessibleName("ClipSoon 设置")
         self.setModal(True)
@@ -1593,7 +1624,7 @@ class SettingsDialog(QDialog):
         self.theme.addItem("跟随系统", "system")
         self.theme.addItem("浅色", "light")
         self.theme.addItem("深色", "dark")
-        self.theme.addItem("玻璃半透（随系统）", "liquid_glass")
+        self.theme.addItem("磨砂质感（随系统）", "liquid_glass")
         self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
         add_row(history_form, 3, "主题", self.theme)
 
@@ -1991,7 +2022,7 @@ class ClipPanel(QWidget):
     send_requested = Signal(object)
     settings_requested = Signal()
     delete_requested = Signal(object)
-    clear_requested = Signal()
+    clear_requested = Signal(object)
     accessibility_requested = Signal()
     position_changed = Signal(int, int)
 
@@ -2090,7 +2121,7 @@ class ClipPanel(QWidget):
         search_layout.setContentsMargins(8, 0, 8, 0)
         search_layout.setSpacing(5)
         self.search_icon = SearchIcon()
-        self.search_icon.clicked.connect(self.settings_requested.emit)
+        self.search_icon.clicked.connect(self._request_settings)
         self.search = QLineEdit()
         self.search.setObjectName("search")
         self.search.setPlaceholderText("搜索剪贴板历史…")
@@ -2127,8 +2158,6 @@ class ClipPanel(QWidget):
         self.count_label.setObjectName("muted")
         filters.addWidget(self.count_label)
         root.addLayout(filters)
-        self.filters_content_divider = section_divider("filtersContentDivider")
-        root.addWidget(self.filters_content_divider)
 
         content = QHBoxLayout()
         # One quiet divider establishes the list/detail boundary in every
@@ -2208,6 +2237,13 @@ class ClipPanel(QWidget):
         self.text_preview.setReadOnly(True)
         self.text_preview.setFrameShape(QFrame.Shape.NoFrame)
         self.text_preview.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.text_preview.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.text_preview.customContextMenuRequested.connect(
+            lambda position: self._open_preview_context_menu(self.text_preview, position)
+        )
+        self.text_preview.selectionChanged.connect(
+            lambda: self._clear_search_selection_for_preview(self.text_preview)
+        )
         self.image_preview = ImagePreview()
         self.file_preview = QLabel()
         self.file_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2216,6 +2252,13 @@ class ClipPanel(QWidget):
         self.file_text_preview.setReadOnly(True)
         self.file_text_preview.setFrameShape(QFrame.Shape.NoFrame)
         self.file_text_preview.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.file_text_preview.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_text_preview.customContextMenuRequested.connect(
+            lambda position: self._open_preview_context_menu(self.file_text_preview, position)
+        )
+        self.file_text_preview.selectionChanged.connect(
+            lambda: self._clear_search_selection_for_preview(self.file_text_preview)
+        )
         self.file_text_preview.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.file_text_preview.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.preview_stack.addWidget(self.text_preview)
@@ -2672,6 +2715,13 @@ class ClipPanel(QWidget):
         key_event = event if isinstance(event, QKeyEvent) else None
         if key_event is None:
             return False
+        if _matches_copy_shortcut(key_event):
+            # Search owns keyboard focus by contract. Preserve its normal copy
+            # semantics when it has a fresh selection; otherwise route the
+            # platform copy shortcut to the visibly selected preview text.
+            if not self.search.hasSelectedText() and self._copy_preview_selection_if_available():
+                return True
+            return super().eventFilter(watched, event)
         key = key_event.key()
         if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
             reverse = key == Qt.Key.Key_Backtab or bool(
@@ -2894,17 +2944,110 @@ class ClipPanel(QWidget):
         if items:
             self.delete_requested.emit(items)
 
+    def _request_settings(self) -> None:
+        """Open settings through the same signal used by the search icon."""
+
+        self.settings_requested.emit()
+
+    def _has_history_in_current_kind(self) -> bool:
+        if self._kind is None:
+            return bool(self._items)
+        return any(item.kind is self._kind for item in self._items)
+
+    def _request_clear_current_kind(self) -> None:
+        kind = self._kind
+        confirmation_text = {
+            None: "清空全部剪贴板历史？此操作无法撤销。",
+            ClipKind.TEXT: "清空剪切板文本历史？此操作无法撤销。",
+            ClipKind.IMAGE: "清空剪切板截图历史？此操作无法撤销。",
+            ClipKind.FILES: "清空剪切板文件历史？此操作无法撤销。",
+        }[kind]
+        if _confirm_destructive_action(
+            self,
+            "清空历史",
+            confirmation_text,
+            "确定",
+            appearance=self._appearance,
+        ):
+            self.clear_requested.emit(kind)
+
+    def _clear_search_selection_for_preview(self, preview: QPlainTextEdit) -> None:
+        """Let a newly selected preview range be the intended copy target.
+
+        The search editor intentionally remains the sole keyboard-focus owner.
+        Clearing its stale selection when a user selects preview text prevents
+        Command/Ctrl+C from copying an earlier search range instead.
+        """
+
+        if preview.textCursor().hasSelection() and self.search.hasSelectedText():
+            self.search.deselect()
+
+    def _active_preview_with_selection(self) -> QPlainTextEdit | None:
+        preview = self.preview_stack.currentWidget()
+        if preview in (self.text_preview, self.file_text_preview) and preview.textCursor().hasSelection():
+            return preview
+        return None
+
+    def _copy_preview_selection_if_available(self) -> bool:
+        preview = self._active_preview_with_selection()
+        if preview is None:
+            return False
+        preview.copy()
+        return True
+
+    def _create_preview_menu(self, preview: QPlainTextEdit) -> tuple[QMenu, QAction, QAction]:
+        """Create the two localised actions available for selectable previews."""
+
+        menu = QMenu(preview)
+        copy_action = menu.addAction("复制")
+        copy_action.setEnabled(preview.textCursor().hasSelection())
+        copy_action.triggered.connect(preview.copy)
+        select_all_action = menu.addAction("全选")
+        select_all_action.setEnabled(bool(preview.toPlainText()))
+        select_all_action.triggered.connect(preview.selectAll)
+        _compact_menu(menu, appearance=self._appearance)
+        return menu, copy_action, select_all_action
+
+    def _open_preview_context_menu(self, preview: QPlainTextEdit, position: QPoint) -> None:
+        menu, _copy_action, _select_all_action = self._create_preview_menu(preview)
+        menu.exec(preview.mapToGlobal(position))
+
+    def _create_list_menu(self) -> tuple[QMenu, QAction, QAction, QAction]:
+        menu = QMenu(self.list)
+
+        def add_menu_action(icon_name: str, text: str) -> QAction:
+            action = menu.addAction(_menu_action_icon(icon_name, self._appearance), text)
+            action.setIconVisibleInMenu(True)
+            return action
+
+        delete_action = add_menu_action("delete", "删除")
+        delete_action.setEnabled(bool(self._selected_items()))
+        clear_action = add_menu_action("clear", "清空")
+        clear_action.setEnabled(self._has_history_in_current_kind())
+        menu.addSeparator()
+        settings_action = add_menu_action("settings", "设置")
+        _compact_menu(menu, appearance=self._appearance)
+        return menu, delete_action, clear_action, settings_action
+
+    def _handle_list_menu_action(
+        self,
+        selected: QAction | None,
+        delete_action: QAction,
+        clear_action: QAction,
+        settings_action: QAction,
+    ) -> None:
+        if selected is delete_action:
+            self._request_delete_selected()
+        elif selected is clear_action:
+            self._request_clear_current_kind()
+        elif selected is settings_action:
+            self._request_settings()
+
     def _open_list_menu(self, position) -> None:
         index = self.list.indexAt(position)
         if index.isValid() and not self.list.selectionModel().isSelected(index):
             self.list.setCurrentIndex(index)
-        menu = QMenu(self.list)
-        delete_action = menu.addAction("删除所选")
-        delete_action.setEnabled(bool(self._selected_items()))
-        menu.addSeparator()
-        clear_action = menu.addAction("清空历史")
-        clear_action.setEnabled(self.model.rowCount() > 0)
-        _compact_menu(menu, appearance=self._appearance)
+        menu, delete_action, clear_action, settings_action = self._create_list_menu()
         selected = menu.exec(self.list.viewport().mapToGlobal(position))
         # QMenu closes in a nested event loop and can leave the panel with no
         # focus widget or inactive state even when the list itself is NoFocus.
@@ -2913,16 +3056,7 @@ class ClipPanel(QWidget):
         if self.isVisible():
             self.activateWindow()
         self._schedule_search_focus_restore()
-        if selected is delete_action:
-            self._request_delete_selected()
-        elif selected is clear_action and _confirm_destructive_action(
-            self,
-            "清空历史",
-            "清空全部剪贴板历史？此操作无法撤销。",
-            "确定",
-            appearance=self._appearance,
-        ):
-            self.clear_requested.emit()
+        self._handle_list_menu_action(selected, delete_action, clear_action, settings_action)
 
 
 def create_tray_icon(parent: QWidget) -> tuple[QSystemTrayIcon, QMenu, dict[str, QAction]]:
@@ -2962,12 +3096,11 @@ def _style_sheet(
     colors = _theme_colors(appearance)
     active_foreground = _active_foreground(appearance)
     accent_foreground = _accent_foreground(appearance)
-    # One shared low-contrast rule defines every main-panel boundary: search,
-    # filters, content, footer, list/detail, and preview/information. Keeping
-    # the material identical avoids a mix of unrelated gray rules across themes.
-    section_divider = (
-        "rgba(224, 238, 255, 46)" if appearance.dark else "rgba(35, 65, 98, 38)"
-    )
+    # One shared low-contrast rule defines every app boundary: settings sections,
+    # search, filters, content, footer, list/detail, and preview/information.
+    # Keeping the material identical avoids a mix of unrelated gray rules across
+    # themes.
+    section_divider, _ = _surface_divider_token(appearance)
     detail_background = "transparent"
     detail_border = "none"
     preview_rule = "background: transparent; border: none;"
@@ -2988,7 +3121,6 @@ def _style_sheet(
         card_background = "transparent"
         card_border = "none"
         settings_background = "transparent"
-        settings_border = f"1px solid {overlay_border}"
         scrollbar_handle = (
             "rgba(43, 74, 112, 148)"
             if not appearance.dark
@@ -3007,7 +3139,6 @@ def _style_sheet(
         card_background = colors.card
         card_border = f"1px solid {colors.border}"
         settings_background = colors.panel
-        settings_border = f"1px solid {colors.border}"
         scrollbar_handle = (
             "rgba(52, 65, 86, 132)"
             if not appearance.dark
@@ -3018,6 +3149,16 @@ def _style_sheet(
             if not appearance.dark
             else "rgba(239, 246, 255, 176)"
         )
+
+    # Settings retain their rounded grouping, but their outer rule is the same
+    # quiet 1 px material divider used by the main panel.  In particular, do
+    # not reuse the luminous glass control border here: it reads as a white
+    # card outline rather than a section boundary.
+    settings_border = f"1px solid {section_divider}"
+    # In the frosted appearance, idle form controls use the same quiet edge as
+    # their containing section.  Focus remains the accent color below, so the
+    # task surface stays calm without obscuring which field is editable.
+    settings_control_border, _ = _settings_control_border_token(appearance)
 
     # Each scroll area owns its vertical scrollbar as a child widget. Without
     # explicit sub-control rules, applying the app stylesheet lets the
@@ -3083,7 +3224,7 @@ def _style_sheet(
         QToolButton#emptyStateClear:hover {{ background: {overlay_hover}; }}
         #detail {{ background: {detail_background}; border: {detail_border}; }}
         #contentDivider {{ background: {section_divider}; border: none; min-width: 1px; max-width: 1px; }}
-        #searchFiltersDivider, #filtersContentDivider, #contentFooterDivider {{
+        #searchFiltersDivider, #contentFooterDivider {{
             background: {section_divider}; border: none; min-height: 1px; max-height: 1px;
         }}
         #textPreview, #fileTextPreview {{ font-size: 13pt; padding: 11px; {preview_rule} }}
@@ -3096,32 +3237,43 @@ def _style_sheet(
         }}
         #muted {{ color: {colors.muted}; font-size: 9pt; }}
         #muted a {{ color: {colors.accent_focus}; text-decoration: none; }}
-        #platformNote {{ background: {overlay}; border: 1px solid {overlay_border}; border-radius: 10px; }}
+        #settingsDialog #platformNote {{
+            background: {overlay}; border: 1px solid {settings_control_border}; border-radius: 10px;
+        }}
         #settingsWindowTitle {{ font-size: 12pt; font-weight: 650; }}
         #settingsSubtitle {{ color: {colors.muted}; font-size: 9pt; }}
         #settingsSection {{ background: {settings_background}; border: {settings_border}; border-radius: 12px; }}
         #settingsSectionTitle {{ font-size: 11pt; font-weight: 650; }}
         #settingsFieldLabel {{ color: {colors.muted}; font-size: 9pt; }}
-        QPlainTextEdit, QLineEdit, QKeySequenceEdit, QComboBox, QSpinBox {{
-            background: {overlay}; border: 1px solid {overlay_border}; border-radius: 10px; padding: 7px;
+        #settingsDialog QPlainTextEdit, #settingsDialog QLineEdit,
+        #settingsDialog QKeySequenceEdit, #settingsDialog QComboBox, #settingsDialog QSpinBox {{
+            background: {overlay}; border: 1px solid {settings_control_border}; border-radius: 10px; padding: 7px;
             selection-background-color: {colors.accent}; selection-color: {accent_foreground};
         }}
-        QPlainTextEdit:focus, QLineEdit:focus, QKeySequenceEdit:focus, QComboBox:focus, QSpinBox:focus {{
+        #settingsDialog QPlainTextEdit:focus, #settingsDialog QLineEdit:focus,
+        #settingsDialog QKeySequenceEdit:focus, #settingsDialog QComboBox:focus,
+        #settingsDialog QSpinBox:focus {{
             border: 1px solid {colors.accent_focus};
         }}
-        QComboBox:disabled, QLineEdit:disabled, QKeySequenceEdit:disabled, QSpinBox:disabled {{
+        #settingsDialog QComboBox::drop-down {{
+            border: none; border-left: 1px solid {settings_control_border}; width: 27px;
+        }}
+        #settingsDialog QComboBox:disabled, #settingsDialog QLineEdit:disabled,
+        #settingsDialog QKeySequenceEdit:disabled, #settingsDialog QSpinBox:disabled {{
             color: {colors.muted}; background: {colors.panel};
         }}
-        QCheckBox {{ color: {colors.text}; }}
-        QCheckBox:disabled {{ color: {colors.muted}; }}
-        QCheckBox::indicator {{ width: 16px; height: 16px; background: transparent; border: none; }}
-        QPlainTextEdit {{ selection-background-color: {colors.accent}; }}
-        QPushButton {{
-            background: {overlay}; border: 1px solid {overlay_border};
+        #settingsDialog QCheckBox {{ color: {colors.text}; }}
+        #settingsDialog QCheckBox:disabled {{ color: {colors.muted}; }}
+        #settingsDialog QCheckBox::indicator {{
+            width: 16px; height: 16px; image: none; background: transparent; border: none;
+        }}
+        #settingsDialog QPlainTextEdit {{ selection-background-color: {colors.accent}; }}
+        #settingsDialog QPushButton {{
+            background: {overlay}; border: 1px solid {settings_control_border};
             border-radius: 10px; padding: 7px 12px;
         }}
-        QPushButton:hover {{ border-color: {colors.accent_focus}; }}
-        QPushButton:focus {{ border: 1px solid {colors.accent_focus}; }}
+        #settingsDialog QPushButton:hover {{ border-color: {colors.accent_focus}; }}
+        #settingsDialog QPushButton:focus {{ border: 1px solid {colors.accent_focus}; }}
         QDialog {{ background: {dialog_background}; }}
     """
 
@@ -3504,6 +3656,69 @@ def _show_themed_warning(
     prompt.exec()
 
 
+def _menu_action_icon(icon_name: str, appearance: _ThemeAppearance) -> QIcon:
+    """Draw the three compact contextual-menu symbols in the active theme."""
+
+    logical_size = _COMPACT_MENU_ICON_SIZE
+    device_scale = 2
+    pixmap = QPixmap(logical_size * device_scale, logical_size * device_scale)
+    pixmap.setDevicePixelRatio(device_scale)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    color = QColor(_theme_colors(appearance).muted)
+    pen = QPen(color, 1.45)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    if icon_name == "delete":
+        painter.drawLine(QPointF(3.0, 3.0), QPointF(11.0, 11.0))
+        painter.drawLine(QPointF(11.0, 3.0), QPointF(3.0, 11.0))
+    elif icon_name == "clear":
+        painter.drawLine(QPointF(2.5, 4.5), QPointF(11.5, 4.5))
+        painter.drawLine(QPointF(5.3, 3.0), QPointF(8.7, 3.0))
+        painter.drawRoundedRect(QRectF(3.7, 4.5, 6.6, 7.0), 1.1, 1.1)
+        painter.drawLine(QPointF(6.0, 6.3), QPointF(6.0, 9.9))
+        painter.drawLine(QPointF(8.0, 6.3), QPointF(8.0, 9.9))
+    elif icon_name == "settings":
+        # Six short rectangular teeth make this read as a cog rather than a
+        # crosshair, while retaining the menu's restrained monochrome weight.
+        painter.save()
+        painter.translate(7.0, 7.0)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        for degrees in range(0, 360, 60):
+            painter.save()
+            painter.rotate(degrees)
+            painter.drawRoundedRect(QRectF(-1.1, -5.7, 2.2, 2.7), 0.45, 0.45)
+            painter.restore()
+        painter.restore()
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QRectF(3.2, 3.2, 7.6, 7.6))
+        painter.drawEllipse(QRectF(5.7, 5.7, 2.6, 2.6))
+    else:
+        raise ValueError(f"Unknown contextual menu icon: {icon_name}")
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _matches_copy_shortcut(event: QKeyEvent) -> bool:
+    """Recognise the platform copy gesture even on headless Qt backends."""
+
+    if event.matches(QKeySequence.StandardKey.Copy):
+        return True
+    primary_modifier = (
+        Qt.KeyboardModifier.MetaModifier
+        if sys.platform == "darwin"
+        else Qt.KeyboardModifier.ControlModifier
+    )
+    return event.key() == Qt.Key.Key_C and event.modifiers() == primary_modifier
+
+
 def _compact_menu(
     menu: QMenu,
     *,
@@ -3516,18 +3731,30 @@ def _compact_menu(
         appearance = _ThemeAppearance(dark=dark)
     colors = _theme_colors(appearance)
     disabled = "#9299A9" if appearance.dark else "#757C8D"
+    has_icons = any(not action.isSeparator() and not action.icon().isNull() for action in menu.actions())
+    # Icon menus use the root inset as their sole outer whitespace. Qt adds
+    # its own icon gutter inside each item, so duplicating item insets would
+    # leave a visibly oversized gap before the text and a wider right edge.
+    surface_inset = 4
+    item_inset = 0 if has_icons else 8
+    # Menus with icons get a 14 px icon column and a deliberate 6 px text
+    # allocation; plain text menus do not reserve an empty icon gutter.
+    icon_column_width = (_COMPACT_MENU_ICON_SIZE + _COMPACT_MENU_ICON_GAP) if has_icons else 0
+    menu.setProperty(_COMPACT_MENU_PROPERTY, has_icons)
     menu.setStyleSheet(
-        f"QMenu {{ background: {colors.menu}; color: {colors.text}; padding: 2px; }}"
-        "QMenu::item { padding: 5px 7px; border-radius: 6px; }"
+        f"QMenu {{ background: {colors.menu}; color: {colors.text}; padding: {surface_inset}px; }}"
+        f"QMenu::item {{ padding: 5px {item_inset}px 5px {item_inset}px; border-radius: 6px; }}"
         f"QMenu::item:selected {{ background: {colors.menu_hover}; color: {colors.text}; }}"
         f"QMenu::item:disabled {{ color: {disabled}; }}"
-        f"QMenu::separator {{ background: {colors.menu_separator}; height: 1px; margin: 2px 4px; }}"
+        f"QMenu::separator {{ background: {colors.menu_separator}; height: 1px; margin: 2px {item_inset}px; }}"
     )
     text_width = max(
         (menu.fontMetrics().horizontalAdvance(action.text()) for action in menu.actions() if not action.isSeparator()),
         default=0,
     )
-    menu.setFixedWidth(text_width + 10)
+    # The icon column and its text gap are explicit, while the root and item
+    # insets remain mirrored so no action has unexplained right-side padding.
+    menu.setFixedWidth(text_width + icon_column_width + 2 * (surface_inset + item_inset))
 
 
 def _hover_color(theme: bool | _ThemeAppearance) -> QColor:

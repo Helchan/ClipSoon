@@ -697,6 +697,19 @@ class HistoryRepository:
     def clear_all(self) -> int:
         return self.delete_many(tuple(item.id for item in self.list_items()))
 
+    def clear_kind(self, kind: ClipKind) -> int:
+        """Delete every stored item of one history type.
+
+        Route through ``delete_many`` rather than issuing a direct ``DELETE``
+        so image history continues to clean up its orphaned PNG files.
+        """
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id FROM clips WHERE kind = ?", (kind.value,)
+            ).fetchall()
+        return self.delete_many(tuple(str(row["id"]) for row in rows))
+
     def _delete_image_if_orphan(self, image_name: str) -> None:
         with self._lock:
             in_use = self._connection.execute(

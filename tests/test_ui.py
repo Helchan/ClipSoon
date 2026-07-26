@@ -6,8 +6,8 @@ import time
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QInputMethodEvent, QKeySequence, QPainter, QPalette
+from PySide6.QtCore import QEvent, QItemSelectionModel, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QImage, QInputMethodEvent, QKeyEvent, QKeySequence, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -43,6 +43,7 @@ from clipsoon.ui import (
     _parse_hotkey,
     _platform_hotkey_validation_error,
     _ScaledImageLoader,
+    _settings_control_border_token,
     _style_sheet,
     _theme_colors,
     _ThemeAppearance,
@@ -613,12 +614,13 @@ def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -
         assert palette.color(QPalette.ColorRole.Text) == QColor("#171A24")
 
 
-def test_glass_translucent_theme_is_selectable_and_uses_a_readable_popup_palette(qtbot) -> None:
+def test_frosted_material_theme_is_selectable_and_uses_a_readable_popup_palette(qtbot) -> None:
     dialog = SettingsDialog(AppSettings(theme="liquid_glass"), accessibility_granted=True)
     qtbot.addWidget(dialog)
 
     assert dialog.theme.currentData() == "liquid_glass"
-    assert dialog.theme.currentText() == "玻璃半透（随系统）"
+    assert dialog.theme.currentText() == "磨砂质感（随系统）"
+    assert dialog.theme.findText("玻璃半透（随系统）") == -1
     assert dialog.theme.findText("液态玻璃（随系统）") == -1
     assert dialog.theme.findText("柔光半透（随系统）") == -1
     for combo in (dialog.hotkey_mode, dialog.theme):
@@ -750,8 +752,75 @@ def test_every_panel_theme_uses_one_visible_vertical_divider_without_a_detail_ca
     assert not divider.isVisible()
 
 
+@pytest.mark.parametrize(
+    ("appearance", "divider_color"),
+    (
+        pytest.param(
+            _ThemeAppearance(dark=False),
+            "rgba(35, 65, 98, 38)",
+            id="light",
+        ),
+        pytest.param(
+            _ThemeAppearance(dark=True),
+            "rgba(224, 238, 255, 46)",
+            id="dark",
+        ),
+        pytest.param(
+            _ThemeAppearance(dark=False, liquid_glass=True),
+            "rgba(35, 65, 98, 38)",
+            id="frosted-light",
+        ),
+        pytest.param(
+            _ThemeAppearance(dark=True, liquid_glass=True),
+            "rgba(224, 238, 255, 46)",
+            id="frosted-dark",
+        ),
+    ),
+)
+def test_settings_sections_share_the_main_panel_divider_material(
+    appearance: _ThemeAppearance,
+    divider_color: str,
+) -> None:
+    style = _style_sheet(appearance)
+    settings_rule = re.search(r"#settingsSection \{(?P<rule>[^}]*)\}", style)
+
+    assert settings_rule is not None
+    assert f"border: 1px solid {divider_color};" in settings_rule.group("rule")
+    assert f"#contentDivider {{ background: {divider_color};" in style
+    assert f"#searchFiltersDivider, #contentFooterDivider {{\n            background: {divider_color};" in style
+
+
+@pytest.mark.parametrize(
+    ("appearance", "divider_color"),
+    (
+        pytest.param(
+            _ThemeAppearance(dark=False, liquid_glass=True),
+            "rgba(35, 65, 98, 38)",
+            id="frosted-light",
+        ),
+        pytest.param(
+            _ThemeAppearance(dark=True, liquid_glass=True),
+            "rgba(224, 238, 255, 46)",
+            id="frosted-dark",
+        ),
+    ),
+)
+def test_frosted_settings_controls_share_the_main_panel_divider_material(
+    appearance: _ThemeAppearance,
+    divider_color: str,
+) -> None:
+    style = _style_sheet(appearance)
+
+    assert _settings_control_border_token(appearance)[0] == divider_color
+    assert "#settingsDialog QPlainTextEdit, #settingsDialog QLineEdit," in style
+    assert f"border: 1px solid {divider_color}; border-radius: 10px; padding: 7px;" in style
+    assert "#settingsDialog QComboBox::drop-down {" in style
+    assert f"border: none; border-left: 1px solid {divider_color}; width: 27px;" in style
+    assert "#settingsDialog QPushButton {" in style
+
+
 @pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
-def test_every_panel_theme_uses_shared_section_rules_without_a_search_frame(
+def test_every_panel_theme_keeps_search_and_footer_section_rules_without_a_search_frame(
     qtbot,
     theme: str,
 ) -> None:
@@ -763,13 +832,14 @@ def test_every_panel_theme_uses_shared_section_rules_without_a_search_frame(
 
     section_dividers = (
         panel.search_filters_divider,
-        panel.filters_content_divider,
         panel.content_footer_divider,
     )
     style = panel.styleSheet()
     assert panel.search_box.frameShape() == QFrame.Shape.NoFrame
     assert "#searchBox { background: transparent; border: none; }" in style
-    assert "#searchFiltersDivider, #filtersContentDivider, #contentFooterDivider {" in style
+    assert "#searchFiltersDivider, #contentFooterDivider {" in style
+    assert not hasattr(panel, "filters_content_divider")
+    assert "filtersContentDivider" not in style
 
     content_left = panel.history_content.mapTo(panel, QPoint()).x()
     content_right = panel.detail.mapTo(panel, QPoint(panel.detail.width(), 0)).x()
@@ -790,7 +860,7 @@ def test_every_panel_theme_uses_shared_section_rules_without_a_search_frame(
     content_top = min(top(panel.history_content), top(panel.detail))
     content_bottom = max(bottom(panel.history_content), bottom(panel.detail))
     assert bottom(panel.search_box) < top(panel.search_filters_divider) < top(first_filter)
-    assert bottom(first_filter) < top(panel.filters_content_divider) < content_top
+    assert bottom(first_filter) < content_top
     assert content_bottom < top(panel.content_footer_divider) < top(panel.version_label)
 
     reference_pixel = panel.content_divider.grab().toImage().pixelColor(
@@ -1182,7 +1252,7 @@ def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
         "#informationDivider {\n            background: rgba(35, 65, 98, 38); "
         "margin: 3px 8px 1px; min-height: 1px; max-height: 1px;\n        }" in style
     )
-    assert "#searchFiltersDivider, #filtersContentDivider, #contentFooterDivider {" in style
+    assert "#searchFiltersDivider, #contentFooterDivider {" in style
     assert "background: rgba(35, 65, 98, 38); border: none; min-height: 1px; max-height: 1px;" in style
     assert "#informationTitle { font-size: 13pt; font-weight: 650; padding: 6px 0 0 0; }" in style
     assert panel.search_icon.size() == QSize(30, 30)
@@ -1874,6 +1944,125 @@ def test_text_file_uses_bounded_read_only_preview(qtbot, tmp_path: Path) -> None
     assert wheel.accepted
 
 
+@pytest.mark.parametrize(
+    ("platform_name", "modifier"),
+    (
+        ("darwin", Qt.KeyboardModifier.MetaModifier),
+        ("win32", Qt.KeyboardModifier.ControlModifier),
+    ),
+)
+def test_selected_text_preview_copies_with_platform_shortcut_while_search_keeps_focus(
+    qtbot,
+    monkeypatch,
+    platform_name: str,
+    modifier: Qt.KeyboardModifier,
+) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("copy", "预览内容可以复制", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    qtbot.waitUntil(panel.search.hasFocus, timeout=500)
+    cursor = panel.text_preview.textCursor()
+    cursor.setPosition(0)
+    cursor.setPosition(4, cursor.MoveMode.KeepAnchor)
+    panel.text_preview.setTextCursor(cursor)
+    monkeypatch.setattr(ui_module.sys, "platform", platform_name)
+    QApplication.clipboard().clear()
+
+    handled = panel.eventFilter(
+        panel.search,
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_C, modifier),
+    )
+
+    assert handled
+    assert QApplication.clipboard().text() == "预览内容"
+    assert panel.search.hasFocus()
+
+
+def test_selected_text_file_preview_copies_with_windows_shortcut_while_search_keeps_focus(
+    qtbot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "preview.txt"
+    path.write_text("文件预览可以复制", encoding="utf-8")
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([ClipItem("file", ClipKind.FILES, "file", 1, 1, files=(str(path),))])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    qtbot.waitUntil(panel.search.hasFocus, timeout=500)
+    cursor = panel.file_text_preview.textCursor()
+    cursor.setPosition(0)
+    cursor.setPosition(4, cursor.MoveMode.KeepAnchor)
+    panel.file_text_preview.setTextCursor(cursor)
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    QApplication.clipboard().clear()
+
+    handled = panel.eventFilter(
+        panel.search,
+        QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_C,
+            Qt.KeyboardModifier.ControlModifier,
+        ),
+    )
+
+    assert handled
+    assert QApplication.clipboard().text() == "文件预览"
+    assert panel.search.hasFocus()
+
+
+def test_preview_copy_keeps_a_fresh_search_selection_as_the_priority(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("copy", "预览内容可以复制", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    qtbot.waitUntil(panel.search.hasFocus, timeout=500)
+    preview_cursor = panel.text_preview.textCursor()
+    preview_cursor.setPosition(0)
+    preview_cursor.setPosition(4, preview_cursor.MoveMode.KeepAnchor)
+    panel.text_preview.setTextCursor(preview_cursor)
+    panel.search.setText("搜索框优先")
+    panel.search.selectAll()
+    QApplication.clipboard().setText("sentinel")
+
+    handled = panel.eventFilter(
+        panel.search,
+        QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_C,
+            Qt.KeyboardModifier.ControlModifier,
+        ),
+    )
+
+    assert not handled
+    assert panel.search.hasSelectedText()
+    assert QApplication.clipboard().text() == "sentinel"
+
+
+def test_preview_context_menu_uses_chinese_copy_and_select_all_actions(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("copy", "预览内容可以复制", 1)])
+    preview = panel.text_preview
+
+    menu, copy_action, select_all_action = panel._create_preview_menu(preview)
+    qtbot.addWidget(menu)
+    assert [action.text() for action in menu.actions()] == ["复制", "全选"]
+    assert not copy_action.isEnabled()
+    assert select_all_action.isEnabled()
+
+    select_all_action.trigger()
+    assert preview.textCursor().selectedText() == "预览内容可以复制"
+    QApplication.clipboard().clear()
+    copy_action.setEnabled(True)
+    copy_action.trigger()
+    assert QApplication.clipboard().text() == "预览内容可以复制"
+
+
 def test_binary_file_keeps_file_icon_preview(qtbot, tmp_path: Path) -> None:
     path = tmp_path / "payload.bin"
     path.write_bytes(b"\x00\x01\x02\xff" * 32)
@@ -1938,16 +2127,16 @@ def test_detail_information_for_text_and_image(qtbot) -> None:
 
 
 def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
-    menu = QMenu()
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("selected", "item", 1)])
+    menu, delete_action, _clear_action, _settings_action = panel._create_list_menu()
     qtbot.addWidget(menu)
-    delete_action = menu.addAction("删除所选")
-    menu.addSeparator()
-    menu.addAction("清空历史")
 
-    _compact_menu(menu)
-
-    expected = menu.fontMetrics().horizontalAdvance("删除所选") + 10
+    expected = menu.fontMetrics().horizontalAdvance("删除") + (14 + 6) + 2 * (4 + 0)
     assert menu.width() == expected
+    assert menu.style().pixelMetric(QStyle.PixelMetric.PM_SmallIconSize, None, menu) == 14
+    assert "QMenu::item { padding: 5px 0px 5px 0px; border-radius: 6px; }" in menu.styleSheet()
     assert "QMenu::item:selected" in menu.styleSheet()
     assert "background: #E0E6F3" in menu.styleSheet()
 
@@ -1960,12 +2149,30 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     assert menu.activeAction() is delete_action
 
 
+def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("selected", "item", 1)])
+
+    menu, delete_action, clear_action, settings_action = panel._create_list_menu()
+    qtbot.addWidget(menu)
+
+    assert [action.text() for action in (delete_action, clear_action, settings_action)] == [
+        "删除",
+        "清空",
+        "设置",
+    ]
+    assert all(not action.icon().isNull() for action in (delete_action, clear_action, settings_action))
+    assert all(action.isIconVisibleInMenu() for action in (delete_action, clear_action, settings_action))
+
+
 def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     menu = QMenu()
     qtbot.addWidget(menu)
-    menu.addAction("删除所选")
+    menu.addAction("删除")
+    menu.addAction("清空")
     menu.addSeparator()
-    menu.addAction("清空历史")
+    menu.addAction("设置")
 
     _compact_menu(menu, dark=True)
 
@@ -1974,6 +2181,76 @@ def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     assert "color: #F2F4F8" in style
     assert "background: #444B5C" in style
     assert "background: #454C5C" in style
+
+
+@pytest.mark.parametrize(
+    ("kind", "confirmation_text"),
+    (
+        (None, "清空全部剪贴板历史？此操作无法撤销。"),
+        (ClipKind.TEXT, "清空剪切板文本历史？此操作无法撤销。"),
+        (ClipKind.IMAGE, "清空剪切板截图历史？此操作无法撤销。"),
+        (ClipKind.FILES, "清空剪切板文件历史？此操作无法撤销。"),
+    ),
+    ids=("all", "text", "image", "files"),
+)
+def test_clear_current_tab_history_uses_its_own_confirmation_and_signal(
+    qtbot, monkeypatch, kind, confirmation_text
+) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items(
+        [
+            clip("text", "text", 3),
+            ClipItem("image", ClipKind.IMAGE, "image", 2, 2),
+            ClipItem("files", ClipKind.FILES, "files", 1, 1, files=("/tmp/file",)),
+        ]
+    )
+    panel._set_filter_kind(kind)
+    confirmations: list[tuple[str, str, str]] = []
+    requested: list[ClipKind | None] = []
+    panel.clear_requested.connect(requested.append)
+
+    def confirm(parent, title, text, confirm_text, *, dark=False, appearance=None) -> bool:
+        del parent, dark, appearance
+        confirmations.append((title, text, confirm_text))
+        return True
+
+    monkeypatch.setattr(ui_module, "_confirm_destructive_action", confirm)
+
+    panel._request_clear_current_kind()
+
+    assert confirmations == [("清空历史", confirmation_text, "确定")]
+    assert requested == [kind]
+
+
+def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items(
+        [
+            clip("text", "text", 2),
+            ClipItem("image", ClipKind.IMAGE, "image", 1, 1),
+        ]
+    )
+    panel._set_filter_kind(ClipKind.TEXT)
+    panel.search.setText("no matching text")
+    menu, delete_action, clear_action, settings_action = panel._create_list_menu()
+    qtbot.addWidget(menu)
+    settings_requests: list[bool] = []
+    panel.settings_requested.connect(lambda: settings_requests.append(True))
+
+    assert [action.text() for action in menu.actions() if not action.isSeparator()] == [
+        "删除",
+        "清空",
+        "设置",
+    ]
+    assert not delete_action.isEnabled()
+    assert clear_action.isEnabled()
+    assert settings_action.isEnabled()
+
+    panel._handle_list_menu_action(settings_action, delete_action, clear_action, settings_action)
+
+    assert settings_requests == [True]
 
 
 def test_filter_and_list_background_align_with_borderless_search_region(qtbot) -> None:
