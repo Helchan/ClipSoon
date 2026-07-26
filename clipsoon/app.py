@@ -25,6 +25,7 @@ from clipsoon.core import (
     JsonSettingsStore,
     ObservableSettings,
 )
+from clipsoon.macos_backdrop import MacosBackdropController
 from clipsoon.system import (
     ClipboardController,
     ForegroundTargetHandle,
@@ -35,7 +36,7 @@ from clipsoon.system import (
     PynputPasteAdapter,
     SelectionSender,
 )
-from clipsoon.ui import ClipPanel, SettingsDialog, create_tray_icon
+from clipsoon.ui import ClipPanel, SettingsDialog, _install_app_owned_caret_style, create_tray_icon
 
 LOGGER = logging.getLogger(__name__)
 _CRASH_LOG_STREAM = None
@@ -145,12 +146,20 @@ class ClipSoonApplication(QObject):
         self._file_history_sweep_timer = QTimer(self)
         self._file_history_sweep_timer.setInterval(_FILE_HISTORY_SWEEP_INTERVAL_MS)
         self._file_history_sweep_timer.timeout.connect(self._schedule_file_history_sweep)
+        self._system_theme_refresh_timer = QTimer(self)
+        self._system_theme_refresh_timer.setSingleShot(True)
+        self._system_theme_refresh_timer.timeout.connect(self._refresh_system_theme)
         self._file_history_sweep_active = False
         self._next_hotkey_restart_at = 0.0
         self._panel_show_generation = 0
         self._confirmed_windows_hotkey: AppSettings | None = None
         self._pending_hotkey_rollback: AppSettings | None = None
         self._pending_hotkey_candidate = ""
+        self._macos_backdrop = MacosBackdropController()
+        self._settings_dialog: SettingsDialog | None = None
+        self._system_theme_refresh_pending = False
+        self._style_hints = qt_app.styleHints()
+        self._system_theme_signals_connected = False
 
         self.panel = ClipPanel(lambda: self.settings.value)
         self.panel.set_items(self.repository.list_items())
@@ -227,6 +236,13 @@ class ClipSoonApplication(QObject):
         self.tray_actions["quit"].triggered.connect(self.qt_app.quit)
         self.tray.activated.connect(self._tray_activated)
         self.qt_app.aboutToQuit.connect(self.shutdown)
+        # ``paletteChanged`` covers the resolved Qt colors, while
+        # ``colorSchemeChanged`` arrives first on platforms that surface the
+        # operating-system appearance directly.  Coalesce them because one
+        # system switch commonly emits both signals.
+        self.qt_app.paletteChanged.connect(self._schedule_system_theme_refresh)
+        self._style_hints.colorSchemeChanged.connect(self._schedule_system_theme_refresh)
+        self._system_theme_signals_connected = True
 
     def toggle_panel(self, context: HotkeyActivationContext | None = None) -> None:
         windows = PlatformBridge.is_windows()
@@ -270,6 +286,7 @@ class ClipSoonApplication(QObject):
             else PlatformBridge.foreground_window_id()
         )
         elapsed = self.panel.show_panel()
+        self._sync_new_native_window(self.panel)
         if windows:
             self._panel_show_generation += 1
             generation = self._panel_show_generation
@@ -381,8 +398,132 @@ class ClipSoonApplication(QObject):
         dialog.reveal_requested.connect(self.open_data_directory)
         dialog.accessibility_requested.connect(self.open_accessibility_settings)
         dialog.settings_changed.connect(lambda values: self._apply_settings(values, dialog))
-        dialog.exec()
-        self.panel.keep_open(False)
+        dialog.native_window_shown.connect(lambda: self._sync_new_native_window(dialog))
+        self._settings_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            if sys.platform == "darwin":
+                # A modal dialog's Qt NSView can be torn down after ``exec``.  Its
+                # sibling effect must not outlive that view in the parent hierarchy.
+                self._macos_backdrop.remove(int(dialog.winId()))
+            self._settings_dialog = None
+            self.panel.keep_open(False)
+            # Modal teardown can briefly leave the command panel without a
+            # focus widget. Restore its permanent typing target after the
+            # dialog closes; the deferred pass wins over Qt's modal restore.
+            self._restore_panel_search_focus()
+            QTimer.singleShot(0, self._restore_panel_search_focus)
+
+    def _restore_panel_search_focus(self) -> None:
+        if self.panel.isVisible():
+            self.panel.search.setFocus()
+
+    def _schedule_system_theme_refresh(self, *_args: object) -> None:
+        """Coalesce an OS appearance update before repainting dynamic themes."""
+        if self.settings.value.theme not in {"system", "liquid_glass"}:
+            return
+        if self._system_theme_refresh_pending:
+            return
+        self._system_theme_refresh_pending = True
+        self._system_theme_refresh_timer.start(0)
+
+    def _refresh_system_theme(self) -> None:
+        """Resolve the current OS palette without overriding explicit themes."""
+        self._system_theme_refresh_pending = False
+        settings = self.settings.value
+        if settings.theme not in {"system", "liquid_glass"}:
+            return
+
+        self.panel.apply_theme()
+        self._sync_native_material(self.panel)
+        if self._settings_dialog is not None:
+            # Settings are applied immediately, so reflecting the persisted
+            # object keeps the currently open dialog in the same resolved
+            # system appearance as the panel.
+            self._settings_dialog.apply_settings(settings)
+            self._sync_native_material(self._settings_dialog)
+
+    def _sync_native_material(self, window: ClipPanel | SettingsDialog) -> None:
+        """Synchronize optional platform material without changing Qt window modes.
+
+        Windows remains on the documented DWM Acrylic path and ordinary
+        non-layered Qt backing store.  On macOS, a displayed transparent Qt
+        top-level receives a sibling ``NSVisualEffectView`` behind it.  Both
+        native paths are enhancements only; the custom material renderer stays
+        readable when the operating system declines the request.
+        """
+        was_active = window.native_backdrop_active
+        enabled = False
+        if PlatformBridge.is_windows():
+            window_id = int(window.winId())
+            if window.uses_liquid_glass_theme():
+                enabled = PlatformBridge.apply_windows_desktop_acrylic(window_id)
+                if not enabled and was_active:
+                    PlatformBridge.clear_windows_desktop_acrylic(window_id)
+            elif was_active:
+                PlatformBridge.clear_windows_desktop_acrylic(window_id)
+        elif sys.platform == "darwin":
+            window_id = int(window.winId())
+            if window.uses_liquid_glass_theme():
+                # Keep the visible material card exactly aligned with the
+                # ordinary-theme card.  The panel has a 14pt transparent
+                # layout gutter for its outer silhouette; the native effect
+                # must begin inside it rather than painting a second gray ring.
+                is_panel = isinstance(window, ClipPanel)
+                content_inset = 14.0 if is_panel else 0.0
+                enabled = self._macos_backdrop.apply(
+                    window_id,
+                    # Match the corresponding Qt-painted shell precisely.
+                    # Settings uses a tighter 16pt radius than the panel's
+                    # 18pt card, otherwise the native material can form a
+                    # faint halo around its corners.
+                    corner_radius=18.0 if is_panel else 16.0,
+                    content_inset=content_inset,
+                    # ClipSoon is a contextual floating command panel, so the
+                    # documented popover material preserves stronger frosted
+                    # color silhouettes. The settings dialog remains an
+                    # under-window surface to keep its form content calmer.
+                    material_role="popover" if is_panel else "under_window",
+                ).applied
+            elif was_active:
+                self._macos_backdrop.remove(window_id)
+        window.set_native_backdrop_active(enabled)
+
+    def _sync_new_native_window(self, window: ClipPanel | SettingsDialog) -> None:
+        """Apply material now, then verify its AppKit sibling after ``show()`` settles."""
+
+        self._sync_native_material(window)
+        if sys.platform != "darwin":
+            return
+
+        # Qt can finish reparenting its QNSView during the next turn after a
+        # frameless Tool/Panel is shown and raised.  The controller validates
+        # cached effects, so these cheap follow-ups only reinsert when the
+        # sibling host actually changed.
+        for delay_ms in (0, 24):
+            QTimer.singleShot(
+                delay_ms,
+                lambda window=window: self._sync_visible_native_material(window),
+            )
+
+    def _sync_visible_native_material(self, window: ClipPanel | SettingsDialog) -> None:
+        """Skip a deferred effect check if the panel hid before it ran."""
+
+        try:
+            visible = window.isVisible()
+        except RuntimeError:
+            # A zero-delay callback can outlive a QWidget during application
+            # shutdown or a test teardown.  There is no native view left to
+            # validate in that case.
+            return
+        if visible:
+            self._sync_native_material(window)
+
+    def _sync_windows_backdrop(self, window: ClipPanel | SettingsDialog) -> None:
+        """Compatibility entry point retained for the existing Windows contract tests."""
+
+        self._sync_native_material(window)
 
     def _apply_settings(self, values: dict[str, object], dialog: SettingsDialog | None = None) -> None:
         """Persist and activate a setting change made in the open dialog."""
@@ -404,7 +545,9 @@ class ClipSoonApplication(QObject):
 
         if dialog is not None:
             dialog.apply_settings(new)
+            self._sync_native_material(dialog)
         self.panel.apply_theme()
+        self._sync_native_material(self.panel)
         hotkey_changed = old.hotkey != new.hotkey
         hotkey_restart_required = hotkey_changed or (
             not PlatformBridge.is_windows()
@@ -586,8 +729,16 @@ class ClipSoonApplication(QObject):
         self._panel_watch_timer.stop()
         self._hotkey_health_timer.stop()
         self._file_history_sweep_timer.stop()
+        self._system_theme_refresh_timer.stop()
+        self._system_theme_refresh_pending = False
+        if self._system_theme_signals_connected:
+            self.qt_app.paletteChanged.disconnect(self._schedule_system_theme_refresh)
+            self._style_hints.colorSchemeChanged.disconnect(self._schedule_system_theme_refresh)
+            self._system_theme_signals_connected = False
         self.hotkey.stop()
         self.clipboard.stop()
+        if sys.platform == "darwin":
+            self._macos_backdrop.remove(int(self.panel.winId()))
         QThreadPool.globalInstance().waitForDone(3_000)
         self.repository.close()
         self.tray.hide()
@@ -597,6 +748,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = argv if argv is not None else sys.argv
     started = time.perf_counter()
     qt_app = QApplication(arguments)
+    _install_app_owned_caret_style(qt_app)
     qt_app.setApplicationName("ClipSoon")
     qt_app.setApplicationVersion(__version__)
     qt_app.setOrganizationName("ClipSoon")

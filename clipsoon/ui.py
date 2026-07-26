@@ -13,6 +13,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QAbstractListModel,
+    QEasingCurve,
     QEvent,
     QFileInfo,
     QItemSelection,
@@ -20,16 +21,20 @@ from PySide6.QtCore import (
     QModelIndex,
     QObject,
     QPoint,
+    QPointF,
     QRect,
+    QRectF,
     QRunnable,
     QSize,
     Qt,
     QThreadPool,
     QTimer,
+    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QColor,
     QCursor,
     QFont,
@@ -40,11 +45,14 @@ from PySide6.QtGui import (
     QInputMethodEvent,
     QKeyEvent,
     QKeySequence,
+    QLinearGradient,
     QMouseEvent,
     QPainter,
+    QPainterPath,
     QPalette,
     QPen,
     QPixmap,
+    QRadialGradient,
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -64,14 +72,16 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListView,
     QMenu,
-    QMessageBox,
     QPlainTextEdit,
+    QProxyStyle,
     QPushButton,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
     QStyle,
     QStyledItemDelegate,
+    QStyleFactory,
+    QStyleOptionButton,
     QStyleOptionViewItem,
     QSystemTrayIcon,
     QToolButton,
@@ -156,6 +166,15 @@ _FILE_REVISION_TTL_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
+class _ThemeAppearance:
+    """Resolved theme plus the independent state of an optional native backdrop."""
+
+    dark: bool
+    liquid_glass: bool = False
+    native_backdrop: bool = False
+
+
+@dataclass(frozen=True)
 class _ThemeColors:
     """Semantic colors shared by Qt stylesheets and custom-painted controls."""
 
@@ -211,9 +230,665 @@ _DARK_COLORS = _ThemeColors(
     menu_separator="#454C5C",
 )
 
+_GLASS_LIGHT_FALLBACK_COLORS = _ThemeColors(
+    window="#EEF4FF",
+    card="rgba(247, 251, 255, 248)",
+    panel="rgba(225, 236, 253, 244)",
+    control="rgba(255, 255, 255, 238)",
+    text="#142039",
+    muted="#53637A",
+    border="rgba(58, 87, 134, 72)",
+    accent="#2C63D9",
+    accent_focus="#3D78EE",
+    hover="#DCE9FC",
+    thumbnail="#D6E4FA",
+    popup="#F9FBFF",
+    menu="#F7FAFF",
+    menu_hover="#DCE9FC",
+    menu_separator="#C8D7EF",
+)
+_GLASS_DARK_FALLBACK_COLORS = _ThemeColors(
+    window="#17202E",
+    card="rgba(24, 34, 50, 248)",
+    panel="rgba(34, 47, 68, 244)",
+    control="rgba(42, 57, 80, 240)",
+    text="#F2F7FF",
+    muted="#B5C4D8",
+    border="rgba(190, 215, 255, 48)",
+    accent="#6B9DFF",
+    accent_focus="#83AEFF",
+    hover="#354967",
+    thumbnail="#3B5273",
+    popup="#243249",
+    menu="#26364E",
+    menu_hover="#3D5475",
+    menu_separator="#4A6388",
+)
+_GLASS_LIGHT_NATIVE_COLORS = _ThemeColors(
+    window="#F4F8FC",
+    card="rgba(246, 250, 255, 132)",
+    panel="rgba(231, 241, 250, 112)",
+    control="rgba(255, 255, 255, 138)",
+    text="#10203A",
+    muted="#405A7B",
+    border="rgba(255, 255, 255, 116)",
+    accent="#2B62D7",
+    accent_focus="#3B78ED",
+    hover="#D5E5FD",
+    thumbnail="#CCDCF7",
+    popup="#F8FBFF",
+    menu="#F7FAFF",
+    menu_hover="#DCE9FC",
+    menu_separator="#C8D7EF",
+)
+_GLASS_DARK_NATIVE_COLORS = _ThemeColors(
+    window="#1B2633",
+    card="rgba(22, 32, 46, 148)",
+    panel="rgba(36, 51, 70, 122)",
+    control="rgba(53, 68, 91, 148)",
+    text="#F3F7FF",
+    muted="#C0CEE0",
+    border="rgba(226, 239, 255, 62)",
+    accent="#74A4FF",
+    accent_focus="#8AB5FF",
+    hover="#415B80",
+    thumbnail="#466088",
+    popup="#243249",
+    menu="#26364E",
+    menu_hover="#3D5475",
+    menu_separator="#4A6388",
+)
 
-def _theme_colors(dark: bool) -> _ThemeColors:
-    return _DARK_COLORS if dark else _LIGHT_COLORS
+
+def _system_prefers_dark() -> bool:
+    return QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+
+def _theme_appearance(
+    settings: AppSettings,
+    *,
+    native_backdrop: bool = False,
+) -> _ThemeAppearance:
+    liquid_glass = settings.theme == "liquid_glass"
+    dark = settings.theme == "dark" or (
+        settings.theme in {"system", "liquid_glass"} and _system_prefers_dark()
+    )
+    return _ThemeAppearance(
+        dark=dark,
+        liquid_glass=liquid_glass,
+        native_backdrop=liquid_glass and native_backdrop,
+    )
+
+
+def _as_theme_appearance(value: bool | _ThemeAppearance) -> _ThemeAppearance:
+    return value if isinstance(value, _ThemeAppearance) else _ThemeAppearance(dark=bool(value))
+
+
+def _theme_colors(theme: bool | _ThemeAppearance) -> _ThemeColors:
+    """Return semantic tokens while keeping bool callers backward compatible."""
+    appearance = _as_theme_appearance(theme)
+    if not appearance.liquid_glass:
+        return _DARK_COLORS if appearance.dark else _LIGHT_COLORS
+    if appearance.native_backdrop:
+        return _GLASS_DARK_NATIVE_COLORS if appearance.dark else _GLASS_LIGHT_NATIVE_COLORS
+    return _GLASS_DARK_FALLBACK_COLORS if appearance.dark else _GLASS_LIGHT_FALLBACK_COLORS
+
+
+def _active_foreground(appearance: _ThemeAppearance) -> str:
+    """Return the readable foreground for an active semantic surface.
+
+    Liquid-glass active fills stay intentionally luminous in both appearances.
+    White text falls below readable contrast on those translucent blues, so
+    every liquid active state shares one deep navy foreground instead.
+    """
+
+    return "#0A192F" if appearance.liquid_glass else "#FFFFFF"
+
+
+def _accent_foreground(appearance: _ThemeAppearance) -> str:
+    """Return the readable foreground for a solid accent control.
+
+    This is intentionally distinct from :func:`_active_foreground`: list
+    selections and filter chips are translucent, luminous surfaces, whereas
+    a combo popup or primary button uses the opaque accent token itself.  The
+    light liquid accent needs white text; its darker liquid counterpart needs
+    the same deep navy used by the glass active surface.
+    """
+
+    return "#0A192F" if appearance.liquid_glass and appearance.dark else "#FFFFFF"
+
+
+_APP_OWNED_CARET_PROPERTY = "_clipsoon_app_owned_caret"
+_APP_OWNED_CARET_STYLE: _AppOwnedCaretStyle | None = None
+
+
+class _AppOwnedCaretStyle(QProxyStyle):
+    """Suppress Qt's platform caret only for editors owned by ClipSoon.
+
+    macOS can render a white native insertion caret even after the QLineEdit
+    text palette has been updated.  Returning a zero cursor width is a public
+    Qt paint metric: editing, selection, undo and IME handling stay native,
+    while the app can draw one predictable themed caret above the editor.
+    """
+
+    def pixelMetric(self, metric, option=None, widget=None) -> int:
+        if (
+            metric == QStyle.PixelMetric.PM_TextCursorWidth
+            and isinstance(widget, QLineEdit)
+            and bool(widget.property(_APP_OWNED_CARET_PROPERTY))
+        ):
+            return 0
+        return super().pixelMetric(metric, option, widget)
+
+
+def _install_app_owned_caret_style(qt_app: QApplication | None = None) -> None:
+    """Install one application proxy before widgets receive their QSS.
+
+    A per-widget QProxyStyle is unreliable below QStyleSheetStyle and can
+    transfer ownership of a private QSpinBox editor's style.  An app-level
+    proxy with a cloned base style avoids both problems and is a no-op for all
+    controls except explicitly marked QLineEdits.
+    """
+
+    global _APP_OWNED_CARET_STYLE
+    application = qt_app if qt_app is not None else QApplication.instance()
+    if not isinstance(application, QApplication):
+        return
+    if isinstance(application.style(), _AppOwnedCaretStyle):
+        _APP_OWNED_CARET_STYLE = application.style()
+        return
+
+    base_style = QStyleFactory.create(application.style().objectName())
+    style = _AppOwnedCaretStyle(base_style) if base_style is not None else _AppOwnedCaretStyle()
+    application.setStyle(style)
+    _APP_OWNED_CARET_STYLE = style
+
+
+def _apply_text_input_palette(
+    editor: QLineEdit,
+    colors: _ThemeColors,
+    appearance: _ThemeAppearance,
+) -> None:
+    """Apply the semantic text palette after Qt has polished the input QSS.
+
+    Applying these values to the actual QLineEdit (rather than only to a
+    parent QSpinBox/QKeySequenceEdit) keeps every editable field readable on
+    a translucent backing store.  The application-owned caret below uses the
+    same text token rather than trusting the platform's native white caret.
+    """
+
+    palette = editor.palette()
+    palette.setColor(QPalette.ColorRole.Text, QColor(colors.text))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(colors.text))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(colors.muted))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(colors.accent))
+    palette.setColor(
+        QPalette.ColorRole.HighlightedText,
+        QColor(_accent_foreground(appearance)),
+    )
+    editor.setPalette(palette)
+
+
+class _ThemedCaretOverlay(QWidget):
+    """A tiny non-interactive caret painted over a native QLineEdit."""
+
+    _WIDTH = 2
+
+    def __init__(self, editor: QLineEdit) -> None:
+        super().__init__(editor)
+        self._color = QColor("#10203A")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.hide()
+
+    def set_color(self, color: QColor) -> None:
+        color = QColor(color)
+        if color == self._color:
+            return
+        self._color = color
+        self.update()
+
+    def follow_cursor(self, cursor: QRect) -> None:
+        # QLineEdit.cursorRect() reserves a wide blink area. Its centre stays
+        # on the actual insertion position even when the native width is zero.
+        self.setGeometry(
+            cursor.center().x(),
+            cursor.y(),
+            self._WIDTH,
+            max(1, cursor.height()),
+        )
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self._color)
+
+
+class _ThemedTextCaret(QObject):
+    """Keep a dark, genuinely blinking caret without changing native editing."""
+
+    _REFRESH_EVENTS = {
+        QEvent.Type.FocusIn,
+        QEvent.Type.FocusOut,
+        QEvent.Type.Show,
+        QEvent.Type.Hide,
+        QEvent.Type.Move,
+        QEvent.Type.Resize,
+        QEvent.Type.FontChange,
+        QEvent.Type.StyleChange,
+        QEvent.Type.PaletteChange,
+        QEvent.Type.KeyPress,
+        QEvent.Type.KeyRelease,
+        QEvent.Type.MouseButtonPress,
+        QEvent.Type.MouseButtonRelease,
+        QEvent.Type.WindowActivate,
+        QEvent.Type.WindowDeactivate,
+    }
+
+    def __init__(self, editor: QLineEdit, *, focus_owner: QWidget | None = None) -> None:
+        super().__init__(editor)
+        _install_app_owned_caret_style()
+        self._editor = editor
+        self._focus_owner = focus_owner if focus_owner is not None else editor
+        self._window = editor.window()
+        self._ime_composing = False
+        self._phase_visible = True
+        self._overlay = _ThemedCaretOverlay(editor)
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._advance_phase)
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setSingleShot(True)
+        self._sync_timer.timeout.connect(self._refresh)
+
+        # The global proxy sees this marker while QLineEdit paints.  That
+        # removes the native white caret for both visible and hidden phases.
+        editor.setProperty(_APP_OWNED_CARET_PROPERTY, True)
+        editor.installEventFilter(self)
+        if self._focus_owner is not editor:
+            self._focus_owner.installEventFilter(self)
+        if self._window is not editor and self._window is not self._focus_owner:
+            self._window.installEventFilter(self)
+        editor.cursorPositionChanged.connect(self._restart_blink)
+        editor.selectionChanged.connect(self._restart_blink)
+        editor.textChanged.connect(self._restart_blink)
+        flash_changed = getattr(QApplication.styleHints(), "cursorFlashTimeChanged", None)
+        if flash_changed is not None:
+            flash_changed.connect(self._restart_blink)
+        self._restart_blink()
+
+    @property
+    def overlay(self) -> _ThemedCaretOverlay:
+        return self._overlay
+
+    def set_color(self, color: QColor) -> None:
+        self._overlay.set_color(color)
+        self._schedule_refresh()
+
+    def _restart_blink(self, *_args: object) -> None:
+        self._phase_visible = True
+        flash_time = QApplication.styleHints().cursorFlashTime()
+        if flash_time >= 2:
+            self._blink_timer.start(max(1, flash_time // 2))
+        else:
+            self._blink_timer.stop()
+        self._schedule_refresh()
+
+    def _advance_phase(self) -> None:
+        self._phase_visible = not self._phase_visible
+        self._refresh()
+
+    def _schedule_refresh(self) -> None:
+        if not self._sync_timer.isActive():
+            self._sync_timer.start(0)
+
+    def _should_draw(self) -> bool:
+        if (
+            self._ime_composing
+            or not self._editor.isVisible()
+            or not self._editor.isEnabled()
+            or self._editor.isReadOnly()
+            or not (self._editor.hasFocus() or self._focus_owner.hasFocus())
+        ):
+            return False
+        return self._window.isActiveWindow()
+
+    def _refresh(self) -> None:
+        if not self._should_draw():
+            self._overlay.hide()
+            return
+        self._overlay.follow_cursor(self._editor.cursorRect())
+        if self._phase_visible:
+            self._overlay.show()
+            self._overlay.raise_()
+        else:
+            self._overlay.hide()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self._editor and event.type() == QEvent.Type.InputMethod:
+            input_event = event if isinstance(event, QInputMethodEvent) else None
+            self._ime_composing = bool(input_event and input_event.preeditString())
+            self._restart_blink()
+            return False
+
+        if event.type() in self._REFRESH_EVENTS:
+            if event.type() in {
+                QEvent.Type.FocusOut,
+                QEvent.Type.Hide,
+                QEvent.Type.WindowDeactivate,
+            }:
+                self._blink_timer.stop()
+                self._phase_visible = True
+                self._schedule_refresh()
+            else:
+                self._restart_blink()
+        return False
+
+
+_LIQUID_GLASS_RADIUS = 18.0
+
+
+def _paint_liquid_glass_material(
+    painter: QPainter,
+    rect: QRectF,
+    appearance: _ThemeAppearance,
+    *,
+    light_position: QPointF | None = None,
+    light_strength: float = 0.0,
+    radius: float = _LIQUID_GLASS_RADIUS,
+) -> None:
+    """Paint a self-contained, lens-inspired material without screen capture.
+
+    The scene below the material is deliberately app-owned: platform backdrop
+    APIs may add real desktop blur, while this renderer keeps the same depth,
+    rim light, and interaction response on unsupported systems.  It therefore
+    remains private and predictable on macOS 13--15 and Windows.
+    """
+
+    if rect.width() <= 2 or rect.height() <= 2:
+        return
+
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    shell = QPainterPath()
+    shell.addRoundedRect(rect, radius, radius)
+    painter.setClipPath(shell)
+
+    native = appearance.native_backdrop
+    if appearance.dark:
+        # Native backdrop already supplies the blur.  Keep this foreground
+        # coating deliberately thin so the blurred scene can remain visible
+        # without sacrificing the contrast of the actual app content.
+        base = QColor(19, 29, 43, 64 if native else 226)
+        top_tint = QColor(85, 141, 220, 15 if native else 72)
+        lower_tint = QColor(84, 107, 143, 7 if native else 62)
+        warm_tint = QColor(94, 194, 186, 6 if native else 42)
+        top_gloss = QColor(238, 248, 255, 16 if native else 42)
+        bottom_shade = QColor(2, 8, 20, 15 if native else 94)
+        rim_light = QColor(229, 243, 255, 106 if native else 106)
+        inner_rim = QColor(151, 202, 255, 28 if native else 56)
+        top_field_alpha = 10 if native else 58
+        lower_field_alpha = 5 if native else 58
+    else:
+        # Do not use a saturated blue/purple lower field over the native
+        # material: it turns the right-bottom corner into a coloured wall and
+        # hides the frosted background.  A low-alpha neutral cool tone retains
+        # depth while leaving underlying windows visible as blurred silhouettes.
+        base = QColor(231, 240, 248, 32 if native else 218)
+        top_tint = QColor(111, 169, 246, 10 if native else 86)
+        lower_tint = QColor(193, 209, 231, 4 if native else 66)
+        warm_tint = QColor(105, 211, 197, 5 if native else 50)
+        top_gloss = QColor(255, 255, 255, 26 if native else 106)
+        bottom_shade = QColor(41, 66, 94, 4 if native else 50)
+        rim_light = QColor(255, 255, 255, 156 if native else 174)
+        inner_rim = QColor(126, 181, 255, 30 if native else 74)
+        top_field_alpha = 8 if native else 58
+        lower_field_alpha = 4 if native else 58
+
+    painter.fillPath(shell, base)
+
+    # A wide low-frequency colour field provides something meaningful for the
+    # translucent lens to bend even when the desktop behind the app is flat.
+    ambient = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    ambient.setColorAt(0.0, top_tint)
+    ambient.setColorAt(0.44, warm_tint)
+    ambient.setColorAt(1.0, lower_tint)
+    painter.fillPath(shell, QBrush(ambient))
+
+    def fill_radial(center: QPointF, extent: float, center_color: QColor) -> None:
+        glow = QRadialGradient(center, extent)
+        glow.setColorAt(0.0, center_color)
+        edge = QColor(center_color)
+        edge.setAlpha(0)
+        glow.setColorAt(1.0, edge)
+        painter.fillPath(shell, QBrush(glow))
+
+    fill_radial(
+        QPointF(rect.left() + rect.width() * 0.15, rect.top() + rect.height() * 0.1),
+        max(rect.width(), rect.height()) * 0.68,
+        QColor(255, 255, 255, top_field_alpha),
+    )
+    fill_radial(
+        QPointF(rect.right() - rect.width() * 0.08, rect.bottom() - rect.height() * 0.12),
+        max(rect.width(), rect.height()) * 0.58,
+        QColor(139, 188, 230, lower_field_alpha),
+    )
+
+    if light_position is not None and light_strength > 0:
+        # The hover response is intentionally local and low-contrast: it
+        # should make the surface feel responsive, never read as a cursor-sized
+        # spotlight or decorative ring around the user's work.
+        bloom = min(rect.width(), rect.height()) * 0.16
+        fill_radial(
+            light_position,
+            max(42.0, bloom),
+            QColor(255, 255, 255, int(5 + light_strength * 18)),
+        )
+
+    # A clear upper sheen and denser lower edge make the surface read as a
+    # thick material rather than a low-opacity card.
+    gloss = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.top() + rect.height() * 0.48)
+    gloss.setColorAt(0.0, top_gloss)
+    gloss.setColorAt(0.46, QColor(top_gloss.red(), top_gloss.green(), top_gloss.blue(), 18))
+    gloss.setColorAt(1.0, QColor(top_gloss.red(), top_gloss.green(), top_gloss.blue(), 0))
+    painter.fillPath(shell, QBrush(gloss))
+
+    lower_edge = QLinearGradient(rect.left(), rect.bottom() - rect.height() * 0.32, rect.left(), rect.bottom())
+    lower_edge.setColorAt(0.0, QColor(bottom_shade.red(), bottom_shade.green(), bottom_shade.blue(), 0))
+    lower_edge.setColorAt(1.0, bottom_shade)
+    painter.fillPath(shell, QBrush(lower_edge))
+    painter.restore()
+
+    # Keep the rim outside the clip so antialiasing stays clean.  A blue inner
+    # edge beside the white outer edge creates a restrained chromatic refraction
+    # cue without using a per-pixel desktop capture.
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    rim = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    rim.setColorAt(0.0, rim_light)
+    rim.setColorAt(0.5, QColor(rim_light.red(), rim_light.green(), rim_light.blue(), rim_light.alpha() // 2))
+    rim.setColorAt(1.0, QColor(143, 190, 255, max(34, rim_light.alpha() // 2)))
+    painter.setPen(QPen(QBrush(rim), 1.15))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(shell)
+    inner = QPainterPath()
+    inner.addRoundedRect(rect.adjusted(1.55, 1.55, -1.55, -1.55), max(2.0, radius - 1.55), max(2.0, radius - 1.55))
+    painter.setPen(QPen(inner_rim, 0.8))
+    painter.drawPath(inner)
+
+    glint = QPainterPath()
+    glint.moveTo(rect.left() + radius * 0.78, rect.top() + 1.2)
+    glint.cubicTo(
+        rect.left() + rect.width() * 0.28,
+        rect.top() + 0.2,
+        rect.left() + rect.width() * 0.52,
+        rect.top() + 2.0,
+        rect.left() + rect.width() * 0.68,
+        rect.top() + 3.4,
+    )
+    painter.setPen(QPen(QColor(255, 255, 255, max(38, rim_light.alpha() // 2)), 1.25))
+    painter.drawPath(glint)
+    painter.restore()
+
+
+class _LiquidGlassSurface(QFrame):
+    """One primary custom-painted material shell for a widget hierarchy."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._appearance = _ThemeAppearance(dark=False)
+        self._light_position = QPointF()
+        self._light_strength = 0.0
+        self._hover_animation = QVariantAnimation(self)
+        self._hover_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._hover_animation.valueChanged.connect(self._set_light_strength)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+
+    def set_appearance(self, appearance: _ThemeAppearance) -> None:
+        self._appearance = appearance
+        if not appearance.liquid_glass:
+            self._hover_animation.stop()
+            self._light_strength = 0.0
+        self.update()
+
+    def set_light_position(self, position: QPointF) -> None:
+        if not self._appearance.liquid_glass:
+            return
+        self._light_position = position
+        self.update()
+
+    def set_light_active(self, active: bool) -> None:
+        if not self._appearance.liquid_glass:
+            return
+        target = 1.0 if active else 0.0
+        if (
+            self._hover_animation.endValue() == target
+            and self._hover_animation.state() == QVariantAnimation.State.Running
+        ):
+            return
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._light_strength)
+        self._hover_animation.setEndValue(target)
+        self._hover_animation.setDuration(140 if active else 220)
+        self._hover_animation.start()
+
+    def _set_light_strength(self, value: object) -> None:
+        self._light_strength = float(value)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self._appearance.liquid_glass:
+            return
+        painter = QPainter(self)
+        _paint_liquid_glass_material(
+            painter,
+            QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6),
+            self._appearance,
+            light_position=self._light_position,
+            light_strength=self._light_strength,
+        )
+
+
+class _SettingsCheckBox(QCheckBox):
+    """A native-behaviour checkbox with an app-owned, legible indicator.
+
+    Qt's platform checkbox indicator can remain stark white when the macOS
+    system appearance disagrees with the selected ClipSoon theme.  Retaining
+    ``QCheckBox`` preserves keyboard and accessibility semantics; only the
+    small visual indicator is repainted with the active theme tokens.
+    """
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._appearance = _ThemeAppearance(dark=False)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
+
+    def set_theme(self, appearance: _ThemeAppearance) -> None:
+        if self._appearance != appearance:
+            self._appearance = appearance
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        indicator = self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator,
+            option,
+            self,
+        )
+        if not indicator.isValid():
+            return
+
+        colors = _theme_colors(self._appearance)
+        enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+        checked = bool(option.state & QStyle.StateFlag.State_On)
+        partially_checked = bool(option.state & QStyle.StateFlag.State_NoChange)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        focused = bool(option.state & QStyle.StateFlag.State_HasFocus)
+
+        if checked or partially_checked:
+            fill = QColor(colors.accent)
+            border = QColor(colors.accent_focus if hovered or focused else colors.accent)
+        elif self._appearance.liquid_glass:
+            if self._appearance.dark:
+                fill = QColor(223, 240, 255, 30)
+                border = QColor(205, 230, 255, 82)
+            else:
+                fill = QColor(255, 255, 255, 76)
+                border = QColor(255, 255, 255, 148)
+            if hovered:
+                fill.setAlpha(min(160, fill.alpha() + 24))
+        elif self._appearance.dark:
+            fill = QColor("#303541")
+            border = QColor("#697184")
+        else:
+            fill = QColor("#EEF1F7")
+            border = QColor("#AEB8CC")
+
+        if focused:
+            border = QColor(colors.accent_focus)
+        if not enabled:
+            fill.setAlpha(max(36, fill.alpha() // 2))
+            border.setAlpha(max(64, border.alpha() // 2))
+
+        painter = QPainter(self)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = QRectF(indicator).adjusted(0.65, 0.65, -0.65, -0.65)
+        painter.setBrush(fill)
+        painter.setPen(QPen(border, 1.15))
+        painter.drawRoundedRect(bounds, 3.5, 3.5)
+
+        if checked:
+            check_color = QColor(_accent_foreground(self._appearance))
+            if not enabled:
+                check_color.setAlpha(165)
+            check_pen = QPen(check_color, 1.9)
+            check_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            check_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(check_pen)
+            painter.drawLine(
+                QPointF(bounds.left() + bounds.width() * 0.23, bounds.center().y()),
+                QPointF(bounds.left() + bounds.width() * 0.43, bounds.bottom() - bounds.height() * 0.25),
+            )
+            painter.drawLine(
+                QPointF(bounds.left() + bounds.width() * 0.43, bounds.bottom() - bounds.height() * 0.25),
+                QPointF(bounds.right() - bounds.width() * 0.20, bounds.top() + bounds.height() * 0.27),
+            )
+        elif partially_checked:
+            dash_color = QColor(colors.text)
+            dash_color.setAlpha(210 if enabled else 130)
+            dash_pen = QPen(dash_color, 1.7)
+            dash_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(dash_pen)
+            painter.drawLine(
+                QPointF(bounds.left() + bounds.width() * 0.27, bounds.center().y()),
+                QPointF(bounds.right() - bounds.width() * 0.27, bounds.center().y()),
+            )
+        painter.restore()
 
 
 class ClipListModel(QAbstractListModel):
@@ -249,20 +924,34 @@ class SearchIcon(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._dark_theme = False
+        self._appearance = _ThemeAppearance(dark=False)
         self.setFixedSize(30, 30)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # The command panel has one permanent typing target.  Opening settings
+        # is a pointer action here, so the small magnifier must never displace
+        # the search editor's input caret or create a competing focus state.
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setAccessibleName("设置")
+        self.setAccessibleDescription("打开设置")
+        self.setToolTip("打开设置")
 
     def set_dark_theme(self, dark: bool) -> None:
-        if self._dark_theme != dark:
-            self._dark_theme = dark
+        self.set_theme(_ThemeAppearance(dark=dark))
+
+    def set_theme(self, appearance: _ThemeAppearance) -> None:
+        if self._appearance != appearance:
+            self._appearance = appearance
+            self._dark_theme = appearance.dark
             self.update()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        colors = _theme_colors(self._dark_theme)
+        colors = _theme_colors(self._appearance)
+        # The magnifier is a compact pointer affordance, not a second typing
+        # target. Its color stays stable while the search caret remains the
+        # only focus indicator in the active command panel.
         painter.setPen(QPen(QColor(colors.accent), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(4, 3, 18, 18)
@@ -293,6 +982,15 @@ class ClipListView(QListView):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         super().mouseMoveEvent(event)
         self.hover_index_changed.emit(self.indexAt(event.position().toPoint()))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # QListView caches a uniform delegate size.  When the list is first
+        # inserted into the empty-state stack, that cache can retain the
+        # pre-layout 640 px width and paint selection/hover material beyond
+        # the actual viewport.  Re-layout after every viewport resize keeps
+        # row geometry flush with the visible pane.
+        self.doItemsLayout()
 
     def leaveEvent(self, event) -> None:
         super().leaveEvent(event)
@@ -491,9 +1189,14 @@ class ClipDelegate(QStyledItemDelegate):
         self._invalidated_paths: set[str] = set()
         self.hovered_row = -1
         self.dark_theme = False
+        self._appearance = _ThemeAppearance(dark=False)
 
     def set_dark_theme(self, dark: bool) -> None:
-        self.dark_theme = dark
+        self.set_theme(_ThemeAppearance(dark=dark))
+
+    def set_theme(self, appearance: _ThemeAppearance) -> None:
+        self._appearance = appearance
+        self.dark_theme = appearance.dark
         view = self.parent()
         if isinstance(view, QListView):
             view.viewport().update()
@@ -522,10 +1225,21 @@ class ClipDelegate(QStyledItemDelegate):
         rect = option.rect.adjusted(4, 1, -5, -1)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = index.row() == self.hovered_row
-        colors = _theme_colors(self.dark_theme)
+        colors = _theme_colors(self._appearance)
         if selected or hovered:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(colors.accent) if selected else _hover_color(self.dark_theme))
+            if self._appearance.liquid_glass:
+                if selected:
+                    # Selection and hover deliberately use the same blue-tinted
+                    # material language.  Selection earns its priority through
+                    # density, not a separate opaque-blue card and white rim.
+                    fill = QColor(77, 143, 233, 154 if not self.dark_theme else 122)
+                else:
+                    fill = QColor(120, 178, 236, 42 if not self.dark_theme else 28)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(fill)
+            else:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(colors.accent) if selected else _hover_color(self._appearance))
             painter.drawRoundedRect(rect, 8, 8)
 
         thumb_rect = self._thumbnail_rect(rect)
@@ -533,7 +1247,9 @@ class ClipDelegate(QStyledItemDelegate):
         text_left = thumb_rect.right() + 13
         text_right = rect.right() - 10
         title_rect = QRect(text_left, thumb_rect.top(), text_right - text_left, thumb_rect.height())
-        foreground = QColor("#FFFFFF") if selected else option.palette.color(QPalette.ColorRole.Text)
+        foreground = option.palette.color(QPalette.ColorRole.Text)
+        if selected:
+            foreground = QColor(_active_foreground(self._appearance))
 
         title_font = QFont(option.font)
         title_font.setWeight(QFont.Weight.Medium)
@@ -553,7 +1269,7 @@ class ClipDelegate(QStyledItemDelegate):
         return QRect(row_rect.left() + 8, top, size, size)
 
     def _paint_thumbnail(self, painter: QPainter, rect: QRect, item: ClipItem, selected: bool) -> None:
-        colors = _theme_colors(self.dark_theme)
+        colors = _theme_colors(self._appearance)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(255, 255, 255, 32) if selected else QColor(colors.thumbnail))
         painter.drawRoundedRect(rect, 8, 8)
@@ -575,7 +1291,9 @@ class ClipDelegate(QStyledItemDelegate):
                     target = self._centered_file_icon_rect(rect)
                     painter.drawPixmap(target, pixmap, pixmap.rect())
                     return
-        color = QColor("#FFFFFF") if selected else QColor(colors.accent)
+        color = QColor(colors.accent)
+        if selected:
+            color = QColor(_active_foreground(self._appearance))
         painter.setPen(color)
         font = painter.font()
         font.setPointSize(16)
@@ -728,6 +1446,7 @@ class SettingsDialog(QDialog):
     reveal_requested = Signal()
     accessibility_requested = Signal()
     settings_changed = Signal(object)
+    native_window_shown = Signal()
 
     _HOTKEYS = {
         "双击 Ctrl": "double:ctrl",
@@ -744,26 +1463,46 @@ class SettingsDialog(QDialog):
         *,
         accessibility_granted: bool | None = None,
     ) -> None:
+        _install_app_owned_caret_style()
         super().__init__(parent)
         self._updating_controls = False
+        self._theme_settings = settings
+        self._native_backdrop_active = False
+        self._appearance = _theme_appearance(settings)
+        self._dark_theme = self._appearance.dark
         self.setWindowTitle("ClipSoon 设置")
+        self.setAccessibleName("ClipSoon 设置")
         self.setModal(True)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setFixedWidth(580)
-        dark = settings.theme == "dark" or (
-            settings.theme == "system"
-            and QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        if sys.platform == "win32":
+            # Keep an ordinary Qt backing store.  Native DWM composition is
+            # requested separately after the dialog owns a stable HWND.
+            self.setAutoFillBackground(True)
+        else:
+            # Keep the macOS top-level mode stable while the user switches
+            # themes.  Qt cannot reliably restore opaque backing after a
+            # shown translucent window; normal themes are instead painted as
+            # a fully opaque app-owned shell in ``paintEvent``.
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.setAutoFillBackground(False)
+        self.setStyleSheet(
+            _style_sheet(
+                self._appearance,
+                dialog_transparent=sys.platform != "win32",
+            )
         )
-        self._dark_theme = dark
-        self.setStyleSheet(_style_sheet(dark))
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 10, 22, 10)
+        layout.setContentsMargins(18, 12, 18, 14)
         layout.setSpacing(6)
 
-        header = QVBoxLayout()
-        header.setSpacing(2)
-        title = QLabel("偏好设置")
-        title.setObjectName("dialogTitle")
+        header = QHBoxLayout()
+        header.setContentsMargins(2, 0, 0, 0)
+        header.setSpacing(8)
+        title = QLabel("ClipSoon 设置")
+        title.setObjectName("settingsWindowTitle")
         header.addWidget(title)
+        header.addStretch()
         layout.addLayout(header)
 
         def section(title_text: str) -> tuple[QFrame, QVBoxLayout]:
@@ -854,6 +1593,7 @@ class SettingsDialog(QDialog):
         self.theme.addItem("跟随系统", "system")
         self.theme.addItem("浅色", "light")
         self.theme.addItem("深色", "dark")
+        self.theme.addItem("玻璃半透（随系统）", "liquid_glass")
         self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
         add_row(history_form, 3, "主题", self.theme)
 
@@ -863,42 +1603,65 @@ class SettingsDialog(QDialog):
         for combo in (self.hotkey_mode, self.theme):
             if combo is None:
                 continue
-            _style_combo_popup(combo, dark)
+            _style_combo_popup(combo, self._appearance)
 
         self.selection_memory = _spin(settings.selection_memory_seconds, 1, 300, " 秒")
         self.selection_memory.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.selection_memory.setEnabled(settings.remember_selection)
         add_row(history_form, 4, "记忆时长", self.selection_memory)
 
-        self.capture = QCheckBox("记录新的剪贴板内容")
+        self.capture = _SettingsCheckBox("记录新的剪贴板内容")
         self.capture.setChecked(settings.capture_enabled)
-        self.paste = QCheckBox("选择后自动粘贴到原应用")
+        self.paste = _SettingsCheckBox("选择后自动粘贴到原应用")
         self.paste.setChecked(settings.paste_after_selection)
-        self.hide = QCheckBox("面板失去焦点时自动隐藏")
-        self.hide.setChecked(settings.hide_on_deactivate)
-        self.launch_at_login = QCheckBox("开机时自动启动 ClipSoon")
+        # Keep QWidget.hide() callable on the settings dialog.  Naming this
+        # checkbox ``hide`` shadows the inherited method and turns a normal
+        # dialog.hide() call into a TypeError.
+        self.hide_on_deactivate_checkbox = _SettingsCheckBox("面板失去焦点时自动隐藏")
+        self.hide_on_deactivate_checkbox.setChecked(settings.hide_on_deactivate)
+        self.launch_at_login = _SettingsCheckBox("开机时自动启动 ClipSoon")
         self.launch_at_login.setChecked(settings.launch_at_login)
         # Keep the persisted ``remember_selection`` key for upgrade compatibility,
         # while the user-facing feature now restores the complete panel state.
-        self.remember_selection = QCheckBox("记住上次状态")
+        self.remember_selection = _SettingsCheckBox("记住上次状态")
         self.remember_selection.setChecked(settings.remember_selection)
         self.remember_selection.toggled.connect(self.selection_memory.setEnabled)
+        behavior_checkboxes = (
+            self.capture,
+            self.paste,
+            self.hide_on_deactivate_checkbox,
+            self.remember_selection,
+            self.launch_at_login,
+        )
+        # Native QCheckBox metrics differ enough across macOS scales that a
+        # content-driven grid can place consecutive labels on top of one
+        # another. Give this compact three-row group an explicit row rhythm.
+        checkbox_row_height = 23
+        for checkbox in behavior_checkboxes:
+            checkbox.setFixedHeight(checkbox_row_height)
+            checkbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         behavior_options = QGridLayout()
         behavior_options.setContentsMargins(118, 3, 0, 0)
         behavior_options.setHorizontalSpacing(18)
-        behavior_options.setVerticalSpacing(3)
+        behavior_options.setVerticalSpacing(4)
+        behavior_options.setRowMinimumHeight(0, checkbox_row_height)
+        behavior_options.setRowMinimumHeight(1, checkbox_row_height)
+        behavior_options.setRowMinimumHeight(2, checkbox_row_height)
+        behavior_options.setColumnStretch(0, 1)
+        behavior_options.setColumnStretch(1, 1)
         behavior_options.addWidget(self.capture, 0, 0)
         behavior_options.addWidget(self.paste, 0, 1)
-        behavior_options.addWidget(self.hide, 1, 0)
+        behavior_options.addWidget(self.hide_on_deactivate_checkbox, 1, 0)
         behavior_options.addWidget(self.remember_selection, 1, 1)
         behavior_options.addWidget(self.launch_at_login, 2, 0, 1, 2)
         history_layout.addLayout(behavior_options)
         layout.addWidget(history_section)
+        self._settings_checkboxes = behavior_checkboxes
 
         self.accessibility_button = None
         platform_message = ""
         if sys.platform == "darwin" and accessibility_granted is not True:
-            platform_message = "macOS 需要辅助功能权限，才能监听全局快捷键并自动粘贴到其他应用。"
+            platform_message = "需要 macOS 辅助功能权限，才能监听全局快捷键并自动粘贴。"
         elif sys.platform == "win32":
             platform_message = (
                 "Windows 使用系统注册的组合快捷键，不使用双击修饰键监听。"
@@ -908,8 +1671,8 @@ class SettingsDialog(QDialog):
             platform_note = QFrame()
             platform_note.setObjectName("platformNote")
             platform_layout = QHBoxLayout(platform_note)
-            platform_layout.setContentsMargins(12, 10, 12, 10)
-            platform_layout.setSpacing(12)
+            platform_layout.setContentsMargins(10, 7, 10, 7)
+            platform_layout.setSpacing(8)
             note = QLabel(platform_message)
             note.setWordWrap(True)
             platform_layout.addWidget(note, 1)
@@ -943,6 +1706,8 @@ class SettingsDialog(QDialog):
         footer = QHBoxLayout()
         footer.addStretch()
         self.close_button = QPushButton("关闭")
+        self.close_button.setObjectName("settingsCloseButton")
+        self.close_button.setAccessibleName("关闭设置")
         self.close_button.setToolTip("关闭设置")
         self.close_button.clicked.connect(self.reject)
         footer.addWidget(self.close_button)
@@ -952,7 +1717,33 @@ class SettingsDialog(QDialog):
         footer.addWidget(self.reset_button)
         layout.addLayout(footer)
 
+        # QKeySequenceEdit and QSpinBox delegate text entry to private child
+        # QLineEdits. Theme their real editors and attach the same app-owned
+        # blinking caret as the main search field, so macOS cannot fall back
+        # to a white insertion line in the settings window.
+        editable_inputs: list[QLineEdit | None] = [self.custom_hotkey.findChild(QLineEdit)]
+        editable_inputs.extend(
+            spin_box.lineEdit()
+            for spin_box in (
+                self.interval,
+                self.maximum,
+                self.retention,
+                self.delay,
+                self.selection_memory,
+            )
+        )
+        self._editable_text_inputs = tuple(editor for editor in editable_inputs if editor is not None)
+        self._text_carets = tuple(
+            _ThemedTextCaret(editor, focus_owner=editor.parentWidget())
+            for editor in self._editable_text_inputs
+        )
+
         self._connect_immediate_changes()
+        self._apply_theme(settings)
+        # A frameless dialog can otherwise place initial keyboard focus on the
+        # footer close action. Start in the first editable field instead; the
+        # close control remains available in normal tab order.
+        self._primary_focus_control: QWidget = self.hotkey_mode or self.custom_hotkey
 
     def values(self) -> dict[str, object]:
         if self.hotkey_mode is None:
@@ -974,7 +1765,7 @@ class SettingsDialog(QDialog):
             "theme": self.theme.currentData(),
             "capture_enabled": self.capture.isChecked(),
             "paste_after_selection": self.paste.isChecked(),
-            "hide_on_deactivate": self.hide.isChecked(),
+            "hide_on_deactivate": self.hide_on_deactivate_checkbox.isChecked(),
             "remember_selection": self.remember_selection.isChecked(),
             "selection_memory_seconds": self.selection_memory.value(),
             "launch_at_login": self.launch_at_login.isChecked(),
@@ -996,7 +1787,7 @@ class SettingsDialog(QDialog):
         for checkbox in (
             self.capture,
             self.paste,
-            self.hide,
+            self.hide_on_deactivate_checkbox,
             self.remember_selection,
             self.launch_at_login,
         ):
@@ -1016,11 +1807,21 @@ class SettingsDialog(QDialog):
         )
         parsed = _parse_hotkey(recorded) if custom else ""
         if custom and not parsed:
-            QMessageBox.warning(self, "快捷键无效", "组合键必须包含 Ctrl/Shift/Alt/Command 和一个普通键。")
+            _show_themed_warning(
+                self,
+                "快捷键无效",
+                "组合键必须包含 Ctrl/Shift/Alt/Command 和一个普通键。",
+                appearance=self._appearance,
+            )
             return
         platform_error = _platform_hotkey_validation_error(parsed)
         if custom and platform_error:
-            QMessageBox.warning(self, "快捷键无效", platform_error)
+            _show_themed_warning(
+                self,
+                "快捷键无效",
+                platform_error,
+                appearance=self._appearance,
+            )
             return
         self._emit_settings_changed()
 
@@ -1051,7 +1852,7 @@ class SettingsDialog(QDialog):
             self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
             self.capture.setChecked(settings.capture_enabled)
             self.paste.setChecked(settings.paste_after_selection)
-            self.hide.setChecked(settings.hide_on_deactivate)
+            self.hide_on_deactivate_checkbox.setChecked(settings.hide_on_deactivate)
             self.remember_selection.setChecked(settings.remember_selection)
             self.selection_memory.setValue(settings.selection_memory_seconds)
             self.selection_memory.setEnabled(settings.remember_selection)
@@ -1059,15 +1860,107 @@ class SettingsDialog(QDialog):
         finally:
             self._updating_controls = False
 
-        dark = settings.theme == "dark" or (
-            settings.theme == "system"
-            and QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        self._apply_theme(settings)
+
+    @property
+    def native_backdrop_active(self) -> bool:
+        return self._native_backdrop_active
+
+    def uses_liquid_glass_theme(self) -> bool:
+        return self._theme_settings.theme == "liquid_glass"
+
+    def set_native_backdrop_active(self, active: bool) -> None:
+        active = bool(active) and self.uses_liquid_glass_theme()
+        if active == self._native_backdrop_active:
+            return
+        self._native_backdrop_active = active
+        self._apply_theme(self._theme_settings)
+
+    def _apply_theme(self, settings: AppSettings) -> None:
+        self._theme_settings = settings
+        self._appearance = _theme_appearance(
+            settings,
+            native_backdrop=self._native_backdrop_active,
         )
-        self._dark_theme = dark
-        self.setStyleSheet(_style_sheet(dark))
+        self._dark_theme = self._appearance.dark
+        colors = _theme_colors(self._appearance)
+        if sys.platform == "win32":
+            palette = self.palette()
+            palette.setColor(
+                QPalette.ColorRole.Window,
+                QColor(0, 0, 0, 0) if self._appearance.native_backdrop else QColor(colors.window),
+            )
+            self.setPalette(palette)
+        else:
+            # Do not toggle ``WA_TranslucentBackground`` after the window is
+            # visible: on macOS that leaves a liquid -> dark root transparent.
+            # ``paintEvent`` supplies the opaque normal-theme shell instead.
+            palette = self.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0, 0))
+            self.setPalette(palette)
+            self.setAutoFillBackground(False)
+        self.setStyleSheet(
+            _style_sheet(
+                self._appearance,
+                dialog_transparent=sys.platform != "win32",
+            )
+        )
+        for editor in self._editable_text_inputs:
+            _apply_text_input_palette(editor, colors, self._appearance)
+        for caret in self._text_carets:
+            caret.set_color(QColor(colors.text))
+        self.update()
+        for checkbox in self._settings_checkboxes:
+            checkbox.set_theme(self._appearance)
         for combo in (self.hotkey_mode, self.theme):
             if combo is not None:
-                _style_combo_popup(combo, dark)
+                _style_combo_popup(combo, self._appearance)
+        if sys.platform == "win32":
+            # QSS may reset this property while polishing; restore the
+            # non-layered backing-store contract after every theme change.
+            self.setAutoFillBackground(True)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.native_window_shown.emit()
+        QTimer.singleShot(0, self._focus_primary_setting)
+
+    def _focus_primary_setting(self) -> None:
+        if self.isVisible() and self.focusWidget() in (None, self.close_button):
+            self._primary_focus_control.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        rect = QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6)
+        if self._appearance.liquid_glass:
+            _paint_liquid_glass_material(
+                painter,
+                rect,
+                self._appearance,
+                radius=16.0,
+            )
+            return
+        if sys.platform != "win32":
+            # This solid app-owned shell is deliberately painted into the
+            # stable transparent top-level so a live liquid -> dark switch
+            # cannot expose the system's light backing around the sections.
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            shell = QPainterPath()
+            shell.addRoundedRect(rect, 16.0, 16.0)
+            painter.fillPath(shell, QColor(_theme_colors(self._appearance).window))
+            painter.setPen(
+                QPen(
+                    QColor(255, 255, 255, 26)
+                    if self._appearance.dark
+                    else QColor(45, 53, 76, 28),
+                    1.0,
+                )
+            )
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(shell)
+            painter.restore()
 
     def _reset(self) -> None:
         defaults = AppSettings(
@@ -1082,7 +1975,7 @@ class SettingsDialog(QDialog):
             "清除历史",
             "清除所有未置顶的历史？此操作无法撤销。",
             "清除历史",
-            dark=self._dark_theme,
+            appearance=self._appearance,
         ):
             self.clear_requested.emit()
 
@@ -1108,6 +2001,7 @@ class ClipPanel(QWidget):
         *,
         selection_clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        _install_app_owned_caret_style()
         super().__init__()
         self._settings = settings
         self._selection_clock = selection_clock
@@ -1124,12 +2018,15 @@ class ClipPanel(QWidget):
         self._selection_hidden_at: float | None = None
         self._selection_hide_prepared = False
         self._search_ime_composing = False
+        self._search_focus_restore_pending = False
         self._selection_memory_timer = QTimer(self)
         self._selection_memory_timer.setSingleShot(True)
         self._selection_memory_timer.timeout.connect(self._expire_selection_memory)
         self._filter_buttons: list[tuple[QToolButton, ClipKind | None]] = []
         self._filter_index = 0
         self._dark_theme = False
+        self._native_backdrop_active = False
+        self._appearance = _ThemeAppearance(dark=False)
         self._drag_offset: QPoint | None = None
         self._drag_origin: QPoint | None = None
         self.setObjectName("panelWindow")
@@ -1154,23 +2051,41 @@ class ClipPanel(QWidget):
     def _build(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(*(1, 1, 1, 1) if sys.platform == "win32" else (14, 14, 14, 14))
-        self.card = QFrame()
+        self._outer_layout = outer
+        self.card = _LiquidGlassSurface()
         self.card.setObjectName("card")
+        self._card_shadow: QGraphicsDropShadowEffect | None = None
         if sys.platform != "win32":
             shadow = QGraphicsDropShadowEffect(self)
             shadow.setBlurRadius(32)
             shadow.setOffset(0, 8)
             shadow.setColor(QColor(0, 0, 0, 115))
             self.card.setGraphicsEffect(shadow)
+            self._card_shadow = shadow
         outer.addWidget(self.card)
         root = QVBoxLayout(self.card)
         root.setContentsMargins(12, 10, 12, 8)
-        root.setSpacing(6)
+        # Major regions are separated by a quiet 1 px rule with three points
+        # of air on each side. This keeps the existing command-panel density
+        # while making search, filters, content, and footer scannable.
+        root.setSpacing(3)
+
+        def section_divider(object_name: str) -> QFrame:
+            divider = QFrame()
+            divider.setObjectName(object_name)
+            divider.setFrameShape(QFrame.Shape.NoFrame)
+            divider.setFixedHeight(1)
+            divider.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+            return divider
 
         search_row = QHBoxLayout()
         search_row.setContentsMargins(4, 0, 0, 0)
         self.search_box = QFrame()
         self.search_box.setObjectName("searchBox")
+        self.search_box.setFrameShape(QFrame.Shape.NoFrame)
         search_layout = QHBoxLayout(self.search_box)
         search_layout.setContentsMargins(8, 0, 8, 0)
         search_layout.setSpacing(5)
@@ -1184,6 +2099,9 @@ class ClipPanel(QWidget):
         search_layout.addWidget(self.search, 1)
         search_row.addWidget(self.search_box, 1)
         root.addLayout(search_row)
+        self.search_filters_divider = section_divider("searchFiltersDivider")
+        root.addWidget(self.search_filters_divider)
+        self._search_caret = _ThemedTextCaret(self.search)
 
         filters = QHBoxLayout()
         filters.setContentsMargins(4, 0, 0, 0)
@@ -1209,9 +2127,14 @@ class ClipPanel(QWidget):
         self.count_label.setObjectName("muted")
         filters.addWidget(self.count_label)
         root.addLayout(filters)
+        self.filters_content_divider = section_divider("filtersContentDivider")
+        root.addWidget(self.filters_content_divider)
 
         content = QHBoxLayout()
-        content.setSpacing(10)
+        # One quiet divider establishes the list/detail boundary in every
+        # theme. Four points on each side preserve the original visual gap
+        # without wrapping the detail column in a second card.
+        content.setSpacing(4)
         self.model = ClipListModel()
         self.list = ClipListView()
         self.list.setObjectName("historyList")
@@ -1220,6 +2143,10 @@ class ClipPanel(QWidget):
         self.list.setItemDelegate(delegate)
         self.list.hover_index_changed.connect(delegate.set_hovered_index)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # Selection remains mouse-driven and arrow navigation is routed from
+        # the search editor.  Letting the view receive focus would hide the
+        # only text caret while the panel is still active.
+        self.list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.list.setMouseTracking(True)
         self.list.viewport().setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.list.setUniformItemSizes(True)
@@ -1230,7 +2157,45 @@ class ClipPanel(QWidget):
         self.list.customContextMenuRequested.connect(self._open_list_menu)
         self.list.doubleClicked.connect(lambda index: self._send(index.row()))
         self.list.selectionModel().currentChanged.connect(lambda current, _previous: self._show_detail(current.row()))
-        content.addWidget(self.list, 3)
+        self.history_content = QStackedWidget()
+        self.history_content.setObjectName("historyContent")
+        self.history_content.addWidget(self.list)
+        self.empty_state = QWidget()
+        self.empty_state.setObjectName("emptyState")
+        empty_layout = QVBoxLayout(self.empty_state)
+        empty_layout.setContentsMargins(24, 12, 24, 12)
+        empty_layout.setSpacing(4)
+        empty_layout.addStretch(1)
+        self.empty_state_title = QLabel()
+        self.empty_state_title.setObjectName("emptyStateTitle")
+        self.empty_state_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.empty_state_message = QLabel()
+        self.empty_state_message.setObjectName("emptyStateMessage")
+        self.empty_state_message.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.empty_state_message.setWordWrap(True)
+        self.empty_state_clear = QToolButton()
+        self.empty_state_clear.setObjectName("emptyStateClear")
+        self.empty_state_clear.setText("清除搜索")
+        self.empty_state_clear.setAutoRaise(True)
+        self.empty_state_clear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.empty_state_clear.clicked.connect(self._clear_empty_search)
+        empty_layout.addWidget(self.empty_state_title, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_layout.addWidget(self.empty_state_message, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_layout.addWidget(self.empty_state_clear, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_layout.addStretch(1)
+        self.history_content.addWidget(self.empty_state)
+        content.addWidget(self.history_content, 3)
+
+        self.content_divider = QFrame()
+        self.content_divider.setObjectName("contentDivider")
+        self.content_divider.setFrameShape(QFrame.Shape.NoFrame)
+        self.content_divider.setFixedWidth(1)
+        self.content_divider.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.content_divider.hide()
+        content.addWidget(self.content_divider)
 
         self.detail = QFrame()
         self.detail.setObjectName("detail")
@@ -1242,6 +2207,7 @@ class ClipPanel(QWidget):
         self.text_preview.setObjectName("textPreview")
         self.text_preview.setReadOnly(True)
         self.text_preview.setFrameShape(QFrame.Shape.NoFrame)
+        self.text_preview.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.image_preview = ImagePreview()
         self.file_preview = QLabel()
         self.file_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1262,9 +2228,17 @@ class ClipPanel(QWidget):
         self.information_divider.setFrameShape(QFrame.Shape.NoFrame)
         self.information_divider.setFixedHeight(1)
         detail_layout.addWidget(self.information_divider)
-        information_title = QLabel("信息")
-        information_title.setObjectName("informationTitle")
-        detail_layout.addWidget(information_title)
+        information_content = QWidget()
+        information_content.setObjectName("informationContent")
+        information_content_layout = QVBoxLayout(information_content)
+        # The divider is intentionally inset by 8 px. Keep the information
+        # title and labels on that same visual baseline instead of letting
+        # their default QLabel margins start further left.
+        information_content_layout.setContentsMargins(8, 0, 8, 0)
+        information_content_layout.setSpacing(6)
+        self.information_title = QLabel("信息")
+        self.information_title.setObjectName("informationTitle")
+        information_content_layout.addWidget(self.information_title)
         information = QGridLayout()
         information.setContentsMargins(0, 0, 0, 0)
         information.setHorizontalSpacing(18)
@@ -1285,9 +2259,12 @@ class ClipPanel(QWidget):
         information.addWidget(self.info_detail_label, 1, 0, Qt.AlignmentFlag.AlignTop)
         information.addWidget(self.info_detail_value, 1, 1)
         information.setColumnStretch(1, 1)
-        detail_layout.addLayout(information)
+        information_content_layout.addLayout(information)
+        detail_layout.addWidget(information_content)
         content.addWidget(self.detail, 2)
         root.addLayout(content, 1)
+        self.content_footer_divider = section_divider("contentFooterDivider")
+        root.addWidget(self.content_footer_divider)
 
         footer = QHBoxLayout()
         self.status = QLabel("")
@@ -1308,6 +2285,21 @@ class ClipPanel(QWidget):
         self.search.textChanged.connect(self._refresh_results)
         self.search.installEventFilter(self)
         self.list.installEventFilter(self)
+        self._install_glass_tracking()
+
+    def _install_glass_tracking(self) -> None:
+        """Let one material shell react to pointer movement above its content."""
+
+        for widget in self.findChildren(QWidget):
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+
+    def _update_glass_light(self, global_position: QPointF) -> None:
+        if not self._appearance.liquid_glass:
+            return
+        position = self.card.mapFromGlobal(global_position.toPoint())
+        self.card.set_light_position(QPointF(position))
+        self.card.set_light_active(True)
 
     def set_items(self, items: Sequence[ClipItem]) -> None:
         new_items = list(items)
@@ -1379,9 +2371,12 @@ class ClipPanel(QWidget):
         self.raise_()
         self.activateWindow()
         self.search.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        self._schedule_search_focus_restore()
         return (time.perf_counter() - started) * 1_000
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._update_glass_light(event.globalPosition())
         if (
             event.button() == Qt.MouseButton.LeftButton
             and self._can_start_drag(event.position().toPoint())
@@ -1394,6 +2389,7 @@ class ClipPanel(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        self._update_glass_light(event.globalPosition())
         if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             screen = QApplication.screenAt(event.globalPosition().toPoint()) or self.screen()
             target = event.globalPosition().toPoint() - self._drag_offset
@@ -1401,6 +2397,14 @@ class ClipPanel(QWidget):
             event.accept()
             return
         super().mouseMoveEvent(event)
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self._update_glass_light(QPointF(QCursor.pos()))
+
+    def leaveEvent(self, event) -> None:
+        self.card.set_light_active(False)
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._drag_offset is not None and event.button() == Qt.MouseButton.LeftButton:
@@ -1542,37 +2546,105 @@ class ClipPanel(QWidget):
             self._select_for_show(restore=False)
 
     def apply_theme(self) -> None:
-        dark = self._settings().theme == "dark" or (
-            self._settings().theme == "system"
-            and QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        self._appearance = _theme_appearance(
+            self._settings(),
+            native_backdrop=self._native_backdrop_active,
         )
-        self._dark_theme = dark
-        colors = _theme_colors(dark)
+        self._dark_theme = self._appearance.dark
+        self.card.set_appearance(self._appearance)
+        # A theme must not change the panel's visible card geometry.  On macOS
+        # the native visual-effect sibling is inset by the same 14 points, so
+        # this gutter stays transparent instead of becoming a second backdrop.
+        margins = (1, 1, 1, 1) if sys.platform == "win32" else (14, 14, 14, 14)
+        self._outer_layout.setContentsMargins(*margins)
+        if self._card_shadow is not None:
+            self._card_shadow.setEnabled(not self._appearance.liquid_glass)
+        colors = _theme_colors(self._appearance)
         if sys.platform == "win32":
             palette = self.palette()
             palette.setColor(
                 QPalette.ColorRole.Window,
-                QColor(colors.window),
+                QColor(0, 0, 0, 0) if self._appearance.native_backdrop else QColor(colors.window),
             )
             self.setPalette(palette)
         delegate = self.list.itemDelegate()
         if isinstance(delegate, ClipDelegate):
-            delegate.set_dark_theme(dark)
-        self.search_icon.set_dark_theme(dark)
-        self.setStyleSheet(_style_sheet(dark))
+            delegate.set_theme(self._appearance)
+        self.search_icon.set_theme(self._appearance)
+        self.setStyleSheet(_style_sheet(self._appearance))
+        # Keep the text palette and the application-owned blinking caret on
+        # the same token after QSS polishing. The global proxy guarantees that
+        # macOS cannot reveal its native white caret during the hidden phase.
+        self._apply_search_input_palette(colors)
+        self._search_caret.set_color(QColor(colors.text))
+        if sys.platform == "win32":
+            # QSS may reset this property while polishing; restore the
+            # non-layered backing-store contract after every theme change.
+            self.setAutoFillBackground(True)
         self._sync_search_box_height()
 
+    @property
+    def native_backdrop_active(self) -> bool:
+        return self._native_backdrop_active
+
+    def uses_liquid_glass_theme(self) -> bool:
+        return self._settings().theme == "liquid_glass"
+
+    def set_native_backdrop_active(self, active: bool) -> None:
+        active = bool(active) and self.uses_liquid_glass_theme()
+        if active == self._native_backdrop_active:
+            return
+        self._native_backdrop_active = active
+        self.apply_theme()
+
     def _sync_search_box_height(self) -> None:
-        """Keep each search-frame gap at half the visible search-text height."""
+        """Keep each search-region gap at half the visible search-text height."""
         self.search.ensurePolished()
         metrics = QFontMetrics(self.search.font())
         text_height = metrics.tightBoundingRect("Ag").height() or metrics.height()
-        # The search frame has a 2 px border. Its content therefore reserves
-        # one text-height for the glyphs and one text-height for both half-height
-        # top and bottom gaps combined.
-        self.search_box.setFixedHeight(text_height * 2 + 4)
+        # One text-height is reserved for the glyphs and the other for the
+        # combined top and bottom breathing space. The search area itself is
+        # deliberately borderless in every appearance.
+        self.search_box.setFixedHeight(text_height * 2)
+
+    def _apply_search_input_palette(self, colors: _ThemeColors) -> None:
+        """Keep the search text and themed blinking caret readable per theme."""
+
+        _apply_text_input_palette(self.search, colors, self._appearance)
+
+    def _schedule_search_focus_restore(self) -> None:
+        """Restore the panel's sole input target after an in-panel click."""
+
+        if self._search_focus_restore_pending:
+            return
+        self._search_focus_restore_pending = True
+        QTimer.singleShot(0, self._restore_search_focus_if_panel_active)
+
+    def _restore_search_focus_if_panel_active(self) -> None:
+        self._search_focus_restore_pending = False
+        if (
+            not self.isVisible()
+            or not self.isActiveWindow()
+            or QApplication.activeModalWidget() is not None
+            or QApplication.activePopupWidget() is not None
+            or self.search.hasFocus()
+        ):
+            return
+        self.search.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            self._appearance.liquid_glass
+            and isinstance(event, QMouseEvent)
+            and (
+                event.type() == QEvent.Type.MouseMove
+                or (
+                    event.type() == QEvent.Type.MouseButtonPress
+                    and event.button() == Qt.MouseButton.LeftButton
+                )
+            )
+        ):
+            self._update_glass_light(event.globalPosition())
         if watched is self.search and event.type() == QEvent.Type.InputMethod:
             input_event = event if isinstance(event, QInputMethodEvent) else None
             if input_event is not None:
@@ -1580,7 +2652,21 @@ class ClipPanel(QWidget):
             return super().eventFilter(watched, event)
         if watched is self.search and event.type() == QEvent.Type.FocusOut:
             self._search_ime_composing = False
+            # A list, preview or incidental native child can still request
+            # focus on some platform styles. Reclaim it after that handler
+            # finishes, but never steal it from a modal dialog or a context
+            # menu owned by the panel.
+            self._schedule_search_focus_restore()
             return super().eventFilter(watched, event)
+        if (
+            watched is not self.search
+            and isinstance(watched, QWidget)
+            and event.type() == QEvent.Type.FocusIn
+        ):
+            # The NoFocus policies cover ordinary clicks. This catches a
+            # platform control or an explicit focus request that bypasses
+            # them, while the deferred callback lets that interaction finish.
+            self._schedule_search_focus_restore()
         if event.type() != QEvent.Type.KeyPress:
             return super().eventFilter(watched, event)
         key_event = event if isinstance(event, QKeyEvent) else None
@@ -1599,7 +2685,12 @@ class ClipPanel(QWidget):
             return True
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if watched is self.search and self._search_ime_composing:
-                return False
+                # If an input method has left a composition in the editor,
+                # this Enter belongs to that composition rather than a send.
+                # In normal GUI operation the IME consumes it before Qt sends
+                # this event; accepting the residual event prevents it from
+                # bubbling into the panel on minimal/offscreen backends.
+                return True
             self._send(self.list.currentIndex().row())
             return True
         if watched is self.search and key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
@@ -1620,6 +2711,9 @@ class ClipPanel(QWidget):
 
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self._schedule_search_focus_restore()
+            return
         if (
             event.type() == QEvent.Type.ActivationChange
             and not self._native_deactivation_managed
@@ -1674,16 +2768,53 @@ class ClipPanel(QWidget):
         if elapsed > 20:
             LOGGER.warning("Search paint preparation took %.1f ms", elapsed)
 
+    def _clear_empty_search(self) -> None:
+        """Return from a no-match state without changing the active category."""
+
+        self.search.clear()
+        self.search.setFocus(Qt.FocusReason.MouseFocusReason)
+
+    def _show_empty_state(self) -> None:
+        """Explain why the history area is empty without adding another surface."""
+
+        has_query = bool(self.search.text())
+        if has_query:
+            title = "没有找到匹配内容"
+            message = "尝试更换关键词，或清除搜索后查看全部历史。"
+        elif not self._items:
+            title = "还没有剪贴板历史"
+            message = "复制文本、图片或文件后，内容会出现在这里。"
+        else:
+            kind_name = {
+                ClipKind.TEXT: "文本",
+                ClipKind.IMAGE: "截图",
+                ClipKind.FILES: "文件",
+            }.get(self._kind, "内容")
+            title = f"暂无{kind_name}历史"
+            message = "切换分类或继续复制内容。"
+        self.empty_state_title.setText(title)
+        self.empty_state_message.setText(message)
+        self.empty_state.setAccessibleName(title)
+        self.empty_state.setAccessibleDescription(message)
+        self.empty_state_clear.setVisible(has_query)
+        self.history_content.setCurrentWidget(self.empty_state)
+        self.content_divider.hide()
+        self.detail.hide()
+
     def _show_detail(self, row: int) -> None:
         item = self.model.item_at(row)
         if item is None:
+            self._show_empty_state()
             self.image_preview.set_path("")
             self.text_preview.setPlainText("")
             self.preview_stack.setCurrentWidget(self.text_preview)
-            self.info_type_value.setText("—")
-            self.info_detail_label.setText("内容")
-            self.info_detail_value.setText("—")
+            self.info_type_value.clear()
+            self.info_detail_label.clear()
+            self.info_detail_value.clear()
             return
+        self.history_content.setCurrentWidget(self.list)
+        self.content_divider.show()
+        self.detail.show()
         self.info_type_value.setText({ClipKind.TEXT: "文本", ClipKind.IMAGE: "图片", ClipKind.FILES: "文件"}[item.kind])
         image_path = item.image_path if item.kind is ClipKind.IMAGE else _single_image_file_path(item.files)
         if image_path:
@@ -1773,8 +2904,15 @@ class ClipPanel(QWidget):
         menu.addSeparator()
         clear_action = menu.addAction("清空历史")
         clear_action.setEnabled(self.model.rowCount() > 0)
-        _compact_menu(menu, dark=self._dark_theme)
+        _compact_menu(menu, appearance=self._appearance)
         selected = menu.exec(self.list.viewport().mapToGlobal(position))
+        # QMenu closes in a nested event loop and can leave the panel with no
+        # focus widget or inactive state even when the list itself is NoFocus.
+        # It is still the panel's own transient interaction, so reactivate the
+        # panel before returning to its permanent input target.
+        if self.isVisible():
+            self.activateWindow()
+        self._schedule_search_focus_restore()
         if selected is delete_action:
             self._request_delete_selected()
         elif selected is clear_action and _confirm_destructive_action(
@@ -1782,7 +2920,7 @@ class ClipPanel(QWidget):
             "清空历史",
             "清空全部剪贴板历史？此操作无法撤销。",
             "确定",
-            dark=self._dark_theme,
+            appearance=self._appearance,
         ):
             self.clear_requested.emit()
 
@@ -1815,25 +2953,142 @@ def create_tray_icon(parent: QWidget) -> tuple[QSystemTrayIcon, QMenu, dict[str,
     return tray, menu, actions
 
 
-def _style_sheet(dark: bool) -> str:
-    colors = _theme_colors(dark)
-    information_divider = "rgba(255, 255, 255, 18)" if dark else "rgba(45, 53, 76, 18)"
+def _style_sheet(
+    theme: bool | _ThemeAppearance,
+    *,
+    dialog_transparent: bool | None = None,
+) -> str:
+    appearance = _as_theme_appearance(theme)
+    colors = _theme_colors(appearance)
+    active_foreground = _active_foreground(appearance)
+    accent_foreground = _accent_foreground(appearance)
+    # One shared low-contrast rule defines every main-panel boundary: search,
+    # filters, content, footer, list/detail, and preview/information. Keeping
+    # the material identical avoids a mix of unrelated gray rules across themes.
+    section_divider = (
+        "rgba(224, 238, 255, 46)" if appearance.dark else "rgba(35, 65, 98, 38)"
+    )
+    detail_background = "transparent"
+    detail_border = "none"
+    preview_rule = "background: transparent; border: none;"
+    transparent_root = appearance.native_backdrop or (
+        appearance.liquid_glass and sys.platform != "win32"
+    )
+    panel_window_rule = "#panelWindow { background: transparent; }" if transparent_root else ""
+    dialog_background = (
+        "transparent"
+        if (transparent_root if dialog_transparent is None else dialog_transparent)
+        else colors.window
+    )
+    if appearance.liquid_glass:
+        overlay = "rgba(232, 244, 255, 54)" if not appearance.dark else "rgba(223, 240, 255, 27)"
+        overlay_hover = "rgba(255, 255, 255, 82)" if not appearance.dark else "rgba(230, 244, 255, 48)"
+        overlay_border = "rgba(255, 255, 255, 104)" if not appearance.dark else "rgba(205, 230, 255, 68)"
+        active_chip = "rgba(68, 130, 237, 190)" if not appearance.dark else "rgba(102, 161, 255, 174)"
+        card_background = "transparent"
+        card_border = "none"
+        settings_background = "transparent"
+        settings_border = f"1px solid {overlay_border}"
+        scrollbar_handle = (
+            "rgba(43, 74, 112, 148)"
+            if not appearance.dark
+            else "rgba(225, 238, 255, 136)"
+        )
+        scrollbar_handle_hover = (
+            "rgba(37, 91, 161, 184)"
+            if not appearance.dark
+            else "rgba(236, 246, 255, 176)"
+        )
+    else:
+        overlay = colors.control
+        overlay_hover = colors.control
+        overlay_border = colors.border
+        active_chip = colors.accent
+        card_background = colors.card
+        card_border = f"1px solid {colors.border}"
+        settings_background = colors.panel
+        settings_border = f"1px solid {colors.border}"
+        scrollbar_handle = (
+            "rgba(52, 65, 86, 132)"
+            if not appearance.dark
+            else "rgba(224, 232, 244, 132)"
+        )
+        scrollbar_handle_hover = (
+            "rgba(47, 94, 172, 172)"
+            if not appearance.dark
+            else "rgba(239, 246, 255, 176)"
+        )
+
+    # Each scroll area owns its vertical scrollbar as a child widget. Without
+    # explicit sub-control rules, applying the app stylesheet lets the
+    # platform's opaque fallback groove become a bright divider. This is
+    # deliberately scoped to the two scrolling content surfaces: settings and
+    # all other native scroll areas retain their platform treatment.
+    content_scrollbar_rule = f"""
+        #historyList QScrollBar:vertical,
+        #textPreview QScrollBar:vertical {{
+            background: transparent; border: none; width: 12px;
+            margin: 8px 1px 8px 3px;
+        }}
+        #historyList QScrollBar::groove:vertical,
+        #textPreview QScrollBar::groove:vertical,
+        #historyList QScrollBar::add-page:vertical,
+        #textPreview QScrollBar::add-page:vertical,
+        #historyList QScrollBar::sub-page:vertical,
+        #textPreview QScrollBar::sub-page:vertical {{
+            background: transparent; border: none;
+        }}
+        #historyList QScrollBar::handle:vertical,
+        #textPreview QScrollBar::handle:vertical {{
+            background: {scrollbar_handle}; border: 2px solid transparent;
+            border-radius: 4px; min-height: 30px;
+        }}
+        #historyList QScrollBar::handle:vertical:hover,
+        #textPreview QScrollBar::handle:vertical:hover {{
+            background: {scrollbar_handle_hover};
+        }}
+        #historyList QScrollBar::add-line:vertical,
+        #textPreview QScrollBar::add-line:vertical,
+        #historyList QScrollBar::sub-line:vertical,
+        #textPreview QScrollBar::sub-line:vertical {{
+            background: transparent; border: none; height: 0px;
+        }}
+    """
     return f"""
         QWidget {{ color: {colors.text}; font-size: 10pt; }}
-        #card {{ background: {colors.card}; border: 1px solid {colors.border}; border-radius: 16px; }}
-        #searchBox {{ background: transparent; border: 2px solid {colors.accent_focus}; border-radius: 10px; }}
-        #search {{ background: transparent; border: none; font-size: 16pt; padding: 0 2px; }}
+        {panel_window_rule}
+        #card {{ background: {card_background}; border: {card_border}; border-radius: 18px; }}
+        #searchBox {{ background: transparent; border: none; }}
+        #search {{
+            background: transparent; border: none; color: {colors.text}; font-size: 16pt; padding: 0 2px;
+            selection-background-color: {colors.accent}; selection-color: {accent_foreground};
+        }}
         QToolButton {{ border: none; border-radius: 8px; padding: 7px 10px; background: transparent; }}
-        QToolButton:hover {{ background: {colors.control}; }}
+        QToolButton:hover {{ background: {overlay_hover}; }}
         QToolButton[filterChip="true"] {{
             color: {colors.muted}; font-size: 13pt; font-weight: 500; padding: 5px 12px;
         }}
-        QToolButton[filterChip="true"]:checked {{ color: white; background: {colors.accent}; }}
+        QToolButton[filterChip="true"]:checked {{
+            color: {active_foreground}; background: {active_chip}; border: 1px solid {overlay_border};
+        }}
         #historyList {{ background: transparent; border: none; outline: none; font-size: 13pt; }}
-        #detail {{ background: {colors.panel}; border: 1px solid {colors.border}; border-radius: 12px; }}
-        #textPreview, #fileTextPreview {{ font-size: 13pt; padding: 11px; }}
+        {content_scrollbar_rule}
+        #emptyState {{ background: transparent; border: none; }}
+        #emptyStateTitle {{ color: {colors.text}; font-size: 13pt; font-weight: 600; }}
+        #emptyStateMessage {{ color: {colors.muted}; font-size: 10pt; }}
+        QToolButton#emptyStateClear {{
+            color: {colors.accent_focus}; background: transparent; border: none;
+            border-radius: 7px; padding: 4px 6px;
+        }}
+        QToolButton#emptyStateClear:hover {{ background: {overlay_hover}; }}
+        #detail {{ background: {detail_background}; border: {detail_border}; }}
+        #contentDivider {{ background: {section_divider}; border: none; min-width: 1px; max-width: 1px; }}
+        #searchFiltersDivider, #filtersContentDivider, #contentFooterDivider {{
+            background: {section_divider}; border: none; min-height: 1px; max-height: 1px;
+        }}
+        #textPreview, #fileTextPreview {{ font-size: 13pt; padding: 11px; {preview_rule} }}
         #informationDivider {{
-            background: {information_divider}; margin: 3px 8px 1px; min-height: 1px; max-height: 1px;
+            background: {section_divider}; margin: 3px 8px 1px; min-height: 1px; max-height: 1px;
         }}
         #informationTitle {{ font-size: 13pt; font-weight: 650; padding: 6px 0 0 0; }}
         #informationLabel, #informationValue {{
@@ -1841,42 +3096,97 @@ def _style_sheet(dark: bool) -> str:
         }}
         #muted {{ color: {colors.muted}; font-size: 9pt; }}
         #muted a {{ color: {colors.accent_focus}; text-decoration: none; }}
-        #platformNote {{ background: {colors.control}; border: 1px solid {colors.border}; border-radius: 10px; }}
-        #dialogTitle {{ font-size: 16pt; font-weight: 650; }}
+        #platformNote {{ background: {overlay}; border: 1px solid {overlay_border}; border-radius: 10px; }}
+        #settingsWindowTitle {{ font-size: 12pt; font-weight: 650; }}
         #settingsSubtitle {{ color: {colors.muted}; font-size: 9pt; }}
-        #settingsSection {{ background: {colors.panel}; border: 1px solid {colors.border}; border-radius: 12px; }}
+        #settingsSection {{ background: {settings_background}; border: {settings_border}; border-radius: 12px; }}
         #settingsSectionTitle {{ font-size: 11pt; font-weight: 650; }}
         #settingsFieldLabel {{ color: {colors.muted}; font-size: 9pt; }}
-        QPlainTextEdit, QLineEdit, QComboBox, QSpinBox {{
-            background: {colors.control}; border: 1px solid {colors.border}; border-radius: 10px; padding: 7px;
+        QPlainTextEdit, QLineEdit, QKeySequenceEdit, QComboBox, QSpinBox {{
+            background: {overlay}; border: 1px solid {overlay_border}; border-radius: 10px; padding: 7px;
+            selection-background-color: {colors.accent}; selection-color: {accent_foreground};
         }}
-        QComboBox:disabled, QLineEdit:disabled {{ color: {colors.muted}; background: {colors.panel}; }}
+        QPlainTextEdit:focus, QLineEdit:focus, QKeySequenceEdit:focus, QComboBox:focus, QSpinBox:focus {{
+            border: 1px solid {colors.accent_focus};
+        }}
+        QComboBox:disabled, QLineEdit:disabled, QKeySequenceEdit:disabled, QSpinBox:disabled {{
+            color: {colors.muted}; background: {colors.panel};
+        }}
+        QCheckBox {{ color: {colors.text}; }}
+        QCheckBox:disabled {{ color: {colors.muted}; }}
+        QCheckBox::indicator {{ width: 16px; height: 16px; background: transparent; border: none; }}
         QPlainTextEdit {{ selection-background-color: {colors.accent}; }}
         QPushButton {{
-            background: {colors.control}; border: 1px solid {colors.border};
+            background: {overlay}; border: 1px solid {overlay_border};
             border-radius: 10px; padding: 7px 12px;
         }}
         QPushButton:hover {{ border-color: {colors.accent_focus}; }}
-        QDialog {{ background: {colors.window}; }}
+        QPushButton:focus {{ border: 1px solid {colors.accent_focus}; }}
+        QDialog {{ background: {dialog_background}; }}
     """
 
 
-def _confirmation_style_sheet(dark: bool) -> str:
-    colors = _theme_colors(dark)
+def _confirmation_style_sheet(
+    theme: bool | _ThemeAppearance,
+    *,
+    destructive: bool = True,
+) -> str:
+    appearance = _as_theme_appearance(theme)
+    colors = _theme_colors(appearance)
+    # On macOS and Linux the confirmation root only reserves breathing room
+    # for the rounded card's shadow. Painting it opaque creates a second,
+    # rectangular surface around the card. Windows keeps its opaque backing
+    # because its top-level dialog must not use Qt's layered-window path.
+    dialog_background = "transparent" if sys.platform != "win32" else colors.window
+    card_background = "transparent" if appearance.liquid_glass else colors.card
+    card_border = "none" if appearance.liquid_glass else f"1px solid {colors.border}"
+    control = (
+        "rgba(232, 244, 255, 54)" if appearance.liquid_glass and not appearance.dark else colors.control
+    )
+    if appearance.liquid_glass and appearance.dark:
+        control = "rgba(223, 240, 255, 27)"
+    control_border = (
+        "rgba(255, 255, 255, 104)"
+        if appearance.liquid_glass and not appearance.dark
+        else ("rgba(205, 230, 255, 68)" if appearance.liquid_glass else colors.border)
+    )
+    if destructive:
+        # Deleting history is materially different from acknowledging a
+        # validation message.  Reserve the danger token for the final action
+        # so users can recognize the irreversible choice at a glance without
+        # making the whole confirmation visually noisy.
+        if appearance.liquid_glass and appearance.dark:
+            confirm_background = "#F0838D"
+            confirm_hover = "#FF9AA3"
+            confirm_foreground = "#0A192F"
+        else:
+            confirm_background = "#C13749"
+            confirm_hover = "#AB2D3D"
+            confirm_foreground = "#FFFFFF"
+    else:
+        confirm_background = colors.accent
+        confirm_hover = colors.accent_focus
+        confirm_foreground = _accent_foreground(appearance)
     return f"""
-        QDialog {{ background: transparent; }}
+        QDialog {{ background: {dialog_background}; color: {colors.text}; font-size: 10pt; }}
         #confirmationCard {{
-            background: {colors.card}; border: 1px solid {colors.border}; border-radius: 16px;
+            background: {card_background}; border: {card_border}; border-radius: 16px;
         }}
-        #confirmationTitle {{ font-size: 14pt; font-weight: 650; }}
+        #confirmationTitle {{ color: {colors.text}; font-size: 14pt; font-weight: 650; }}
         #confirmationMessage {{ color: {colors.muted}; font-size: 11pt; }}
         #confirmationCancel, #confirmationConfirm {{
             border-radius: 9px; padding: 7px 10px;
         }}
-        #confirmationCancel {{ background: {colors.control}; border: 1px solid {colors.border}; }}
-        #confirmationCancel:hover {{ border-color: {colors.accent_focus}; }}
-        #confirmationConfirm {{ background: {colors.accent}; border: 1px solid {colors.accent}; color: white; }}
-        #confirmationConfirm:hover {{ background: {colors.accent_focus}; border-color: {colors.accent_focus}; }}
+        #confirmationCancel {{
+            background: {control}; border: 1px solid {control_border}; color: {colors.text};
+        }}
+        #confirmationCancel:hover, #confirmationCancel:focus {{ border-color: {colors.accent_focus}; }}
+        #confirmationConfirm {{
+            background: {confirm_background}; border: 1px solid {confirm_background}; color: {confirm_foreground};
+        }}
+        #confirmationConfirm:hover, #confirmationConfirm:focus {{
+            background: {confirm_hover}; border-color: {confirm_hover};
+        }}
     """
 
 
@@ -1976,11 +3286,13 @@ def _read_text_file_preview(files: Sequence[str]) -> str | None:
     return text + ("\n..." if truncated else "")
 
 
-def _style_combo_popup(combo: QComboBox, dark: bool) -> None:
-    colors = _theme_colors(dark)
+def _style_combo_popup(combo: QComboBox, theme: bool | _ThemeAppearance) -> None:
+    appearance = _as_theme_appearance(theme)
+    colors = _theme_colors(appearance)
+    accent_foreground = _accent_foreground(appearance)
     popup_background = colors.popup
     popup_hover = colors.hover
-    border = "#484E5E" if dark else "#D2D8E5"
+    border = "#484E5E" if appearance.dark else "#D2D8E5"
     view = combo.view()
     container = view.window()
     container.setObjectName("comboPopup")
@@ -2000,14 +3312,14 @@ def _style_combo_popup(combo: QComboBox, dark: bool) -> None:
     palette.setColor(QPalette.ColorRole.Text, QColor(colors.text))
     palette.setColor(QPalette.ColorRole.WindowText, QColor(colors.text))
     palette.setColor(QPalette.ColorRole.Highlight, QColor(colors.accent))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(accent_foreground))
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(colors.muted))
     view.setStyleSheet(
         f"QAbstractItemView {{ background: {popup_background}; color: {colors.text}; "
         "border: none; outline: none; padding: 2px; }"
         "QAbstractItemView::item { min-height: 28px; padding: 3px 8px; }"
         f"QAbstractItemView::item:hover {{ background: {popup_hover}; color: {colors.text}; }}"
-        f"QAbstractItemView::item:selected {{ background: {colors.accent}; color: #FFFFFF; }}"
+        f"QAbstractItemView::item:selected {{ background: {colors.accent}; color: {accent_foreground}; }}"
         f"QAbstractItemView::item:disabled {{ color: {colors.muted}; }}"
     )
     # Apply the palette after QSS: some platform styles repolish the popup view
@@ -2016,7 +3328,7 @@ def _style_combo_popup(combo: QComboBox, dark: bool) -> None:
 
 
 class _DestructiveConfirmationDialog(QDialog):
-    """Application-styled confirmation that avoids a platform QMessageBox."""
+    """Application-styled confirmation or acknowledgement dialog."""
 
     def __init__(
         self,
@@ -2025,21 +3337,54 @@ class _DestructiveConfirmationDialog(QDialog):
         text: str,
         confirm_text: str,
         *,
-        dark: bool,
+        dark: bool = False,
+        appearance: _ThemeAppearance | None = None,
+        cancel_text: str | None = "取消",
+        destructive: bool = True,
     ) -> None:
         super().__init__(parent)
+        requested_appearance = appearance or _ThemeAppearance(dark=dark)
+        # A transient confirmation window does not receive its own native
+        # NSVisualEffect/DWM bridge.  It must therefore render the complete
+        # in-app liquid material rather than inherit the parent's lower-alpha
+        # native-backdrop palette and look unexpectedly thin.
+        self._appearance = _ThemeAppearance(
+            dark=requested_appearance.dark,
+            liquid_glass=requested_appearance.liquid_glass,
+        )
+        self._destructive = destructive
         self.setWindowTitle(title)
         self.setAccessibleName(title)
         self.setModal(True)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        if sys.platform == "win32":
+            # Keep this secondary top-level window off Qt's layered path too.
+            self.setAutoFillBackground(True)
+        else:
+            # The confirmation card is the sole visible surface. Its root is
+            # transparent in every theme so the shadow margin cannot become an
+            # exposed rectangular outer ring.
+            self.setAttribute(
+                Qt.WidgetAttribute.WA_TranslucentBackground,
+                True,
+            )
+            self.setAutoFillBackground(False)
+            palette = self.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0, 0))
+            self.setPalette(palette)
         self.setFixedWidth(420)
-        self.setStyleSheet(_confirmation_style_sheet(dark))
+        self.setStyleSheet(
+            _confirmation_style_sheet(self._appearance, destructive=self._destructive)
+        )
+        if sys.platform == "win32":
+            self.setAutoFillBackground(True)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 14)
-        card = QFrame()
+        card = _LiquidGlassSurface()
         card.setObjectName("confirmationCard")
+        card.set_appearance(self._appearance)
+        self._material_card = card
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(22, 20, 22, 18)
         card_layout.setSpacing(8)
@@ -2054,22 +3399,68 @@ class _DestructiveConfirmationDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
         buttons.addStretch()
-        self.cancel_button = QPushButton("取消")
-        self.cancel_button.setObjectName("confirmationCancel")
+        self.cancel_button: QPushButton | None = None
+        if cancel_text is not None:
+            self.cancel_button = QPushButton(cancel_text)
+            self.cancel_button.setObjectName("confirmationCancel")
+            self.cancel_button.clicked.connect(self.reject)
+            buttons.addWidget(self.cancel_button)
         self.confirm_button = QPushButton(confirm_text)
         self.confirm_button.setObjectName("confirmationConfirm")
-        self.cancel_button.clicked.connect(self.reject)
         self.confirm_button.clicked.connect(self.accept)
-        self.cancel_button.setDefault(True)
-        buttons.addWidget(self.cancel_button)
+        (self.cancel_button or self.confirm_button).setDefault(True)
         buttons.addWidget(self.confirm_button)
         card_layout.addLayout(buttons)
-        shadow = QGraphicsDropShadowEffect(card)
-        shadow.setBlurRadius(24)
-        shadow.setOffset(0, 8)
-        shadow.setColor(QColor(0, 0, 0, 72 if dark else 48))
-        card.setGraphicsEffect(shadow)
+        if sys.platform != "win32":
+            shadow = QGraphicsDropShadowEffect(card)
+            shadow.setBlurRadius(24)
+            shadow.setOffset(0, 8)
+            shadow.setColor(QColor(0, 0, 0, 72 if self._appearance.dark else 48))
+            card.setGraphicsEffect(shadow)
         root.addWidget(card)
+        if self._appearance.liquid_glass:
+            self._install_material_tracking()
+
+    def _install_material_tracking(self) -> None:
+        """Forward child-pointer movement to the one confirmation material shell."""
+
+        self.setMouseTracking(True)
+        for widget in self.findChildren(QWidget):
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+
+    def _update_material_light(self, global_position: QPointF) -> None:
+        position = self._material_card.mapFromGlobal(global_position.toPoint())
+        self._material_card.set_light_position(QPointF(position))
+        self._material_card.set_light_active(self._material_card.rect().contains(position))
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            self._appearance.liquid_glass
+            and isinstance(event, QMouseEvent)
+            and (
+                event.type() == QEvent.Type.MouseMove
+                or (
+                    event.type() == QEvent.Type.MouseButtonPress
+                    and event.button() == Qt.MouseButton.LeftButton
+                )
+            )
+        ):
+            self._update_material_light(event.globalPosition())
+        return super().eventFilter(watched, event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        self._update_material_light(event.globalPosition())
+        super().mouseMoveEvent(event)
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        if self._appearance.liquid_glass:
+            self._update_material_light(QPointF(QCursor.pos()))
+
+    def leaveEvent(self, event) -> None:
+        self._material_card.set_light_active(False)
+        super().leaveEvent(event)
 
 
 def _confirm_destructive_action(
@@ -2079,16 +3470,52 @@ def _confirm_destructive_action(
     confirm_text: str,
     *,
     dark: bool = False,
+    appearance: _ThemeAppearance | None = None,
 ) -> bool:
-    prompt = _DestructiveConfirmationDialog(parent, title, text, confirm_text, dark=dark)
+    prompt = _DestructiveConfirmationDialog(
+        parent,
+        title,
+        text,
+        confirm_text,
+        dark=dark,
+        appearance=appearance,
+    )
     return prompt.exec() == QDialog.DialogCode.Accepted
 
 
-def _compact_menu(menu: QMenu, *, dark: bool | None = None) -> None:
-    if dark is None:
-        dark = menu.palette().color(QPalette.ColorRole.Window).lightness() < 128
-    colors = _theme_colors(dark)
-    disabled = "#9299A9" if dark else "#757C8D"
+def _show_themed_warning(
+    parent: QWidget,
+    title: str,
+    text: str,
+    *,
+    appearance: _ThemeAppearance,
+) -> None:
+    """Present validation feedback without falling back to a system-coloured alert."""
+
+    prompt = _DestructiveConfirmationDialog(
+        parent,
+        title,
+        text,
+        "知道了",
+        appearance=appearance,
+        cancel_text=None,
+        destructive=False,
+    )
+    prompt.exec()
+
+
+def _compact_menu(
+    menu: QMenu,
+    *,
+    dark: bool | None = None,
+    appearance: _ThemeAppearance | None = None,
+) -> None:
+    if appearance is None:
+        if dark is None:
+            dark = menu.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        appearance = _ThemeAppearance(dark=dark)
+    colors = _theme_colors(appearance)
+    disabled = "#9299A9" if appearance.dark else "#757C8D"
     menu.setStyleSheet(
         f"QMenu {{ background: {colors.menu}; color: {colors.text}; padding: 2px; }}"
         "QMenu::item { padding: 5px 7px; border-radius: 6px; }"
@@ -2103,8 +3530,8 @@ def _compact_menu(menu: QMenu, *, dark: bool | None = None) -> None:
     menu.setFixedWidth(text_width + 10)
 
 
-def _hover_color(dark: bool) -> QColor:
-    return QColor(_theme_colors(dark).hover)
+def _hover_color(theme: bool | _ThemeAppearance) -> QColor:
+    return QColor(_theme_colors(theme).hover)
 
 
 def _elide(painter: QPainter, text: str, width: int) -> str:

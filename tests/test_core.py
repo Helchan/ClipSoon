@@ -105,6 +105,14 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
     assert settings.value.hotkey == "double:ctrl"
 
 
+def test_liquid_glass_theme_is_a_valid_persisted_setting(tmp_path: Path) -> None:
+    store = JsonSettingsStore(tmp_path / "settings.json")
+    store.save(AppSettings(theme="liquid_glass"))
+
+    assert store.load().theme == "liquid_glass"
+    assert AppSettings(theme="liquid_glass").validated().theme == "liquid_glass"
+
+
 @pytest.mark.parametrize("payload", ["[1, 2]", "{bad", "null", '"string"'])
 def test_corrupt_or_wrong_shape_settings_fall_back(tmp_path: Path, payload: str) -> None:
     path = tmp_path / "settings.json"

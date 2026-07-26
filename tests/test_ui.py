@@ -5,8 +5,9 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, QRect, QSize, Qt
-from PySide6.QtGui import QColor, QImage, QInputMethodEvent, QKeySequence, QPalette
+import pytest
+from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QImage, QInputMethodEvent, QKeySequence, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -14,8 +15,12 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFrame,
     QLabel,
+    QLineEdit,
     QMenu,
+    QStyle,
+    QStyleOptionButton,
     QStyleOptionViewItem,
+    QWidget,
 )
 
 import clipsoon.ui as ui_module
@@ -27,16 +32,20 @@ from clipsoon.ui import (
     ImagePreview,
     SearchIcon,
     SettingsDialog,
+    _accent_foreground,
     _bucketed_size,
     _ByteLruCache,
     _compact_menu,
     _DestructiveConfirmationDialog,
     _hotkey_display,
     _hover_color,
+    _paint_liquid_glass_material,
     _parse_hotkey,
     _platform_hotkey_validation_error,
     _ScaledImageLoader,
     _style_sheet,
+    _theme_colors,
+    _ThemeAppearance,
 )
 
 
@@ -86,10 +95,12 @@ def test_panel_search_return_waits_for_active_input_method_composition(qtbot) ->
     panel.send_requested.connect(sent.append)
 
     QApplication.sendEvent(panel.search, QInputMethodEvent("pin", []))
+    assert panel._search_caret._ime_composing
     qtbot.keyPress(panel.search, Qt.Key.Key_Return)
     assert sent == []
 
     QApplication.sendEvent(panel.search, QInputMethodEvent("", []))
+    assert not panel._search_caret._ime_composing
     qtbot.keyPress(panel.search, Qt.Key.Key_Return)
     assert [item.id for item in sent] == ["item"]
 
@@ -122,6 +133,61 @@ def test_new_status_restarts_timer_and_permission_warning_persists(qtbot) -> Non
     assert panel.status.text() == ""
 
 
+def test_empty_history_uses_an_explanatory_state_without_inert_details(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    assert panel.history_content.currentWidget() is panel.empty_state
+    assert panel.empty_state_title.text() == "还没有剪贴板历史"
+    assert panel.empty_state_message.text() == "复制文本、图片或文件后，内容会出现在这里。"
+    assert not panel.empty_state_clear.isVisible()
+    assert not panel.detail.isVisible()
+    assert panel.info_type_value.text() == ""
+    assert panel.info_detail_label.text() == ""
+    assert panel.info_detail_value.text() == ""
+
+
+def test_no_match_empty_state_can_clear_search_and_restore_the_list(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    panel.set_items([clip("item", "可找到的内容", 1)])
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    panel.search.setText("不存在")
+
+    assert panel.history_content.currentWidget() is panel.empty_state
+    assert panel.empty_state_title.text() == "没有找到匹配内容"
+    assert panel.empty_state_clear.isVisible()
+    assert not panel.detail.isVisible()
+
+    qtbot.mouseClick(panel.empty_state_clear, Qt.MouseButton.LeftButton)
+
+    assert panel.search.text() == ""
+    assert panel.history_content.currentWidget() is panel.list
+    assert panel.detail.isVisible()
+    assert panel.list.currentIndex().row() == 0
+
+
+def test_empty_filter_state_does_not_offer_an_irrelevant_clear_action(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    panel.set_items([clip("text", "仅有文本", 1)])
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    screenshot_filter = panel._filter_buttons[2][0]
+    qtbot.mouseClick(screenshot_filter, Qt.MouseButton.LeftButton)
+
+    assert panel.history_content.currentWidget() is panel.empty_state
+    assert panel.empty_state_title.text() == "暂无截图历史"
+    assert panel.empty_state_message.text() == "切换分类或继续复制内容。"
+    assert not panel.empty_state_clear.isVisible()
+    assert not panel.detail.isVisible()
+
+
 def test_settings_and_custom_hotkey_validation(qtbot) -> None:
     dialog = SettingsDialog(AppSettings(hotkey="combo:ctrl+shift+v"))
     qtbot.addWidget(dialog)
@@ -143,8 +209,20 @@ def test_settings_and_custom_hotkey_validation(qtbot) -> None:
     )
     assert not hasattr(dialog, "version_label")
     assert dialog.close_button.text() == "关闭"
+    assert dialog.close_button.accessibleName() == "关闭设置"
     assert dialog.reset_button.text() == "重置"
     assert not dialog.findChildren(QDialogButtonBox)
+
+
+def test_settings_dialog_keeps_qwidget_hide_callable(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    dialog.hide()
+
+    assert not dialog.isVisible()
 
 
 def test_windows_settings_only_offer_registered_combo_and_hide_double_interval(
@@ -169,15 +247,17 @@ def test_windows_settings_only_offer_registered_combo_and_hide_double_interval(
     assert dialog.findChildren(QComboBox) == [dialog.theme]
     dialog.custom_hotkey.setKeySequence(QKeySequence("Ctrl+Alt+K"))
     assert dialog.values()["hotkey"] == "combo:ctrl+alt+k"
-    warnings: list[str] = []
+    warnings: list[tuple[str, object]] = []
     monkeypatch.setattr(
-        ui_module.QMessageBox,
-        "warning",
-        lambda _parent, _title, message: warnings.append(message),
+        ui_module,
+        "_show_themed_warning",
+        lambda _parent, _title, message, *, appearance: warnings.append((message, appearance)),
     )
     dialog.custom_hotkey.clear()
     dialog._emit_hotkey_change()
-    assert warnings == ["组合键必须包含 Ctrl/Shift/Alt/Command 和一个普通键。"]
+    assert warnings == [
+        ("组合键必须包含 Ctrl/Shift/Alt/Command 和一个普通键。", dialog._appearance)
+    ]
     assert dialog.result() == QDialog.DialogCode.Rejected
     assert dialog.interval.isHidden()
     interval_labels = [
@@ -235,9 +315,52 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
         controls.insert(0, dialog.hotkey_mode)
     visible_controls = [control for control in controls if not control.isHidden()]
     assert len({control.width() for control in visible_controls}) == 1
-    assert dialog.close_button.geometry().left() < dialog.reset_button.geometry().left()
+    assert dialog.windowFlags() & Qt.WindowType.FramelessWindowHint
+    assert dialog.findChild(QLabel, "settingsWindowTitle").text() == "ClipSoon 设置"
+    assert dialog.close_button.geometry().top() == dialog.reset_button.geometry().top()
+    assert dialog.close_button.geometry().right() < dialog.reset_button.geometry().left()
     assert "主题" in [label.text() for label in dialog.findChildren(QLabel, "settingsFieldLabel")]
     assert "外观" not in [label.text() for label in dialog.findChildren(QLabel, "settingsFieldLabel")]
+
+
+def test_settings_behavior_checkboxes_have_stable_non_overlapping_rows(qtbot) -> None:
+    for theme in ("light", "dark", "liquid_glass"):
+        dialog = SettingsDialog(AppSettings(theme=theme), accessibility_granted=True)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        qtbot.waitExposed(dialog)
+
+        assert dialog.capture.height() == 23, theme
+        assert dialog.paste.height() == 23, theme
+        assert dialog.hide_on_deactivate_checkbox.height() == 23, theme
+        assert dialog.remember_selection.height() == 23, theme
+        assert dialog.launch_at_login.height() == 23, theme
+        assert dialog.capture.geometry().bottom() < dialog.hide_on_deactivate_checkbox.geometry().top(), theme
+        assert dialog.paste.geometry().bottom() < dialog.remember_selection.geometry().top(), theme
+        assert (
+            dialog.hide_on_deactivate_checkbox.geometry().bottom()
+            < dialog.launch_at_login.geometry().top()
+        ), theme
+        dialog.close()
+
+
+def test_frameless_settings_footer_has_an_app_owned_close_control(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    assert dialog.windowFlags() & Qt.WindowType.FramelessWindowHint
+    assert dialog.findChild(QLabel, "settingsWindowTitle").text() == "ClipSoon 设置"
+    assert dialog.close_button.text() == "关闭"
+    assert dialog.close_button.geometry().top() == dialog.reset_button.geometry().top()
+    assert dialog.close_button.geometry().right() < dialog.reset_button.geometry().left()
+    assert dialog.close_button.accessibleName() == "关闭设置"
+    qtbot.wait(10)
+    assert dialog.focusWidget() is (dialog.hotkey_mode or dialog.custom_hotkey)
+    assert not dialog.close_button.hasFocus()
+    qtbot.mouseClick(dialog.close_button, Qt.MouseButton.LeftButton)
+    assert dialog.result() == QDialog.DialogCode.Rejected
 
 
 def test_state_memory_setting_is_an_optional_three_second_default(qtbot) -> None:
@@ -286,6 +409,18 @@ def test_destructive_confirmation_uses_the_clipsoon_dialog(qtbot) -> None:
     assert "min-width" not in dialog.styleSheet()
     assert "padding: 7px 10px" in dialog.styleSheet()
 
+    acknowledgement = _DestructiveConfirmationDialog(
+        parent,
+        "快捷键无效",
+        "请输入有效组合键。",
+        "知道了",
+        dark=False,
+        cancel_text=None,
+    )
+    qtbot.addWidget(acknowledgement)
+    assert acknowledgement.cancel_button is None
+    assert acknowledgement.confirm_button.isDefault()
+
 
 def test_launch_at_login_setting_round_trips_through_dialog(qtbot) -> None:
     dialog = SettingsDialog(AppSettings(launch_at_login=True), accessibility_granted=True)
@@ -325,6 +460,147 @@ def test_dark_settings_combo_popups_use_readable_theme_colors(qtbot) -> None:
     assert rendered.pixelColor(sample_x, normal_rect.center().y()) == QColor("#292D39")
 
 
+def test_dark_settings_uses_an_app_owned_opaque_shell_on_macos_after_a_live_theme_switch(
+    qtbot,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "darwin")
+    dialog = SettingsDialog(AppSettings(theme="dark"), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    assert dialog.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert dialog.palette().color(QPalette.ColorRole.Window) == QColor(0, 0, 0, 0)
+    assert "QDialog { background: transparent; }" in dialog.styleSheet()
+    rendered = dialog.grab().toImage()
+    assert rendered.pixelColor(4, dialog.height() // 2) == QColor("#1C1F27")
+
+    dialog.apply_settings(AppSettings(theme="liquid_glass"))
+    assert dialog.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert not dialog.autoFillBackground()
+
+    dialog.apply_settings(AppSettings(theme="dark"))
+    assert dialog.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert dialog.palette().color(QPalette.ColorRole.Window) == QColor(0, 0, 0, 0)
+    rendered = dialog.grab().toImage()
+    assert rendered.pixelColor(4, dialog.height() // 2) == QColor("#1C1F27")
+
+
+def test_settings_controls_and_confirmation_buttons_show_theme_focus(qtbot) -> None:
+    dialog = SettingsDialog(
+        AppSettings(theme="dark", hotkey="combo:ctrl+shift+space"),
+        accessibility_granted=True,
+    )
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    dialog.activateWindow()
+    dialog.theme.setFocus()
+    QApplication.processEvents()
+    assert dialog.theme.hasFocus()
+    rendered = dialog.grab().toImage()
+    origin = dialog.theme.mapTo(dialog, QPoint(0, 0))
+    assert rendered.pixelColor(origin.x(), origin.y() + dialog.theme.height() // 2) == QColor("#7180F5")
+    assert "QKeySequenceEdit:focus" in dialog.styleSheet()
+    assert "QKeySequenceEdit:disabled" in dialog.styleSheet()
+
+    parent = QDialog()
+    prompt = _DestructiveConfirmationDialog(
+        parent,
+        "清空历史",
+        "确认清空？",
+        "确定",
+        appearance=_ThemeAppearance(dark=True),
+    )
+    qtbot.addWidget(parent)
+    qtbot.addWidget(prompt)
+    prompt.show()
+    qtbot.waitExposed(prompt)
+    prompt.activateWindow()
+    prompt.cancel_button.setFocus()
+    QApplication.processEvents()
+    assert prompt.cancel_button.hasFocus()
+    rendered = prompt.grab().toImage()
+    origin = prompt.cancel_button.mapTo(prompt, QPoint(0, 0))
+    assert rendered.pixelColor(origin.x(), origin.y() + prompt.cancel_button.height() // 2) == QColor(
+        "#7180F5"
+    )
+
+
+def test_settings_checkboxes_use_the_active_theme_and_keep_a_visible_checkmark(qtbot) -> None:
+    def indicator_pixels(dialog: SettingsDialog, checkbox) -> list[QColor]:
+        option = QStyleOptionButton()
+        checkbox.initStyleOption(option)
+        indicator = checkbox.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator,
+            option,
+            checkbox,
+        )
+        origin = checkbox.mapTo(dialog, indicator.topLeft())
+        image = dialog.grab().toImage()
+        return [
+            image.pixelColor(origin.x() + x, origin.y() + y)
+            for y in range(indicator.height())
+            for x in range(indicator.width())
+        ]
+
+    for theme in ("light", "dark", "liquid_glass"):
+        dialog = SettingsDialog(AppSettings(theme=theme), accessibility_granted=True)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        qtbot.waitExposed(dialog)
+
+        checkbox = dialog.capture
+        colors = indicator_pixels(dialog, checkbox)
+        expected = QColor(ui_module._theme_colors(dialog._appearance).accent)
+        checkmark = QColor(ui_module._accent_foreground(dialog._appearance))
+        assert expected in colors, theme
+        assert checkmark in colors, theme
+
+        checkbox.setChecked(False)
+        colors = indicator_pixels(dialog, checkbox)
+        assert checkmark not in colors, theme
+
+        option = QStyleOptionButton()
+        checkbox.initStyleOption(option)
+        indicator = checkbox.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator,
+            option,
+            checkbox,
+        )
+        origin = checkbox.mapTo(dialog, indicator.topLeft())
+        idle_pixel = dialog.grab().toImage().pixelColor(
+            origin.x(), origin.y() + indicator.height() // 2
+        )
+
+        dialog.activateWindow()
+        checkbox.setFocus()
+        QApplication.processEvents()
+        assert checkbox.hasFocus(), theme
+        rendered = dialog.grab().toImage()
+        focus_color = QColor(ui_module._theme_colors(dialog._appearance).accent_focus)
+        focused_pixel = rendered.pixelColor(origin.x(), origin.y() + indicator.height() // 2)
+        assert focused_pixel != idle_pixel, theme
+        assert all(
+            abs(actual - expected) <= 18
+            for actual, expected in zip(focused_pixel.getRgb()[:3], focus_color.getRgb()[:3], strict=True)
+        ), theme
+        dialog.close()
+
+
+def test_macos_permission_note_keeps_the_settings_dialog_below_a_720px_work_area(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "darwin")
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=False)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    assert dialog.accessibility_button is not None
+    assert dialog.height() <= 720
+
+
 def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -> None:
     dialog = SettingsDialog(AppSettings(theme="light"), accessibility_granted=True)
     qtbot.addWidget(dialog)
@@ -335,6 +611,514 @@ def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -
         palette = combo.view().palette()
         assert palette.color(QPalette.ColorRole.Base) == QColor("#FAFBFE")
         assert palette.color(QPalette.ColorRole.Text) == QColor("#171A24")
+
+
+def test_glass_translucent_theme_is_selectable_and_uses_a_readable_popup_palette(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(theme="liquid_glass"), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+
+    assert dialog.theme.currentData() == "liquid_glass"
+    assert dialog.theme.currentText() == "玻璃半透（随系统）"
+    assert dialog.theme.findText("液态玻璃（随系统）") == -1
+    assert dialog.theme.findText("柔光半透（随系统）") == -1
+    for combo in (dialog.hotkey_mode, dialog.theme):
+        if combo is None:
+            continue
+        palette = combo.view().palette()
+        assert palette.color(QPalette.ColorRole.Base) == QColor("#F9FBFF")
+        assert palette.color(QPalette.ColorRole.Text) == QColor("#142039")
+        assert "background: #F9FBFF" in combo.view().styleSheet()
+        assert "background: #2C63D9; color: #FFFFFF" in combo.view().styleSheet()
+
+
+def test_dark_liquid_combo_popup_uses_the_dark_foreground_for_its_solid_accent(qtbot) -> None:
+    combo = QComboBox()
+    combo.addItems(["一", "二"])
+    qtbot.addWidget(combo)
+
+    ui_module._style_combo_popup(combo, _ThemeAppearance(dark=True, liquid_glass=True))
+
+    assert "background: #6B9DFF; color: #0A192F" in combo.view().styleSheet()
+
+
+def test_confirmation_reserves_danger_color_for_irreversible_actions(qtbot) -> None:
+    parent = QDialog()
+    destructive = _DestructiveConfirmationDialog(parent, "清空历史", "确认清空？", "清空")
+    acknowledgement = _DestructiveConfirmationDialog(
+        parent,
+        "快捷键无效",
+        "请重试。",
+        "知道了",
+        cancel_text=None,
+        destructive=False,
+    )
+    qtbot.addWidget(parent)
+    qtbot.addWidget(destructive)
+    qtbot.addWidget(acknowledgement)
+
+    assert "background: #C13749" in destructive.styleSheet()
+    assert "background: #5264E8" in acknowledgement.styleSheet()
+
+
+def _render_liquid_material(
+    *,
+    light_strength: float = 0.0,
+    native_backdrop: bool = False,
+    transparent_canvas: bool = False,
+) -> QImage:
+    image = QImage(320, 220, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(QColor(0, 0, 0, 0) if transparent_canvas else QColor("#101721"))
+    painter = QPainter(image)
+    _paint_liquid_glass_material(
+        painter,
+        QRectF(20, 20, 280, 180),
+        _ThemeAppearance(dark=False, liquid_glass=True, native_backdrop=native_backdrop),
+        light_position=QPointF(112, 84),
+        light_strength=light_strength,
+    )
+    painter.end()
+    return image
+
+
+def test_liquid_glass_material_has_environmental_depth_rim_and_subtle_pointer_sheen() -> None:
+    resting = _render_liquid_material()
+    active = _render_liquid_material(light_strength=1.0)
+
+    top_rim = resting.pixelColor(160, 21)
+    just_inside = resting.pixelColor(160, 44)
+    upper_left = resting.pixelColor(64, 58)
+    lower_right = resting.pixelColor(260, 176)
+    resting_light = resting.pixelColor(112, 84)
+    active_light = active.pixelColor(112, 84)
+
+    assert sum(top_rim.getRgb()[:3]) > sum(just_inside.getRgb()[:3])
+    assert upper_left != lower_right
+    assert sum(active_light.getRgb()[:3]) > sum(resting_light.getRgb()[:3]) + 4
+
+
+def test_native_soft_translucent_material_keeps_a_neutral_frosted_backdrop_visible() -> None:
+    fallback = _render_liquid_material(transparent_canvas=True)
+    frosted = _render_liquid_material(native_backdrop=True, transparent_canvas=True)
+
+    for point in ((64, 58), (160, 120), (260, 176)):
+        fallback_pixel = fallback.pixelColor(*point)
+        frosted_pixel = frosted.pixelColor(*point)
+        assert 0 < frosted_pixel.alpha() < 100
+        assert frosted_pixel.alpha() + 110 < fallback_pixel.alpha()
+
+    # The lower-right field must remain a neutral cool tint rather than turn
+    # into a saturated blue panel over the system material.
+    lower_right = frosted.pixelColor(260, 176)
+    assert lower_right.blue() - lower_right.green() < 28
+
+
+@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+def test_every_panel_theme_uses_one_visible_vertical_divider_without_a_detail_card(
+    qtbot,
+    theme: str,
+) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme=theme))
+    qtbot.addWidget(panel)
+    panel.set_items([clip("selected", "divider", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    divider = panel.content_divider
+    history_right = panel.history_content.mapTo(panel, QPoint(panel.history_content.width(), 0)).x()
+    divider_left = divider.mapTo(panel, QPoint(0, 0)).x()
+    divider_right = divider.mapTo(panel, QPoint(divider.width(), 0)).x()
+    detail_left = panel.detail.mapTo(panel, QPoint(0, 0)).x()
+
+    assert divider.isVisible()
+    assert divider.width() == 1
+    assert history_right < divider_left < divider_right < detail_left
+    assert divider_left - history_right == detail_left - divider_right
+    style = panel.styleSheet()
+    divider_color = (
+        "rgba(224, 238, 255, 46)"
+        if panel._appearance.dark
+        else "rgba(35, 65, 98, 38)"
+    )
+    assert "#detail { background: transparent; border: none; }" in style
+    assert f"#contentDivider {{ background: {divider_color};" in panel.styleSheet()
+    assert (
+        "#textPreview, #fileTextPreview { font-size: 13pt; padding: 11px; "
+        "background: transparent; border: none; }"
+    ) in style
+
+    panel.set_items([])
+    assert not divider.isVisible()
+
+
+@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+def test_every_panel_theme_uses_shared_section_rules_without_a_search_frame(
+    qtbot,
+    theme: str,
+) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme=theme))
+    qtbot.addWidget(panel)
+    panel.set_items([clip("selected", "divider", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    section_dividers = (
+        panel.search_filters_divider,
+        panel.filters_content_divider,
+        panel.content_footer_divider,
+    )
+    style = panel.styleSheet()
+    assert panel.search_box.frameShape() == QFrame.Shape.NoFrame
+    assert "#searchBox { background: transparent; border: none; }" in style
+    assert "#searchFiltersDivider, #filtersContentDivider, #contentFooterDivider {" in style
+
+    content_left = panel.history_content.mapTo(panel, QPoint()).x()
+    content_right = panel.detail.mapTo(panel, QPoint(panel.detail.width(), 0)).x()
+    for divider in section_dividers:
+        assert divider.isVisible()
+        assert divider.frameShape() == QFrame.Shape.NoFrame
+        assert divider.height() == 1
+        assert divider.mapTo(panel, QPoint()).x() == content_left
+        assert divider.mapTo(panel, QPoint(divider.width(), 0)).x() == content_right
+
+    def top(widget: QWidget) -> int:
+        return widget.mapTo(panel, QPoint()).y()
+
+    def bottom(widget: QWidget) -> int:
+        return widget.mapTo(panel, QPoint(0, widget.height())).y()
+
+    first_filter = panel._filter_buttons[0][0]
+    content_top = min(top(panel.history_content), top(panel.detail))
+    content_bottom = max(bottom(panel.history_content), bottom(panel.detail))
+    assert bottom(panel.search_box) < top(panel.search_filters_divider) < top(first_filter)
+    assert bottom(first_filter) < top(panel.filters_content_divider) < content_top
+    assert content_bottom < top(panel.content_footer_divider) < top(panel.version_label)
+
+    reference_pixel = panel.content_divider.grab().toImage().pixelColor(
+        0,
+        panel.content_divider.height() // 2,
+    )
+    assert reference_pixel.alpha() > 0
+    for divider in (*section_dividers, panel.information_divider):
+        image = divider.grab().toImage()
+        painted_pixels = [
+            image.pixelColor(x, y)
+            for y in range(image.height())
+            for x in range(image.width())
+        ]
+        assert reference_pixel in painted_pixels
+
+    panel.set_items([])
+    assert all(divider.isVisible() for divider in section_dividers)
+
+
+@pytest.mark.parametrize(
+    ("theme", "divider_is_dark"),
+    (("light", True), ("dark", False)),
+)
+def test_standard_detail_has_no_card_edge_and_its_divider_paints(
+    qtbot,
+    theme: str,
+    divider_is_dark: bool,
+) -> None:
+    """The standard appearances use a rule, not a second rounded card."""
+    panel = ClipPanel(lambda: AppSettings(theme=theme))
+    qtbot.addWidget(panel)
+    panel.set_items([clip("selected", "divider", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    rendered_panel = panel.grab().toImage()
+    detail = panel.detail
+    top_edge = detail.mapTo(panel, QPoint(detail.width() // 2, 0))
+    just_above = top_edge - QPoint(0, 3)
+    left_edge = detail.mapTo(panel, QPoint(0, detail.height() // 2))
+    just_left = left_edge - QPoint(2, 0)
+
+    def maximum_rgb_delta(first: QColor, second: QColor) -> int:
+        return max(
+            abs(first.red() - second.red()),
+            abs(first.green() - second.green()),
+            abs(first.blue() - second.blue()),
+        )
+
+    # A former detail-card border would be visible at either of these edges.
+    assert maximum_rgb_delta(
+        rendered_panel.pixelColor(top_edge),
+        rendered_panel.pixelColor(just_above),
+    ) <= 1
+    assert maximum_rgb_delta(
+        rendered_panel.pixelColor(left_edge),
+        rendered_panel.pixelColor(just_left),
+    ) <= 1
+
+    # Grab the one-pixel child directly: Qt's offscreen parent compositing
+    # intentionally folds semitransparent child pixels into its background.
+    divider_ink = panel.content_divider.grab().toImage().pixelColor(
+        0,
+        panel.content_divider.height() // 2,
+    )
+    assert divider_ink.alpha() > 0
+    assert (divider_ink.lightness() < 150) is divider_is_dark
+
+
+def test_liquid_glass_panel_uses_one_custom_painted_primary_shell(qtbot) -> None:
+    current = {"settings": AppSettings(theme="light")}
+    panel = ClipPanel(lambda: current["settings"])
+    qtbot.addWidget(panel)
+
+    expected_inset = 1 if sys.platform == "win32" else 14
+    light_margins = panel.layout().contentsMargins()
+    assert light_margins.left() == expected_inset
+    assert light_margins.top() == expected_inset
+
+    current["settings"] = AppSettings(theme="liquid_glass")
+    panel.apply_theme()
+
+    assert panel.card.__class__.__name__ == "_LiquidGlassSurface"
+    liquid_margins = panel.layout().contentsMargins()
+    assert liquid_margins.left() == expected_inset
+    assert liquid_margins.top() == expected_inset
+    assert "#card { background: transparent; border: none;" in panel.styleSheet()
+    assert "#detail { background: transparent; border: none;" in panel.styleSheet()
+    if panel.card.graphicsEffect() is not None:
+        assert not panel.card.graphicsEffect().isEnabled()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows confirmation dialogs must retain opaque non-layered backing",
+)
+@pytest.mark.parametrize(
+    "appearance",
+    (
+        _ThemeAppearance(dark=False),
+        _ThemeAppearance(dark=True),
+        _ThemeAppearance(dark=False, liquid_glass=True),
+        _ThemeAppearance(dark=True, liquid_glass=True),
+    ),
+    ids=("light", "dark", "glass-light", "glass-dark"),
+)
+def test_confirmation_has_no_opaque_rectangular_root_ring(qtbot, appearance) -> None:
+    parent = QDialog()
+    prompt = _DestructiveConfirmationDialog(
+        parent,
+        "清空历史",
+        "确认清空？",
+        "确定",
+        appearance=appearance,
+    )
+    qtbot.addWidget(parent)
+    qtbot.addWidget(prompt)
+    prompt.show()
+    qtbot.waitExposed(prompt)
+
+    card = prompt.findChild(QFrame, "confirmationCard")
+    assert card is not None
+    assert prompt.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert not prompt.autoFillBackground()
+    assert "QDialog { background: transparent;" in prompt.styleSheet()
+
+    rendered = prompt.grab().toImage()
+    # The outer corner belongs to the transparent root, not an opaque
+    # rectangular second surface. The retained soft card shadow may occupy
+    # nearby margin pixels, but never as a hard opaque strip.
+    assert rendered.pixelColor(1, 1).alpha() == 0
+    for point in (
+        card.mapTo(prompt, QPoint(-2, card.height() // 2)),
+        card.mapTo(prompt, QPoint(card.width() // 2, card.height() + 2)),
+    ):
+        assert rendered.pixelColor(point).alpha() < 96
+    center = card.mapTo(prompt, card.rect().center())
+    assert rendered.pixelColor(center).alpha() >= 200
+
+
+def test_dark_confirmation_uses_bright_title_and_cancel_text(qtbot) -> None:
+    parent = QDialog()
+    prompt = _DestructiveConfirmationDialog(
+        parent,
+        "清空历史",
+        "确认清空？",
+        "确定",
+        appearance=_ThemeAppearance(dark=True),
+    )
+    qtbot.addWidget(parent)
+    qtbot.addWidget(prompt)
+    prompt.show()
+    qtbot.waitExposed(prompt)
+
+    if sys.platform == "win32":
+        assert not prompt.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    else:
+        assert prompt.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert "#confirmationTitle { color: #F2F4F8;" in prompt.styleSheet()
+    assert "color: #F2F4F8;" in prompt.styleSheet()
+    rendered = prompt.grab().toImage()
+    root_pixel = rendered.pixelColor(2, prompt.height() // 2)
+    if sys.platform == "win32":
+        assert root_pixel.alpha() == 255
+        assert root_pixel.lightness() < 40
+    else:
+        assert root_pixel.alpha() < 96
+    title = prompt.findChild(QLabel, "confirmationTitle")
+    assert title is not None
+    for widget in (title, prompt.cancel_button):
+        origin = widget.mapTo(prompt, QPoint(0, 0))
+        rect = QRect(origin, widget.size())
+        assert any(
+            rendered.pixelColor(x, y).lightness() > 180
+            for y in range(rect.top(), rect.bottom() + 1)
+            for x in range(rect.left(), rect.right() + 1)
+        )
+
+
+def test_confirmation_falls_back_to_complete_liquid_material_without_parent_native_backdrop(qtbot) -> None:
+    parent = QDialog()
+    prompt = _DestructiveConfirmationDialog(
+        parent,
+        "清空历史",
+        "确认清空？",
+        "确定",
+        appearance=_ThemeAppearance(dark=False, liquid_glass=True, native_backdrop=True),
+    )
+    qtbot.addWidget(parent)
+    qtbot.addWidget(prompt)
+
+    assert prompt._appearance.liquid_glass
+    assert not prompt._appearance.native_backdrop
+
+
+def test_liquid_list_selection_and_hover_share_one_blue_material_language(qtbot) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+    qtbot.addWidget(panel)
+    panel.set_items(
+        [
+            clip("selected", "selected", 3),
+            clip("hovered", "hovered", 2),
+            clip("plain", "plain", 1),
+        ]
+    )
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    hovered = panel.model.index(1)
+    qtbot.mouseMove(panel.list.viewport(), panel.list.visualRect(hovered).center())
+    qtbot.wait(20)
+
+    image = panel.list.viewport().grab().toImage()
+    selected_rect = panel.list.visualRect(panel.model.index(0))
+    hover_rect = panel.list.visualRect(hovered)
+    assert selected_rect.width() == image.width()
+    assert hover_rect.width() == image.width()
+    selected_point = selected_rect.center()
+    selected_point.setX(selected_rect.right() - 10)
+    hover_point = hover_rect.center()
+    hover_point.setX(hover_rect.right() - 10)
+
+    selected_fill = image.pixelColor(selected_point)
+    hover_fill = image.pixelColor(hover_point)
+    assert selected_fill.alpha() == 154
+    assert hover_fill.alpha() == 42
+    assert selected_fill.blue() - selected_fill.red() > 140
+    assert hover_fill.blue() - hover_fill.red() > 100
+    assert selected_fill.alpha() > hover_fill.alpha()
+
+
+def test_liquid_history_scrollbar_is_narrow_and_has_no_opaque_track(qtbot) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+    qtbot.addWidget(panel)
+    panel.set_items([clip(str(index), f"item {index}", index) for index in range(42)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    scrollbar = panel.list.verticalScrollBar()
+    rendered = scrollbar.grab().toImage()
+
+    assert scrollbar.isVisible()
+    assert scrollbar.width() == 12
+    assert rendered.pixelColor(scrollbar.width() // 2, scrollbar.height() // 2).alpha() == 0
+    style = panel.styleSheet()
+    assert "#historyList QScrollBar:vertical" in style
+    assert "#historyList QScrollBar::groove:vertical" in style
+    assert "#historyList QScrollBar::add-page:vertical" in style
+    assert "#historyList QScrollBar::sub-page:vertical" in style
+
+
+def test_standard_history_scrollbars_are_narrow_and_have_no_opaque_track(qtbot) -> None:
+    for theme, handle in (
+        ("light", "rgba(52, 65, 86, 132)"),
+        ("dark", "rgba(224, 232, 244, 132)"),
+    ):
+        panel = ClipPanel(lambda theme=theme: AppSettings(theme=theme))
+        qtbot.addWidget(panel)
+        panel.set_items([clip(str(index), f"item {index}", index) for index in range(42)])
+        panel.show_panel()
+        qtbot.waitExposed(panel)
+
+        scrollbar = panel.list.verticalScrollBar()
+        rendered = scrollbar.grab().toImage()
+
+        assert scrollbar.isVisible(), theme
+        assert scrollbar.width() == 12, theme
+        assert rendered.pixelColor(scrollbar.width() // 2, scrollbar.height() // 2).alpha() == 0, theme
+        assert handle in panel.styleSheet()
+
+
+def test_long_text_preview_scrollbar_is_narrow_and_transparent_in_every_theme(qtbot) -> None:
+    text = "\n".join(f"long preview line {index}" for index in range(160))
+    for theme in ("light", "dark", "liquid_glass"):
+        panel = ClipPanel(lambda theme=theme: AppSettings(theme=theme))
+        qtbot.addWidget(panel)
+        panel.set_items([clip("long", text, 1)])
+        panel.show_panel()
+        qtbot.waitExposed(panel)
+
+        scrollbar = panel.text_preview.verticalScrollBar()
+        rendered = scrollbar.grab().toImage()
+
+        assert panel.text_preview.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        assert panel.file_text_preview.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        assert scrollbar.isVisible(), theme
+        assert scrollbar.width() == 12, theme
+        assert rendered.pixelColor(scrollbar.width() // 2, scrollbar.height() // 2).alpha() == 0, theme
+        assert "#textPreview QScrollBar:vertical" in panel.styleSheet()
+
+
+def test_windows_liquid_glass_keeps_qt_non_layered_before_and_after_native_backdrop(
+    qtbot,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+    qtbot.addWidget(panel)
+
+    assert panel.card.graphicsEffect() is None
+    assert not panel.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert panel.autoFillBackground()
+    assert not panel.native_backdrop_active
+    assert "#panelWindow { background: transparent; }" not in panel.styleSheet()
+
+    panel.set_native_backdrop_active(True)
+
+    assert panel.native_backdrop_active
+    assert not panel.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert panel.autoFillBackground()
+    assert "#panelWindow { background: transparent; }" in panel.styleSheet()
+    assert "#card { background: transparent; border: none;" in panel.styleSheet()
+    assert "rgba(232, 244, 255, 54)" in panel.styleSheet()
+
+
+def test_windows_dialogs_keep_non_layered_backing_without_qt_drop_shadows(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    dialog = SettingsDialog(AppSettings(theme="liquid_glass"), accessibility_granted=True)
+    prompt = _DestructiveConfirmationDialog(dialog, "清空历史", "确认清空？", "确定", dark=False)
+    qtbot.addWidget(dialog)
+    qtbot.addWidget(prompt)
+
+    assert dialog.autoFillBackground()
+    assert not dialog.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert prompt.autoFillBackground()
+    assert not prompt.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    card = prompt.findChild(QFrame, "confirmationCard")
+    assert card is not None and card.graphicsEffect() is None
 
 
 def test_open_data_directory_closes_settings_before_emitting(qtbot, monkeypatch) -> None:
@@ -377,8 +1161,7 @@ def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
     panel.show_panel()
     qtbot.waitExposed(panel)
 
-    information_title = panel.findChild(QLabel, "informationTitle")
-    assert information_title is not None
+    information_title = panel.information_title
     assert panel.search.font().pointSizeF() == 16
     assert all(button.font().pointSizeF() == 13 for button, _kind in panel._filter_buttons)
     assert panel.list.font().pointSizeF() == 13
@@ -390,22 +1173,30 @@ def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
     assert panel.information_divider.frameShape() == QFrame.Shape.NoFrame
     assert panel.info_type_label.font().weight() == panel.info_type_value.font().weight()
     assert panel.info_detail_label.font().weight() == panel.info_detail_value.font().weight()
+    assert information_title.geometry().left() == panel.info_type_label.geometry().left()
+    assert information_title.geometry().left() == panel.information_divider.geometry().left()
     style = _style_sheet(False)
     assert "#informationLabel, #informationValue" in style
     assert "color: #62697A; font-size: 13pt; font-weight: 500;" in style
     assert (
-        "#informationDivider {\n            background: rgba(45, 53, 76, 18); "
+        "#informationDivider {\n            background: rgba(35, 65, 98, 38); "
         "margin: 3px 8px 1px; min-height: 1px; max-height: 1px;\n        }" in style
     )
+    assert "#searchFiltersDivider, #filtersContentDivider, #contentFooterDivider {" in style
+    assert "background: rgba(35, 65, 98, 38); border: none; min-height: 1px; max-height: 1px;" in style
     assert "#informationTitle { font-size: 13pt; font-weight: 650; padding: 6px 0 0 0; }" in style
     assert panel.search_icon.size() == QSize(30, 30)
     text_height = panel.search.fontMetrics().tightBoundingRect("Ag").height()
-    assert panel.search_box.height() == text_height * 2 + 4
+    assert panel.search_box.height() == text_height * 2
+    assert panel.search_box.frameShape() == QFrame.Shape.NoFrame
     search_margins = panel.search.parentWidget().layout().contentsMargins()
     assert search_margins.top() == 0
     assert search_margins.bottom() == 0
-    search_rule = "#search { background: transparent; border: none; font-size: 16pt; padding: 0 2px; }"
-    assert search_rule in _style_sheet(False)
+    search_style = _style_sheet(False)
+    assert "#searchBox { background: transparent; border: none; }" in search_style
+    assert "#search {" in search_style
+    assert "color: #171A24; font-size: 16pt; padding: 0 2px;" in search_style
+    assert "selection-background-color: #5264E8; selection-color: #FFFFFF;" in search_style
 
 
 def test_windows_panel_uses_opaque_backing_store_without_drop_shadow(
@@ -1185,7 +1976,7 @@ def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     assert "background: #454C5C" in style
 
 
-def test_filter_and_list_background_align_with_bordered_search(qtbot) -> None:
+def test_filter_and_list_background_align_with_borderless_search_region(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
     panel.set_items([clip("text", "text", 1)])
@@ -1200,6 +1991,7 @@ def test_filter_and_list_background_align_with_bordered_search(qtbot) -> None:
 
     assert button_left == list_background_left
     assert search_box is not None
+    assert search_box.frameShape() == QFrame.Shape.NoFrame
     assert search_box.mapTo(panel, QPoint()).x() == list_background_left
     search_right = search_box.mapTo(panel, QPoint(search_box.width(), 0)).x()
     detail_right = panel.detail.mapTo(panel, QPoint(panel.detail.width(), 0)).x()
@@ -1216,6 +2008,170 @@ def test_clicking_search_icon_requests_settings(qtbot) -> None:
     qtbot.mouseClick(panel.search_icon, Qt.MouseButton.LeftButton)
 
     assert requested == [True]
+
+
+def test_search_icon_click_keeps_the_main_panel_typing_focus(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    requested: list[bool] = []
+    panel.settings_requested.connect(lambda: requested.append(True))
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    qtbot.mouseClick(panel.search_icon, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(panel.search.hasFocus, timeout=500)
+
+    assert panel.search_icon.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert panel.search_icon.toolTip() == "打开设置"
+    assert requested == [True]
+
+
+@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+def test_active_panel_keeps_search_focus_after_every_in_panel_interaction(qtbot, theme: str) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme=theme))
+    qtbot.addWidget(panel)
+    panel.set_items([clip("first", "first preview", 2), clip("second", "second preview", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    def assert_search_focus() -> None:
+        qtbot.waitUntil(panel.search.hasFocus, timeout=500)
+        assert QApplication.focusWidget() is panel.search
+
+    assert_search_focus()
+    qtbot.mouseClick(panel._filter_buttons[1][0], Qt.MouseButton.LeftButton)
+    assert_search_focus()
+    second = panel.model.index(1)
+    qtbot.mouseClick(panel.list.viewport(), Qt.MouseButton.LeftButton, pos=panel.list.visualRect(second).center())
+    assert_search_focus()
+    qtbot.keyClick(panel.search, Qt.Key.Key_Up)
+    assert_search_focus()
+    assert panel.list.currentIndex().row() == 0
+    qtbot.mouseClick(panel.text_preview.viewport(), Qt.MouseButton.LeftButton)
+    assert_search_focus()
+    qtbot.mouseClick(panel.search_icon, Qt.MouseButton.LeftButton)
+    assert_search_focus()
+    panel.search.clearFocus()
+    assert_search_focus()
+
+    assert panel.list.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert panel.text_preview.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert panel.search_icon.focusPolicy() == Qt.FocusPolicy.NoFocus
+
+
+@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+def test_search_uses_an_app_owned_themed_blinking_caret(qtbot, theme: str) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme=theme))
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    colors = _theme_colors(panel._appearance)
+    palette = panel.search.palette()
+    assert palette.color(QPalette.ColorRole.Text) == QColor(colors.text)
+    assert palette.color(QPalette.ColorRole.WindowText) == QColor(colors.text)
+    assert f"color: {colors.text}; font-size: 16pt" in panel.styleSheet()
+    assert f"selection-color: {_accent_foreground(panel._appearance)}" in panel.styleSheet()
+
+    # The native QLineEdit caret must be absent during the overlay's hidden
+    # half-cycle, otherwise macOS paints a white line through glass themes.
+    assert panel.search.property("_clipsoon_app_owned_caret") is True
+    assert (
+        panel.search.style().pixelMetric(
+            QStyle.PixelMetric.PM_TextCursorWidth,
+            None,
+            panel.search,
+        )
+        == 0
+    )
+    caret = panel._search_caret
+    assert caret.overlay._color == QColor(colors.text)
+    prior_phase = caret._phase_visible
+    caret._advance_phase()
+    assert caret._phase_visible is not prior_phase
+    caret._restart_blink()
+    if QApplication.styleHints().cursorFlashTime() >= 2:
+        assert caret._blink_timer.interval() == max(
+            1,
+            QApplication.styleHints().cursorFlashTime() // 2,
+        )
+
+
+@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+def test_settings_text_editors_use_the_same_app_owned_blinking_caret(qtbot, theme: str) -> None:
+    dialog = SettingsDialog(AppSettings(theme=theme), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    editors = (
+        dialog.custom_hotkey.findChild(QLineEdit),
+        dialog.interval.lineEdit(),
+        dialog.maximum.lineEdit(),
+        dialog.retention.lineEdit(),
+        dialog.delay.lineEdit(),
+        dialog.selection_memory.lineEdit(),
+    )
+    assert all(editor is not None for editor in editors)
+
+    def assert_editor_tokens() -> None:
+        current_colors = _theme_colors(dialog._appearance)
+        assert len(dialog._text_carets) == len(editors)
+        for editor, caret in zip(editors, dialog._text_carets, strict=True):
+            assert editor is not None
+            palette = editor.palette()
+            # The custom-hotkey and selection-memory inputs can start disabled;
+            # assert their active palette because it is the one used as soon as
+            # the editable control receives focus and renders its themed caret.
+            assert palette.color(QPalette.ColorGroup.Active, QPalette.ColorRole.Text) == QColor(
+                current_colors.text
+            )
+            assert palette.color(QPalette.ColorGroup.Active, QPalette.ColorRole.WindowText) == QColor(
+                current_colors.text
+            )
+            assert editor.property("_clipsoon_app_owned_caret") is True
+            assert (
+                editor.style().pixelMetric(
+                    QStyle.PixelMetric.PM_TextCursorWidth,
+                    None,
+                    editor,
+                )
+                == 0
+            )
+            assert caret.overlay._color == QColor(current_colors.text)
+        assert f"selection-background-color: {current_colors.accent}; selection-color: " in dialog.styleSheet()
+        assert f"selection-color: {_accent_foreground(dialog._appearance)};" in dialog.styleSheet()
+
+    assert_editor_tokens()
+    dialog.apply_settings(AppSettings(theme="dark" if not dialog._appearance.dark else "light"))
+    assert_editor_tokens()
+
+
+def test_empty_action_and_closed_context_menu_restore_the_permanent_search_focus(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("first", "first", 2), clip("second", "second", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    panel.search.setText("no matching history")
+    assert panel.history_content.currentWidget() is panel.empty_state
+    qtbot.mouseClick(panel.empty_state_clear, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(panel.search.hasFocus, timeout=500)
+    assert QApplication.focusWidget() is panel.search
+
+    def dismiss_context_menu() -> None:
+        popup = QApplication.activePopupWidget()
+        if popup is None:
+            QTimer.singleShot(5, dismiss_context_menu)
+            return
+        popup.close()
+
+    panel.search.clearFocus()
+    QTimer.singleShot(0, dismiss_context_menu)
+    panel._open_list_menu(panel.list.visualRect(panel.model.index(0)).center())
+    qtbot.waitUntil(panel.search.hasFocus, timeout=500)
+    assert QApplication.focusWidget() is panel.search
 
 
 def test_hover_background_is_visible_but_weaker_than_selection(qtbot) -> None:

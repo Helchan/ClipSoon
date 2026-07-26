@@ -219,7 +219,11 @@ class AppSettings:
             launch_at_login=bool(self.launch_at_login),
             panel_x=_optional_coordinate(self.panel_x),
             panel_y=_optional_coordinate(self.panel_y),
-            theme=self.theme if self.theme in {"system", "light", "dark"} else "system",
+            theme=(
+                self.theme
+                if self.theme in {"system", "light", "dark", "liquid_glass"}
+                else "system"
+            ),
         )
 
 
