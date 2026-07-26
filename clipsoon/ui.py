@@ -8,6 +8,7 @@ import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -768,15 +769,40 @@ class _LiquidGlassSurface(QFrame):
         self._appearance = _ThemeAppearance(dark=False)
         self._light_position = QPointF()
         self._light_strength = 0.0
-        self._hover_animation = QVariantAnimation(self)
-        self._hover_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._hover_animation.valueChanged.connect(self._set_light_strength)
+        self._hover_animation = self._create_hover_animation()
         self.setFrameShape(QFrame.Shape.NoFrame)
+
+    def _create_hover_animation(self) -> QVariantAnimation:
+        """Create the short-lived pointer sheen animation for this surface."""
+
+        animation = QVariantAnimation(self)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.valueChanged.connect(self._set_light_strength)
+        return animation
+
+    def _active_hover_animation(self) -> QVariantAnimation:
+        """Return a live animation, recreating one Qt already tore down.
+
+        A deferred system-appearance refresh can arrive while Qt is unwinding
+        a modal window or test widget tree.  In that narrow lifecycle window
+        the surface still exists but its parent-owned animation may already
+        have been destroyed.  Recreate the cosmetic animation rather than
+        letting a theme refresh fail; the material remains fully functional.
+        """
+
+        try:
+            self._hover_animation.state()
+        except RuntimeError:
+            self._hover_animation = self._create_hover_animation()
+        return self._hover_animation
 
     def set_appearance(self, appearance: _ThemeAppearance) -> None:
         self._appearance = appearance
         if not appearance.liquid_glass:
-            self._hover_animation.stop()
+            # The effect is optional, and a later hover will lazily create a
+            # fresh animation if this QObject was torn down.
+            with suppress(RuntimeError):
+                self._hover_animation.stop()
             self._light_strength = 0.0
         self.update()
 
@@ -789,17 +815,18 @@ class _LiquidGlassSurface(QFrame):
     def set_light_active(self, active: bool) -> None:
         if not self._appearance.liquid_glass:
             return
+        animation = self._active_hover_animation()
         target = 1.0 if active else 0.0
         if (
-            self._hover_animation.endValue() == target
-            and self._hover_animation.state() == QVariantAnimation.State.Running
+            animation.endValue() == target
+            and animation.state() == QVariantAnimation.State.Running
         ):
             return
-        self._hover_animation.stop()
-        self._hover_animation.setStartValue(self._light_strength)
-        self._hover_animation.setEndValue(target)
-        self._hover_animation.setDuration(140 if active else 220)
-        self._hover_animation.start()
+        animation.stop()
+        animation.setStartValue(self._light_strength)
+        animation.setEndValue(target)
+        animation.setDuration(140 if active else 220)
+        animation.start()
 
     def _set_light_strength(self, value: object) -> None:
         self._light_strength = float(value)

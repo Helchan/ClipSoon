@@ -87,6 +87,44 @@ def test_closing_settings_returns_focus_to_the_permanent_search_target(qtbot, tm
     application.shutdown()
 
 
+def test_windows_settings_close_reactivates_panel_before_restoring_search_focus(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Windows restores a closed dialog's child focus after ``exec()`` returns."""
+
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+    application.panel.show_panel()
+    qtbot.waitExposed(application.panel)
+    original_platform = app_module.sys.platform
+
+    def close_active_modal() -> None:
+        modal = QApplication.activeModalWidget()
+        if modal is None:
+            QTimer.singleShot(0, close_active_modal)
+            return
+        modal.reject()
+
+    try:
+        # Instantiate the app using the local platform, then exercise the
+        # Windows-only settings shell. This avoids creating a real Windows
+        # clipboard worker on the non-Windows test host.
+        monkeypatch.setattr(app_module.sys, "platform", "win32")
+        application.panel.search.clearFocus()
+        QTimer.singleShot(0, close_active_modal)
+        application.show_settings()
+
+        qtbot.waitUntil(application.panel.search.hasFocus, timeout=500)
+        assert application.panel.isActiveWindow()
+        assert QApplication.focusWidget() is application.panel.search
+    finally:
+        monkeypatch.setattr(app_module.sys, "platform", original_platform)
+        application.shutdown()
+
+
 def test_clear_current_tab_history_preserves_other_kinds(qtbot, tmp_path) -> None:
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)

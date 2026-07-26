@@ -6,7 +6,19 @@ import time
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QEvent, QItemSelectionModel, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEvent,
+    QItemSelectionModel,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+)
 from PySide6.QtGui import QColor, QImage, QInputMethodEvent, QKeyEvent, QKeySequence, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -696,6 +708,28 @@ def test_liquid_glass_material_has_environmental_depth_rim_and_subtle_pointer_sh
     assert sum(top_rim.getRgb()[:3]) > sum(just_inside.getRgb()[:3])
     assert upper_left != lower_right
     assert sum(active_light.getRgb()[:3]) > sum(resting_light.getRgb()[:3]) + 4
+
+
+def test_liquid_surface_recovers_when_qt_tears_down_its_hover_animation(qtbot) -> None:
+    """A deferred theme refresh must not call a stale parent-owned animation."""
+
+    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+    qtbot.addWidget(panel)
+    stale_animation = panel.card._hover_animation
+    stale_animation.deleteLater()
+    QCoreApplication.sendPostedEvents(stale_animation, QEvent.Type.DeferredDelete)
+
+    with pytest.raises(RuntimeError):
+        stale_animation.state()
+
+    # Theme reconciliation can occur before the next pointer event. It must
+    # safely clear the stale effect, and the next hover must restore it.
+    panel.card.set_appearance(_ThemeAppearance(dark=False))
+    panel.card.set_appearance(_ThemeAppearance(dark=False, liquid_glass=True))
+    panel.card.set_light_active(True)
+
+    assert panel.card._hover_animation is not stale_animation
+    assert panel.card._hover_animation.state() == QVariantAnimation.State.Running
 
 
 def test_native_soft_translucent_material_keeps_a_neutral_frosted_backdrop_visible() -> None:

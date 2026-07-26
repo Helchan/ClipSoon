@@ -13,7 +13,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from platformdirs import user_data_path
-from PySide6.QtCore import QLockFile, QObject, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QLockFile, QObject, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
@@ -163,6 +163,13 @@ class ClipSoonApplication(QObject):
         self._system_theme_signals_connected = False
 
         self.panel = ClipPanel(lambda: self.settings.value)
+        # The timer is owned by the panel so closing the panel also cancels a
+        # pending post-modal focus repair. A static QTimer.singleShot bound to
+        # this application can otherwise fire after pytest or Qt has already
+        # destroyed the panel.
+        self._settings_focus_restore_timer = QTimer(self.panel)
+        self._settings_focus_restore_timer.setSingleShot(True)
+        self._settings_focus_restore_timer.timeout.connect(self._restore_panel_search_focus)
         self.panel.set_items(self.repository.list_items())
         self.clipboard = ClipboardController(
             qt_app.clipboard(),
@@ -411,14 +418,22 @@ class ClipSoonApplication(QObject):
             self._settings_dialog = None
             self.panel.keep_open(False)
             # Modal teardown can briefly leave the command panel without a
-            # focus widget. Restore its permanent typing target after the
-            # dialog closes; the deferred pass wins over Qt's modal restore.
+            # focus widget or inactive behind its just-dismissed child. Restore
+            # its permanent typing target after the dialog closes; a second,
+            # short delayed pass wins over the platform's deferred modal-focus
+            # restoration on Windows.
             self._restore_panel_search_focus()
-            QTimer.singleShot(0, self._restore_panel_search_focus)
+            self._settings_focus_restore_timer.start(35)
 
     def _restore_panel_search_focus(self) -> None:
-        if self.panel.isVisible():
-            self.panel.search.setFocus()
+        if self.panel.isVisible() and QApplication.activeModalWidget() is None:
+            # On Windows, QDialog.exec() can restore its last child editor as
+            # the focus widget after returning to this finally block. The
+            # panel must first regain window activation; otherwise setFocus()
+            # only updates a dormant focus chain and the visible caret remains
+            # in the closed settings dialog.
+            self.panel.activateWindow()
+            self.panel.search.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     def _schedule_system_theme_refresh(self, *_args: object) -> None:
         """Coalesce an OS appearance update before repainting dynamic themes."""
@@ -742,6 +757,7 @@ class ClipSoonApplication(QObject):
         self._panel_watch_timer.stop()
         self._hotkey_health_timer.stop()
         self._file_history_sweep_timer.stop()
+        self._settings_focus_restore_timer.stop()
         self._system_theme_refresh_timer.stop()
         self._system_theme_refresh_pending = False
         if self._system_theme_signals_connected:
