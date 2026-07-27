@@ -2,7 +2,7 @@
 
 The contract is intentionally small and visible here:
 
-* Empty query: newest ``updated_at`` first.
+* Empty query: preserve the caller-provided order.
 * Non-empty query: every normalized query character must occur in order.
 * Exact field equality always wins.
 * Other scores combine query/content length coverage and match continuity.
@@ -65,7 +65,8 @@ class SearchEngine:
                 if score is not None:
                     ranked.append(SearchResult(record.item, score))
         else:
-            ranked = [SearchResult(record.item, record.item.updated_at) for record in records]
+            ranked = [SearchResult(record.item, 0.0) for record in records]
+            return ranked if limit is None else ranked[:limit]
         ranked.sort(
             key=lambda result: (
                 result.score,

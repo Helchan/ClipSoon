@@ -2458,11 +2458,11 @@ def test_detail_information_for_text_and_image(qtbot) -> None:
     image = ClipItem("image", ClipKind.IMAGE, "image", 1, 2, byte_size=2048)
     panel.set_items([text, image])
 
-    panel._show_detail(1)
+    panel._show_detail(0)
     assert panel.info_type_value.text() == "文本"
     assert panel.info_detail_label.text() == "字数"
     assert panel.info_detail_value.text() == "8 字"
-    panel._show_detail(0)
+    panel._show_detail(1)
     assert panel.info_type_value.text() == "图片"
     assert panel.info_detail_label.text() == "图片大小"
     assert panel.info_detail_value.text() == "2.0 KB"

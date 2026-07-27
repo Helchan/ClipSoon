@@ -155,11 +155,11 @@ def test_search_contract_exact_prefix_substring_subsequence_and_rejection() -> N
 def test_search_unicode_filter_browse_and_stable_tie_break() -> None:
     text = item("b", "发布计划 ＡＢＣ", updated=10, pinned=True)
     file_item = item("a", "/tmp/abc.txt", updated=20, kind=ClipKind.FILES)
-    engine = SearchEngine([file_item, text])
+    engine = SearchEngine([text, file_item])
     assert normalize("  ＡｂＣ  ") == "  abc  "
     assert engine.rank("abc", now=20)[0].item.id == "b"
     assert engine.rank("abc", now=20, kind=ClipKind.FILES)[0].item.id == "a"
-    assert engine.rank("", now=20)[0].item.id == "a"
+    assert [result.item.id for result in engine.rank("", now=20)] == ["b", "a"]
     assert [result.item.id for result in engine.rank("", now=20, favorites_only=True)] == ["b"]
     assert len(engine.rank("abc", now=20, limit=1)) == 1
 
