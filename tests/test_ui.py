@@ -2539,7 +2539,7 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
         _unfavorite_action,
         delete_action,
         _clear_action,
-        _clear_favorites_action,
+        _clear_non_favorites_action,
         _settings_action,
     ) = panel._create_list_menu()
     qtbot.addWidget(menu)
@@ -2591,9 +2591,15 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
     qtbot.addWidget(panel)
     panel.set_items([clip("selected", "item", 1)])
 
-    menu, favorite_action, unfavorite_action, delete_action, clear_action, clear_favorites_action, settings_action = (
-        panel._create_list_menu()
-    )
+    (
+        menu,
+        favorite_action,
+        unfavorite_action,
+        delete_action,
+        clear_action,
+        clear_non_favorites_action,
+        settings_action,
+    ) = panel._create_list_menu()
     qtbot.addWidget(menu)
 
     menu_actions = (
@@ -2601,7 +2607,7 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
         unfavorite_action,
         delete_action,
         clear_action,
-        clear_favorites_action,
+        clear_non_favorites_action,
         settings_action,
     )
     assert [action.text() for action in menu_actions] == [
@@ -2609,7 +2615,7 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
         "取消收藏",
         "删除",
         "清空",
-        "清空F",
+        "清空NF",
         "设置",
     ]
     assert menu.actions()[0] is favorite_action
@@ -2617,12 +2623,12 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
     assert menu.actions()[2].isSeparator()
     assert menu.actions()[3] is delete_action
     assert menu.actions()[4] is clear_action
-    assert menu.actions()[5] is clear_favorites_action
+    assert menu.actions()[5] is clear_non_favorites_action
     assert menu.actions()[6].isSeparator()
     assert menu.actions()[7] is settings_action
     assert all(not action.icon().isNull() for action in menu_actions)
     assert all(action.isIconVisibleInMenu() for action in menu_actions)
-    assert not clear_favorites_action.isEnabled()
+    assert clear_non_favorites_action.isEnabled()
     assert favorite_action.isEnabled()
     assert not unfavorite_action.isEnabled()
 
@@ -2633,14 +2639,14 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
         unfavorite_action,
         _delete_action,
         _clear_action,
-        clear_favorites_action,
+        clear_non_favorites_action,
         _settings_action,
     ) = (
         panel._create_list_menu()
     )
     qtbot.addWidget(menu)
 
-    assert clear_favorites_action.isEnabled()
+    assert not clear_non_favorites_action.isEnabled()
     assert not favorite_action.isEnabled()
     assert unfavorite_action.isEnabled()
 
@@ -2653,7 +2659,7 @@ def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     menu.addSeparator()
     menu.addAction("删除")
     menu.addAction("清空")
-    menu.addAction("清空F")
+    menu.addAction("清空NF")
     menu.addSeparator()
     menu.addAction("设置")
 
@@ -2709,12 +2715,12 @@ def test_clear_current_tab_history_uses_its_own_confirmation_and_signal(
     assert requested == [kind]
 
 
-def test_clear_favorites_history_uses_its_own_confirmation_and_signal(qtbot, monkeypatch) -> None:
+def test_clear_non_favorites_history_uses_its_own_confirmation_and_signal(qtbot, monkeypatch) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
     confirmations: list[tuple[str, str, str]] = []
     requested: list[bool] = []
-    panel.clear_favorites_requested.connect(lambda: requested.append(True))
+    panel.clear_non_favorites_requested.connect(lambda: requested.append(True))
 
     def confirm(parent, title, text, confirm_text, *, dark=False, appearance=None) -> bool:
         del parent, dark, appearance
@@ -2723,9 +2729,9 @@ def test_clear_favorites_history_uses_its_own_confirmation_and_signal(qtbot, mon
 
     monkeypatch.setattr(ui_module, "_confirm_destructive_action", confirm)
 
-    panel._request_clear_favorites()
+    panel._request_clear_non_favorites()
 
-    assert confirmations == [("清空历史", "清空所有收藏历史？此操作无法撤销。", "确定")]
+    assert confirmations == [("清空历史", "清空所有非收藏历史？此操作无法撤销。", "确定")]
     assert requested == [True]
 
 
@@ -2740,9 +2746,15 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
     )
     panel._set_filter_kind(ClipKind.TEXT)
     panel.search.setText("no matching text")
-    menu, favorite_action, unfavorite_action, delete_action, clear_action, clear_favorites_action, settings_action = (
-        panel._create_list_menu()
-    )
+    (
+        menu,
+        favorite_action,
+        unfavorite_action,
+        delete_action,
+        clear_action,
+        clear_non_favorites_action,
+        settings_action,
+    ) = panel._create_list_menu()
     qtbot.addWidget(menu)
     settings_requests: list[bool] = []
     panel.settings_requested.connect(lambda: settings_requests.append(True))
@@ -2752,12 +2764,12 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
         "取消收藏",
         "删除",
         "清空",
-        "清空F",
+        "清空NF",
         "设置",
     ]
     assert not delete_action.isEnabled()
     assert clear_action.isEnabled()
-    assert not clear_favorites_action.isEnabled()
+    assert clear_non_favorites_action.isEnabled()
     assert not favorite_action.isEnabled()
     assert not unfavorite_action.isEnabled()
     assert settings_action.isEnabled()
@@ -2766,7 +2778,7 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
         settings_action,
         delete_action,
         clear_action,
-        clear_favorites_action,
+        clear_non_favorites_action,
         favorite_action,
         unfavorite_action,
         settings_action,
@@ -2780,9 +2792,15 @@ def test_list_context_menu_routes_favorite_signal(qtbot) -> None:
     qtbot.addWidget(panel)
     selected = clip("selected", "item", 1)
     panel.set_items([selected])
-    menu, favorite_action, unfavorite_action, delete_action, clear_action, clear_favorites_action, settings_action = (
-        panel._create_list_menu()
-    )
+    (
+        menu,
+        favorite_action,
+        unfavorite_action,
+        delete_action,
+        clear_action,
+        clear_non_favorites_action,
+        settings_action,
+    ) = panel._create_list_menu()
     qtbot.addWidget(menu)
     requests: list[tuple[tuple[str, ...], bool]] = []
     panel.favorite_requested.connect(
@@ -2793,7 +2811,7 @@ def test_list_context_menu_routes_favorite_signal(qtbot) -> None:
         favorite_action,
         delete_action,
         clear_action,
-        clear_favorites_action,
+        clear_non_favorites_action,
         favorite_action,
         unfavorite_action,
         settings_action,
@@ -2802,16 +2820,22 @@ def test_list_context_menu_routes_favorite_signal(qtbot) -> None:
     assert requests == [(("selected",), True)]
 
     panel.set_items([selected.with_pin(True)])
-    menu, favorite_action, unfavorite_action, delete_action, clear_action, clear_favorites_action, settings_action = (
-        panel._create_list_menu()
-    )
+    (
+        menu,
+        favorite_action,
+        unfavorite_action,
+        delete_action,
+        clear_action,
+        clear_non_favorites_action,
+        settings_action,
+    ) = panel._create_list_menu()
     qtbot.addWidget(menu)
 
     panel._handle_list_menu_action(
         unfavorite_action,
         delete_action,
         clear_action,
-        clear_favorites_action,
+        clear_non_favorites_action,
         favorite_action,
         unfavorite_action,
         settings_action,

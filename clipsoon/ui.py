@@ -2000,7 +2000,7 @@ class SettingsDialog(QDialog):
         data_layout.addWidget(data_description)
         data_row = QHBoxLayout()
         data_row.setSpacing(8)
-        clear = QPushButton("清除未收藏历史")
+        clear = QPushButton("清除非收藏历史")
         reveal_text = {
             "darwin": "在 Finder 中打开",
             "win32": "在资源管理器中打开",
@@ -2423,7 +2423,7 @@ class SettingsDialog(QDialog):
         if _confirm_destructive_action(
             self,
             "清除历史",
-            "清除所有未收藏的历史？此操作无法撤销。",
+            "清除所有非收藏历史？此操作无法撤销。",
             "清除历史",
             appearance=self._appearance,
         ):
@@ -2443,7 +2443,7 @@ class ClipPanel(QWidget):
     delete_requested = Signal(object)
     favorite_requested = Signal(object, bool)
     clear_requested = Signal(object)
-    clear_favorites_requested = Signal()
+    clear_non_favorites_requested = Signal()
     accessibility_requested = Signal()
     position_changed = Signal(int, int)
 
@@ -3532,15 +3532,15 @@ class ClipPanel(QWidget):
         ):
             self.clear_requested.emit(kind)
 
-    def _request_clear_favorites(self) -> None:
+    def _request_clear_non_favorites(self) -> None:
         if _confirm_destructive_action(
             self,
             "清空历史",
-            "清空所有收藏历史？此操作无法撤销。",
+            "清空所有非收藏历史？此操作无法撤销。",
             "确定",
             appearance=self._appearance,
         ):
-            self.clear_favorites_requested.emit()
+            self.clear_non_favorites_requested.emit()
 
     def _clear_search_selection_for_preview(self, preview: QPlainTextEdit) -> None:
         """Let a newly selected preview range be the intended copy target.
@@ -3603,8 +3603,8 @@ class ClipPanel(QWidget):
         delete_action.setEnabled(bool(selected_items))
         clear_action = add_menu_action("clear", "清空")
         clear_action.setEnabled(self._has_history_in_current_kind())
-        clear_favorites_action = add_menu_action("clear", "清空F")
-        clear_favorites_action.setEnabled(any(item.pinned for item in self._items))
+        clear_non_favorites_action = add_menu_action("clear", "清空NF")
+        clear_non_favorites_action.setEnabled(any(not item.pinned for item in self._items))
         menu.addSeparator()
         settings_action = add_menu_action("settings", "设置")
         _compact_menu(menu, appearance=self._appearance)
@@ -3614,7 +3614,7 @@ class ClipPanel(QWidget):
             unfavorite_action,
             delete_action,
             clear_action,
-            clear_favorites_action,
+            clear_non_favorites_action,
             settings_action,
         )
 
@@ -3623,7 +3623,7 @@ class ClipPanel(QWidget):
         selected: QAction | None,
         delete_action: QAction,
         clear_action: QAction,
-        clear_favorites_action: QAction,
+        clear_non_favorites_action: QAction,
         favorite_action: QAction,
         unfavorite_action: QAction,
         settings_action: QAction,
@@ -3632,8 +3632,8 @@ class ClipPanel(QWidget):
             self._request_delete_selected()
         elif selected is clear_action:
             self._request_clear_current_kind()
-        elif selected is clear_favorites_action:
-            self._request_clear_favorites()
+        elif selected is clear_non_favorites_action:
+            self._request_clear_non_favorites()
         elif selected is favorite_action:
             self._request_favorite_selected(True)
         elif selected is unfavorite_action:
@@ -3651,7 +3651,7 @@ class ClipPanel(QWidget):
             unfavorite_action,
             delete_action,
             clear_action,
-            clear_favorites_action,
+            clear_non_favorites_action,
             settings_action,
         ) = self._create_list_menu()
         selected = menu.exec(self.list.viewport().mapToGlobal(position))
@@ -3666,7 +3666,7 @@ class ClipPanel(QWidget):
             selected,
             delete_action,
             clear_action,
-            clear_favorites_action,
+            clear_non_favorites_action,
             favorite_action,
             unfavorite_action,
             settings_action,

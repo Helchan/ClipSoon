@@ -311,11 +311,11 @@ def test_clear_history_removes_only_unpinned_items(qtbot, tmp_path) -> None:
     assert application.repository.get(pinned.id) is not None
     assert application.repository.get(unpinned.id) is None
     assert [item.id for item in application.panel._items] == [pinned.id]
-    assert application.panel.status.text() == "已清除 1 条未收藏历史"
+    assert application.panel.status.text() == "已清空 1 条非收藏历史"
     application.shutdown()
 
 
-def test_clear_favorite_history_removes_only_favorites(qtbot, tmp_path) -> None:
+def test_clear_non_favorite_history_removes_only_non_favorites(qtbot, tmp_path) -> None:
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)
     application.clipboard.start()
@@ -324,12 +324,12 @@ def test_clear_favorite_history_removes_only_favorites(qtbot, tmp_path) -> None:
     application.repository.set_pinned(favorite.id, True)
     application._reload_history()
 
-    application.clear_favorite_history()
+    application.clear_non_favorite_history()
 
-    assert application.repository.get(favorite.id) is None
-    assert application.repository.get(ordinary.id) is not None
-    assert [item.id for item in application.panel._items] == [ordinary.id]
-    assert application.panel.status.text() == "已清空 1 条收藏历史"
+    assert application.repository.get(favorite.id) is not None
+    assert application.repository.get(ordinary.id) is None
+    assert [item.id for item in application.panel._items] == [favorite.id]
+    assert application.panel.status.text() == "已清空 1 条非收藏历史"
     application.shutdown()
 
 

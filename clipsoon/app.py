@@ -243,7 +243,7 @@ class ClipSoonApplication(QObject):
         self.panel.delete_requested.connect(self._delete_many)
         self.panel.favorite_requested.connect(self._favorite_many)
         self.panel.clear_requested.connect(self.clear_current_tab_history)
-        self.panel.clear_favorites_requested.connect(self.clear_favorite_history)
+        self.panel.clear_non_favorites_requested.connect(self.clear_non_favorite_history)
         self.panel.accessibility_requested.connect(self.open_accessibility_settings)
         self.panel.position_changed.connect(self._save_panel_position)
         self.sender.finished.connect(self._send_finished)
@@ -665,10 +665,10 @@ class ClipSoonApplication(QObject):
         self.clipboard.sync_cursor()
         removed = self.repository.clear_unpinned()
         self._reload_history()
-        self.panel.set_status(f"已清除 {removed} 条未收藏历史")
+        self.panel.set_status(f"已清空 {removed} 条非收藏历史")
 
-    def clear_favorite_history(self) -> None:
-        self.clear_current_tab_history(FAVORITES_FILTER)
+    def clear_non_favorite_history(self) -> None:
+        self.clear_history()
 
     def clear_all_history(self) -> None:
         self.clear_current_tab_history(None)
