@@ -15,13 +15,18 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 
 class ClipKind(StrEnum):
     TEXT = "text"
     IMAGE = "image"
     FILES = "files"
+
+
+FavoriteFilter = Literal["favorites"]
+FAVORITES_FILTER: FavoriteFilter = "favorites"
+HistoryFilter = ClipKind | FavoriteFilter | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +153,8 @@ class HistoryStore(Protocol):
     def set_pinned(self, item_id: str, pinned: bool) -> None: ...
 
     def delete(self, item_id: str) -> None: ...
+
+    def clear_favorites(self) -> int: ...
 
     def prune_missing_file_items(
         self, item_ids: Sequence[str] | None = None
@@ -352,8 +359,10 @@ class HistoryRepository:
                     revision INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_clips_recent
-                    ON clips(pinned DESC, updated_at DESC);
+                    ON clips(updated_at DESC, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_clips_kind ON clips(kind);
+                CREATE INDEX IF NOT EXISTS idx_clips_favorites_recent
+                    ON clips(pinned DESC, updated_at DESC, created_at DESC);
                 """
             )
             columns = {
@@ -366,7 +375,7 @@ class HistoryRepository:
                 )
 
     def list_items(self, limit: int | None = None) -> list[ClipItem]:
-        sql = "SELECT * FROM clips ORDER BY pinned DESC, updated_at DESC, created_at DESC"
+        sql = "SELECT * FROM clips ORDER BY updated_at DESC, created_at DESC"
         parameters: tuple[int, ...] = ()
         if limit is not None:
             sql += " LIMIT ?"
@@ -693,6 +702,9 @@ class HistoryRepository:
 
     def clear_unpinned(self) -> int:
         return sum(int(self.delete(item.id)) for item in self.list_items() if not item.pinned)
+
+    def clear_favorites(self) -> int:
+        return sum(int(self.delete(item.id)) for item in self.list_items() if item.pinned)
 
     def clear_all(self) -> int:
         return self.delete_many(tuple(item.id for item in self.list_items()))

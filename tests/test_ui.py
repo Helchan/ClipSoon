@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 
 import clipsoon.ui as ui_module
 from clipsoon import __version__
-from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, ClipItem, ClipKind
+from clipsoon.core import FAVORITES_FILTER, WINDOWS_DEFAULT_HOTKEY, AppSettings, ClipItem, ClipKind
 from clipsoon.ui import (
     ClipDelegate,
     ClipPanel,
@@ -204,7 +204,7 @@ def test_empty_filter_state_does_not_offer_an_irrelevant_clear_action(qtbot) -> 
     panel.show_panel()
     qtbot.waitExposed(panel)
 
-    screenshot_filter = panel._filter_buttons[2][0]
+    screenshot_filter = panel._filter_buttons[3][0]
     qtbot.mouseClick(screenshot_filter, Qt.MouseButton.LeftButton)
 
     assert panel.history_content.currentWidget() is panel.empty_state
@@ -212,6 +212,35 @@ def test_empty_filter_state_does_not_offer_an_irrelevant_clear_action(qtbot) -> 
     assert panel.empty_state_message.text() == "切换分类或继续复制内容。"
     assert not panel.empty_state_clear.isVisible()
     assert not panel.detail.isVisible()
+
+
+def test_favorites_tab_is_left_of_all_but_all_remains_default(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    favorite = clip("favorite", "favorite", 1).with_pin(True)
+    newer = clip("newer", "newer", 2)
+    panel.set_items([newer, favorite])
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    assert [button.text() for button, _kind in panel._filter_buttons] == [
+        "收藏",
+        "全部",
+        "文本",
+        "截图",
+        "文件",
+    ]
+    assert panel._kind is None
+    assert panel._filter_buttons[1][0].isChecked()
+    assert [panel.model.item_at(row).id for row in range(panel.model.rowCount())] == [
+        "newer",
+        "favorite",
+    ]
+
+    qtbot.mouseClick(panel._filter_buttons[0][0], Qt.MouseButton.LeftButton)
+
+    assert panel._kind == FAVORITES_FILTER
+    assert [panel.model.item_at(row).id for row in range(panel.model.rowCount())] == ["favorite"]
 
 
 def test_settings_and_custom_hotkey_validation(qtbot) -> None:
@@ -1660,7 +1689,7 @@ def test_panel_restores_filter_search_and_selection_before_state_memory_expires(
     panel.set_items([file_item, clip("alpha", "alpha", 3), clip("alphabet", "alphabet", 2)])
     panel.show_panel()
     qtbot.waitExposed(panel)
-    qtbot.mouseClick(panel._filter_buttons[3][0], Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(panel._filter_buttons[4][0], Qt.MouseButton.LeftButton)
     panel.search.setText("alp")
     panel.hide()
 
@@ -1668,7 +1697,7 @@ def test_panel_restores_filter_search_and_selection_before_state_memory_expires(
     panel.show_panel()
 
     assert panel._kind is ClipKind.FILES
-    assert panel._filter_buttons[3][0].isChecked()
+    assert panel._filter_buttons[4][0].isChecked()
     assert panel.search.text() == "alp"
     assert panel.model.rowCount() == 1
     assert panel.model.item_at(panel.list.currentIndex().row()).id == "file"
@@ -1702,7 +1731,7 @@ def test_expired_state_memory_clears_search_and_selects_global_first(qtbot) -> N
     panel.set_items([clip("alpha", "alpha", 3), clip("other", "other", 2)])
     panel.show_panel()
     qtbot.waitExposed(panel)
-    qtbot.mouseClick(panel._filter_buttons[1][0], Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(panel._filter_buttons[2][0], Qt.MouseButton.LeftButton)
     panel.search.setText("other")
     panel.hide()
 
@@ -1710,7 +1739,7 @@ def test_expired_state_memory_clears_search_and_selects_global_first(qtbot) -> N
     panel.show_panel()
 
     assert panel._kind is None
-    assert panel._filter_buttons[0][0].isChecked()
+    assert panel._filter_buttons[1][0].isChecked()
     assert panel.search.text() == ""
     assert panel.model.rowCount() == 2
     assert panel.model.item_at(panel.list.currentIndex().row()).id == "alpha"
@@ -1757,7 +1786,7 @@ def test_hidden_selection_memory_is_actively_cleared_when_timer_expires(qtbot) -
     panel.set_items([clip("first", "first", 2), clip("second", "second", 1)])
     panel.show_panel()
     qtbot.waitExposed(panel)
-    qtbot.mouseClick(panel._filter_buttons[1][0], Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(panel._filter_buttons[2][0], Qt.MouseButton.LeftButton)
     panel.search.setText("second")
     panel.list.setCurrentIndex(panel.model.index(0))
 
@@ -1769,7 +1798,7 @@ def test_hidden_selection_memory_is_actively_cleared_when_timer_expires(qtbot) -
     assert panel._remembered_search_text == ""
     assert panel._remembered_kind is None
     assert panel._kind is None
-    assert panel._filter_buttons[0][0].isChecked()
+    assert panel._filter_buttons[1][0].isChecked()
     assert panel.search.text() == ""
     assert panel.list.currentIndex().row() == 0
     panel.show_panel()
@@ -1785,21 +1814,21 @@ def test_default_three_second_state_memory_with_real_qt_interactions(qtbot) -> N
     panel.set_items([clip("first", "first", 3), clip("second", "second", 2), clip("other", "other", 1)])
     panel.show_panel()
     qtbot.waitExposed(panel)
-    qtbot.mouseClick(panel._filter_buttons[1][0], Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(panel._filter_buttons[2][0], Qt.MouseButton.LeftButton)
     panel.search.setText("second")
     panel.hide_panel()
 
     qtbot.wait(500)
     panel.show_panel()
     assert panel._kind is ClipKind.TEXT
-    assert panel._filter_buttons[1][0].isChecked()
+    assert panel._filter_buttons[2][0].isChecked()
     assert panel.search.text() == "second"
     assert panel.model.item_at(panel.list.currentIndex().row()).id == "second"
 
     panel.hide_panel()
     qtbot.waitUntil(lambda: panel._selection_hidden_at is None, timeout=3_500)
     assert panel._kind is None
-    assert panel._filter_buttons[0][0].isChecked()
+    assert panel._filter_buttons[1][0].isChecked()
     assert panel.search.text() == ""
     assert panel.model.item_at(panel.list.currentIndex().row()).id == "first"
 
@@ -2210,21 +2239,21 @@ def test_filter_tabs_cycle_forward_and_backward(qtbot) -> None:
     panel.show_panel()
     qtbot.waitExposed(panel)
 
-    for expected in (ClipKind.TEXT, ClipKind.IMAGE, ClipKind.FILES, None, ClipKind.TEXT):
+    for expected in (ClipKind.TEXT, ClipKind.IMAGE, ClipKind.FILES, FAVORITES_FILTER, None, ClipKind.TEXT):
         qtbot.keyPress(panel.search, Qt.Key.Key_Tab)
-        assert panel._kind is expected
+        assert panel._kind == expected
 
     qtbot.keyPress(panel.search, Qt.Key.Key_Backtab)
     assert panel._kind is None
     qtbot.keyPress(panel.search, Qt.Key.Key_Tab, Qt.KeyboardModifier.ShiftModifier)
-    assert panel._kind is ClipKind.FILES
+    assert panel._kind == FAVORITES_FILTER
 
 
 def test_image_filter_tab_is_named_screenshot(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
 
-    assert panel._filter_buttons[2][0].text() == "截图"
+    assert panel._filter_buttons[3][0].text() == "截图"
 
 
 def test_text_file_uses_bounded_read_only_preview(qtbot, tmp_path: Path) -> None:
@@ -2504,9 +2533,15 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     panel = ClipPanel(lambda: AppSettings(theme="light"))
     qtbot.addWidget(panel)
     panel.set_items([clip("selected", "item", 1)])
-    menu, delete_action, _clear_action, _clear_unpinned_action, _pin_action, _settings_action = (
-        panel._create_list_menu()
-    )
+    (
+        menu,
+        _favorite_action,
+        _unfavorite_action,
+        delete_action,
+        _clear_action,
+        _clear_favorites_action,
+        _settings_action,
+    ) = panel._create_list_menu()
     qtbot.addWidget(menu)
 
     font = QFont(menu.font())
@@ -2556,49 +2591,69 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
     qtbot.addWidget(panel)
     panel.set_items([clip("selected", "item", 1)])
 
-    menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action = (
+    menu, favorite_action, unfavorite_action, delete_action, clear_action, clear_favorites_action, settings_action = (
         panel._create_list_menu()
     )
     qtbot.addWidget(menu)
 
     menu_actions = (
+        favorite_action,
+        unfavorite_action,
         delete_action,
         clear_action,
-        clear_unpinned_action,
-        pin_action,
+        clear_favorites_action,
         settings_action,
     )
     assert [action.text() for action in menu_actions] == [
+        "收藏",
+        "取消收藏",
         "删除",
         "清空",
-        "清空NP",
-        "置顶",
+        "清空F",
         "设置",
     ]
+    assert menu.actions()[0] is favorite_action
+    assert menu.actions()[1] is unfavorite_action
+    assert menu.actions()[2].isSeparator()
+    assert menu.actions()[3] is delete_action
+    assert menu.actions()[4] is clear_action
+    assert menu.actions()[5] is clear_favorites_action
+    assert menu.actions()[6].isSeparator()
+    assert menu.actions()[7] is settings_action
     assert all(not action.icon().isNull() for action in menu_actions)
     assert all(action.isIconVisibleInMenu() for action in menu_actions)
-    assert clear_unpinned_action.isEnabled()
-    assert pin_action.isEnabled()
-    assert pin_action.data() is True
+    assert not clear_favorites_action.isEnabled()
+    assert favorite_action.isEnabled()
+    assert not unfavorite_action.isEnabled()
 
     panel.set_items([clip("pinned", "item", 1).with_pin(True)])
-    menu, _delete_action, _clear_action, clear_unpinned_action, pin_action, _settings_action = (
+    (
+        menu,
+        favorite_action,
+        unfavorite_action,
+        _delete_action,
+        _clear_action,
+        clear_favorites_action,
+        _settings_action,
+    ) = (
         panel._create_list_menu()
     )
     qtbot.addWidget(menu)
 
-    assert not clear_unpinned_action.isEnabled()
-    assert pin_action.text() == "取消置顶"
-    assert pin_action.data() is False
+    assert clear_favorites_action.isEnabled()
+    assert not favorite_action.isEnabled()
+    assert unfavorite_action.isEnabled()
 
 
 def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     menu = QMenu()
     qtbot.addWidget(menu)
+    menu.addAction("收藏")
+    menu.addAction("取消收藏")
+    menu.addSeparator()
     menu.addAction("删除")
     menu.addAction("清空")
-    menu.addAction("清空NP")
-    menu.addAction("置顶")
+    menu.addAction("清空F")
     menu.addSeparator()
     menu.addAction("设置")
 
@@ -2617,11 +2672,12 @@ def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     ("kind", "confirmation_text"),
     (
         (None, "清空全部剪贴板历史？此操作无法撤销。"),
+        (FAVORITES_FILTER, "清空收藏历史？此操作无法撤销。"),
         (ClipKind.TEXT, "清空剪切板文本历史？此操作无法撤销。"),
         (ClipKind.IMAGE, "清空剪切板截图历史？此操作无法撤销。"),
         (ClipKind.FILES, "清空剪切板文件历史？此操作无法撤销。"),
     ),
-    ids=("all", "text", "image", "files"),
+    ids=("all", "favorites", "text", "image", "files"),
 )
 def test_clear_current_tab_history_uses_its_own_confirmation_and_signal(
     qtbot, monkeypatch, kind, confirmation_text
@@ -2637,7 +2693,7 @@ def test_clear_current_tab_history_uses_its_own_confirmation_and_signal(
     )
     panel._set_filter_kind(kind)
     confirmations: list[tuple[str, str, str]] = []
-    requested: list[ClipKind | None] = []
+    requested: list[object] = []
     panel.clear_requested.connect(requested.append)
 
     def confirm(parent, title, text, confirm_text, *, dark=False, appearance=None) -> bool:
@@ -2653,12 +2709,12 @@ def test_clear_current_tab_history_uses_its_own_confirmation_and_signal(
     assert requested == [kind]
 
 
-def test_clear_unpinned_history_uses_its_own_confirmation_and_signal(qtbot, monkeypatch) -> None:
+def test_clear_favorites_history_uses_its_own_confirmation_and_signal(qtbot, monkeypatch) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
     confirmations: list[tuple[str, str, str]] = []
     requested: list[bool] = []
-    panel.clear_unpinned_requested.connect(lambda: requested.append(True))
+    panel.clear_favorites_requested.connect(lambda: requested.append(True))
 
     def confirm(parent, title, text, confirm_text, *, dark=False, appearance=None) -> bool:
         del parent, dark, appearance
@@ -2667,9 +2723,9 @@ def test_clear_unpinned_history_uses_its_own_confirmation_and_signal(qtbot, monk
 
     monkeypatch.setattr(ui_module, "_confirm_destructive_action", confirm)
 
-    panel._request_clear_unpinned()
+    panel._request_clear_favorites()
 
-    assert confirmations == [("清空历史", "清空所有非置顶历史？此操作无法撤销。", "确定")]
+    assert confirmations == [("清空历史", "清空所有收藏历史？此操作无法撤销。", "确定")]
     assert requested == [True]
 
 
@@ -2684,7 +2740,7 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
     )
     panel._set_filter_kind(ClipKind.TEXT)
     panel.search.setText("no matching text")
-    menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action = (
+    menu, favorite_action, unfavorite_action, delete_action, clear_action, clear_favorites_action, settings_action = (
         panel._create_list_menu()
     )
     qtbot.addWidget(menu)
@@ -2692,52 +2748,76 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
     panel.settings_requested.connect(lambda: settings_requests.append(True))
 
     assert [action.text() for action in menu.actions() if not action.isSeparator()] == [
+        "收藏",
+        "取消收藏",
         "删除",
         "清空",
-        "清空NP",
-        "置顶",
+        "清空F",
         "设置",
     ]
     assert not delete_action.isEnabled()
     assert clear_action.isEnabled()
-    assert clear_unpinned_action.isEnabled()
-    assert not pin_action.isEnabled()
+    assert not clear_favorites_action.isEnabled()
+    assert not favorite_action.isEnabled()
+    assert not unfavorite_action.isEnabled()
     assert settings_action.isEnabled()
 
     panel._handle_list_menu_action(
         settings_action,
         delete_action,
         clear_action,
-        clear_unpinned_action,
-        pin_action,
+        clear_favorites_action,
+        favorite_action,
+        unfavorite_action,
         settings_action,
     )
 
     assert settings_requests == [True]
 
 
-def test_list_context_menu_routes_pin_signal(qtbot) -> None:
+def test_list_context_menu_routes_favorite_signal(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
     selected = clip("selected", "item", 1)
     panel.set_items([selected])
-    menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action = (
+    menu, favorite_action, unfavorite_action, delete_action, clear_action, clear_favorites_action, settings_action = (
         panel._create_list_menu()
     )
     qtbot.addWidget(menu)
     requests: list[tuple[tuple[str, ...], bool]] = []
-    panel.pin_requested.connect(lambda items, pinned: requests.append((tuple(item.id for item in items), pinned)))
+    panel.favorite_requested.connect(
+        lambda items, favorite: requests.append((tuple(item.id for item in items), favorite))
+    )
 
     panel._handle_list_menu_action(
-        pin_action,
+        favorite_action,
         delete_action,
         clear_action,
-        clear_unpinned_action,
-        pin_action,
+        clear_favorites_action,
+        favorite_action,
+        unfavorite_action,
         settings_action,
     )
 
     assert requests == [(("selected",), True)]
+
+    panel.set_items([selected.with_pin(True)])
+    menu, favorite_action, unfavorite_action, delete_action, clear_action, clear_favorites_action, settings_action = (
+        panel._create_list_menu()
+    )
+    qtbot.addWidget(menu)
+
+    panel._handle_list_menu_action(
+        unfavorite_action,
+        delete_action,
+        clear_action,
+        clear_favorites_action,
+        favorite_action,
+        unfavorite_action,
+        settings_action,
+    )
+
+    assert requests == [(("selected",), True), (("selected",), False)]
 
 
 def test_filter_and_list_background_align_with_borderless_search_region(qtbot) -> None:
@@ -2747,8 +2827,8 @@ def test_filter_and_list_background_align_with_borderless_search_region(qtbot) -
     panel.show_panel()
     qtbot.waitExposed(panel)
 
-    all_button = panel._filter_buttons[0][0]
-    button_left = all_button.mapTo(panel, QPoint()).x()
+    first_filter_button = panel._filter_buttons[0][0]
+    button_left = first_filter_button.mapTo(panel, QPoint()).x()
     list_background_left = panel.list.viewport().mapTo(panel, QPoint(4, 0)).x()
     search_box = panel.findChild(QFrame, "searchBox")
     search_icon = panel.findChild(SearchIcon)

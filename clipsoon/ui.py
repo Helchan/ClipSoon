@@ -92,7 +92,15 @@ from PySide6.QtWidgets import (
 )
 
 from clipsoon import __version__
-from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, ClipItem, ClipKind, format_bytes
+from clipsoon.core import (
+    FAVORITES_FILTER,
+    WINDOWS_DEFAULT_HOTKEY,
+    AppSettings,
+    ClipItem,
+    ClipKind,
+    HistoryFilter,
+    format_bytes,
+)
 from clipsoon.search import SearchEngine
 
 LOGGER = logging.getLogger(__name__)
@@ -1539,7 +1547,7 @@ class ClipDelegate(QStyledItemDelegate):
         if item.pinned:
             painter.setPen(foreground)
             pin_rect = QRect(rect.right() - 26, rect.center().y() - 9, 16, 18)
-            painter.drawText(pin_rect, Qt.AlignmentFlag.AlignCenter, "◆")
+            painter.drawText(pin_rect, Qt.AlignmentFlag.AlignCenter, "★")
         painter.restore()
 
     @staticmethod
@@ -1987,12 +1995,12 @@ class SettingsDialog(QDialog):
             layout.addWidget(platform_note)
 
         data_section, data_layout = section("数据管理")
-        data_description = QLabel("历史数据仅保存在本机；清除操作不会影响已置顶条目。")
+        data_description = QLabel("历史数据仅保存在本机；清除操作不会影响已收藏条目。")
         data_description.setObjectName("settingsSubtitle")
         data_layout.addWidget(data_description)
         data_row = QHBoxLayout()
         data_row.setSpacing(8)
-        clear = QPushButton("清除未置顶历史")
+        clear = QPushButton("清除未收藏历史")
         reveal_text = {
             "darwin": "在 Finder 中打开",
             "win32": "在资源管理器中打开",
@@ -2415,7 +2423,7 @@ class SettingsDialog(QDialog):
         if _confirm_destructive_action(
             self,
             "清除历史",
-            "清除所有未置顶的历史？此操作无法撤销。",
+            "清除所有未收藏的历史？此操作无法撤销。",
             "清除历史",
             appearance=self._appearance,
         ):
@@ -2433,9 +2441,9 @@ class ClipPanel(QWidget):
     send_requested = Signal(object)
     settings_requested = Signal()
     delete_requested = Signal(object)
-    pin_requested = Signal(object, bool)
+    favorite_requested = Signal(object, bool)
     clear_requested = Signal(object)
-    clear_unpinned_requested = Signal()
+    clear_favorites_requested = Signal()
     accessibility_requested = Signal()
     position_changed = Signal(int, int)
 
@@ -2451,12 +2459,12 @@ class ClipPanel(QWidget):
         self._selection_clock = selection_clock
         self._items: list[ClipItem] = []
         self._engine = SearchEngine()
-        self._kind: ClipKind | None = None
+        self._kind: HistoryFilter = None
         self._keep_open = False
         self._native_deactivation_managed = sys.platform == "win32"
         self._selection_anchor = 0
         self._remembered_search_text = ""
-        self._remembered_kind: ClipKind | None = None
+        self._remembered_kind: HistoryFilter = None
         self._remembered_item_ids: tuple[str, ...] = ()
         self._remembered_current_id: str | None = None
         self._selection_hidden_at: float | None = None
@@ -2467,7 +2475,7 @@ class ClipPanel(QWidget):
         self._selection_memory_timer = QTimer(self)
         self._selection_memory_timer.setSingleShot(True)
         self._selection_memory_timer.timeout.connect(self._expire_selection_memory)
-        self._filter_buttons: list[tuple[QToolButton, ClipKind | None]] = []
+        self._filter_buttons: list[tuple[QToolButton, HistoryFilter]] = []
         self._filter_index = 0
         self._dark_theme = False
         self._native_backdrop_active = False
@@ -2552,19 +2560,22 @@ class ClipPanel(QWidget):
         filters = QHBoxLayout()
         filters.setContentsMargins(4, 0, 0, 0)
         filters.setSpacing(7)
-        filters_by_kind = (
+        filters_by_kind: tuple[tuple[str, HistoryFilter], ...] = (
+            ("收藏", FAVORITES_FILTER),
             ("全部", None),
             ("文本", ClipKind.TEXT),
             ("截图", ClipKind.IMAGE),
             ("文件", ClipKind.FILES),
         )
-        for label, kind in filters_by_kind:
+        for index, (label, kind) in enumerate(filters_by_kind):
             button = QToolButton()
             button.setText(label)
             button.setCheckable(True)
             button.setProperty("filterChip", True)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             button.setChecked(kind is None)
+            if kind is None:
+                self._filter_index = index
             button.clicked.connect(lambda _checked=False, kind=kind, button=button: self._filter(kind, button))
             self._filter_buttons.append((button, kind))
             filters.addWidget(button)
@@ -2818,7 +2829,7 @@ class ClipPanel(QWidget):
         restore_state = settings.remember_selection and self._selection_memory_is_valid(settings)
         target_kind = self._remembered_kind if restore_state else None
         search_text = self._remembered_search_text if restore_state else ""
-        kind_changed = self._kind is not target_kind
+        kind_changed = self._kind != target_kind
         self._set_filter_kind(target_kind)
         if self.search.text() != search_text:
             self.search.setText(search_text)
@@ -3317,14 +3328,14 @@ class ClipPanel(QWidget):
     def set_native_deactivation_managed(self, value: bool) -> None:
         self._native_deactivation_managed = bool(value)
 
-    def _filter(self, kind: ClipKind | None, active: QToolButton) -> None:
+    def _filter(self, kind: HistoryFilter, active: QToolButton) -> None:
         del active
         self._set_filter_kind(kind)
         self._refresh_results()
 
-    def _set_filter_kind(self, kind: ClipKind | None) -> None:
+    def _set_filter_kind(self, kind: HistoryFilter) -> None:
         for index, (button, _button_kind) in enumerate(self._filter_buttons):
-            active = _button_kind is kind
+            active = _button_kind == kind
             button.setChecked(active)
             if active:
                 self._filter_index = index
@@ -3337,7 +3348,15 @@ class ClipPanel(QWidget):
 
     def _refresh_results(self) -> None:
         started = time.perf_counter()
-        results = self._engine.rank(self.search.text(), now=time.time(), kind=self._kind, limit=500)
+        favorites_only = self._kind == FAVORITES_FILTER
+        kind = None if favorites_only else self._kind
+        results = self._engine.rank(
+            self.search.text(),
+            now=time.time(),
+            kind=kind,
+            favorites_only=favorites_only,
+            limit=500,
+        )
         self.model.replace([result.item for result in results])
         self.count_label.setText(f"{len(results)} 条")
         if results:
@@ -3369,6 +3388,7 @@ class ClipPanel(QWidget):
             message = "复制文本、图片或文件后，内容会出现在这里。"
         else:
             kind_name = {
+                FAVORITES_FILTER: "收藏",
                 ClipKind.TEXT: "文本",
                 ClipKind.IMAGE: "截图",
                 ClipKind.FILES: "文件",
@@ -3477,10 +3497,10 @@ class ClipPanel(QWidget):
         if items:
             self.delete_requested.emit(items)
 
-    def _request_pin_selected(self, pinned: bool) -> None:
+    def _request_favorite_selected(self, favorite: bool) -> None:
         items = self._selected_items()
         if items:
-            self.pin_requested.emit(items, pinned)
+            self.favorite_requested.emit(items, favorite)
 
     def _request_settings(self) -> None:
         """Open settings through the same signal used by the search icon."""
@@ -3488,6 +3508,8 @@ class ClipPanel(QWidget):
         self.settings_requested.emit()
 
     def _has_history_in_current_kind(self) -> bool:
+        if self._kind == FAVORITES_FILTER:
+            return any(item.pinned for item in self._items)
         if self._kind is None:
             return bool(self._items)
         return any(item.kind is self._kind for item in self._items)
@@ -3495,6 +3517,7 @@ class ClipPanel(QWidget):
     def _request_clear_current_kind(self) -> None:
         kind = self._kind
         confirmation_text = {
+            FAVORITES_FILTER: "清空收藏历史？此操作无法撤销。",
             None: "清空全部剪贴板历史？此操作无法撤销。",
             ClipKind.TEXT: "清空剪切板文本历史？此操作无法撤销。",
             ClipKind.IMAGE: "清空剪切板截图历史？此操作无法撤销。",
@@ -3509,15 +3532,15 @@ class ClipPanel(QWidget):
         ):
             self.clear_requested.emit(kind)
 
-    def _request_clear_unpinned(self) -> None:
+    def _request_clear_favorites(self) -> None:
         if _confirm_destructive_action(
             self,
             "清空历史",
-            "清空所有非置顶历史？此操作无法撤销。",
+            "清空所有收藏历史？此操作无法撤销。",
             "确定",
             appearance=self._appearance,
         ):
-            self.clear_unpinned_requested.emit()
+            self.clear_favorites_requested.emit()
 
     def _clear_search_selection_for_preview(self, preview: QPlainTextEdit) -> None:
         """Let a newly selected preview range be the intended copy target.
@@ -3560,7 +3583,9 @@ class ClipPanel(QWidget):
         menu, _copy_action, _select_all_action = self._create_preview_menu(preview)
         menu.exec(preview.mapToGlobal(position))
 
-    def _create_list_menu(self) -> tuple[QMenu, QAction, QAction, QAction, QAction, QAction]:
+    def _create_list_menu(
+        self,
+    ) -> tuple[QMenu, QAction, QAction, QAction, QAction, QAction, QAction]:
         menu = QMenu(self.list)
 
         def add_menu_action(icon_name: str, text: str) -> QAction:
@@ -3569,38 +3594,50 @@ class ClipPanel(QWidget):
             return action
 
         selected_items = self._selected_items()
+        favorite_action = add_menu_action("favorite", "收藏")
+        favorite_action.setEnabled(any(not item.pinned for item in selected_items))
+        unfavorite_action = add_menu_action("unfavorite", "取消收藏")
+        unfavorite_action.setEnabled(any(item.pinned for item in selected_items))
+        menu.addSeparator()
         delete_action = add_menu_action("delete", "删除")
         delete_action.setEnabled(bool(selected_items))
         clear_action = add_menu_action("clear", "清空")
         clear_action.setEnabled(self._has_history_in_current_kind())
-        clear_unpinned_action = add_menu_action("clear", "清空NP")
-        clear_unpinned_action.setEnabled(any(not item.pinned for item in self._items))
-        pin_to = True if not selected_items else any(not item.pinned for item in selected_items)
-        pin_action = add_menu_action("pin", "置顶" if pin_to else "取消置顶")
-        pin_action.setEnabled(bool(selected_items))
-        pin_action.setData(pin_to)
+        clear_favorites_action = add_menu_action("clear", "清空F")
+        clear_favorites_action.setEnabled(any(item.pinned for item in self._items))
         menu.addSeparator()
         settings_action = add_menu_action("settings", "设置")
         _compact_menu(menu, appearance=self._appearance)
-        return menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action
+        return (
+            menu,
+            favorite_action,
+            unfavorite_action,
+            delete_action,
+            clear_action,
+            clear_favorites_action,
+            settings_action,
+        )
 
     def _handle_list_menu_action(
         self,
         selected: QAction | None,
         delete_action: QAction,
         clear_action: QAction,
-        clear_unpinned_action: QAction,
-        pin_action: QAction,
+        clear_favorites_action: QAction,
+        favorite_action: QAction,
+        unfavorite_action: QAction,
         settings_action: QAction,
     ) -> None:
         if selected is delete_action:
             self._request_delete_selected()
         elif selected is clear_action:
             self._request_clear_current_kind()
-        elif selected is clear_unpinned_action:
-            self._request_clear_unpinned()
-        elif selected is pin_action:
-            self._request_pin_selected(bool(pin_action.data()))
+        elif selected is clear_favorites_action:
+            self._request_clear_favorites()
+        elif selected is favorite_action:
+            self._request_favorite_selected(True)
+        elif selected is unfavorite_action:
+            self._request_favorite_selected(False)
         elif selected is settings_action:
             self._request_settings()
 
@@ -3608,9 +3645,15 @@ class ClipPanel(QWidget):
         index = self.list.indexAt(position)
         if index.isValid() and not self.list.selectionModel().isSelected(index):
             self.list.setCurrentIndex(index)
-        menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action = (
-            self._create_list_menu()
-        )
+        (
+            menu,
+            favorite_action,
+            unfavorite_action,
+            delete_action,
+            clear_action,
+            clear_favorites_action,
+            settings_action,
+        ) = self._create_list_menu()
         selected = menu.exec(self.list.viewport().mapToGlobal(position))
         # QMenu closes in a nested event loop and can leave the panel with no
         # focus widget or inactive state even when the list itself is NoFocus.
@@ -3623,8 +3666,9 @@ class ClipPanel(QWidget):
             selected,
             delete_action,
             clear_action,
-            clear_unpinned_action,
-            pin_action,
+            clear_favorites_action,
+            favorite_action,
+            unfavorite_action,
             settings_action,
         )
 
@@ -4278,16 +4322,13 @@ def _menu_action_icon(icon_name: str, appearance: _ThemeAppearance) -> QIcon:
         painter.drawRoundedRect(QRectF(3.7, 4.5, 6.6, 7.0), 1.1, 1.1)
         painter.drawLine(QPointF(6.0, 6.3), QPointF(6.0, 9.9))
         painter.drawLine(QPointF(8.0, 6.3), QPointF(8.0, 9.9))
-    elif icon_name == "pin":
-        head = QPainterPath()
-        head.moveTo(5.0, 2.9)
-        head.lineTo(10.0, 5.0)
-        head.lineTo(8.1, 8.0)
-        head.lineTo(4.1, 6.4)
-        head.closeSubpath()
-        painter.fillPath(head, color)
-        painter.drawLine(QPointF(6.0, 7.0), QPointF(3.1, 11.2))
-        painter.drawLine(QPointF(7.2, 7.4), QPointF(10.6, 10.8))
+    elif icon_name in {"favorite", "unfavorite"}:
+        icon_font = QFont()
+        icon_font.setPointSizeF(10.5)
+        painter.setFont(icon_font)
+        painter.drawText(QRectF(0, 0, logical_size, logical_size), Qt.AlignmentFlag.AlignCenter, "★")
+        if icon_name == "unfavorite":
+            painter.drawLine(QPointF(2.6, 2.6), QPointF(11.4, 11.4))
     elif icon_name == "settings":
         # Six short rectangular teeth make this read as a cog rather than a
         # crosshair, while retaining the menu's restrained monochrome weight.

@@ -11,7 +11,13 @@ from PySide6.QtWidgets import QApplication
 
 import clipsoon.app as app_module
 from clipsoon.app import ClipSoonApplication, _WindowsPanelGuard
-from clipsoon.core import WINDOWS_DEFAULT_HOTKEY, AppSettings, ClipKind, JsonSettingsStore
+from clipsoon.core import (
+    FAVORITES_FILTER,
+    WINDOWS_DEFAULT_HOTKEY,
+    AppSettings,
+    ClipKind,
+    JsonSettingsStore,
+)
 from clipsoon.system import ForegroundTargetHandle, HotkeyActivationContext, PlatformBridge
 from clipsoon.ui import SettingsDialog
 
@@ -305,11 +311,29 @@ def test_clear_history_removes_only_unpinned_items(qtbot, tmp_path) -> None:
     assert application.repository.get(pinned.id) is not None
     assert application.repository.get(unpinned.id) is None
     assert [item.id for item in application.panel._items] == [pinned.id]
-    assert application.panel.status.text() == "已清除 1 条未置顶历史"
+    assert application.panel.status.text() == "已清除 1 条未收藏历史"
     application.shutdown()
 
 
-def test_pin_many_updates_history_order_and_status(qtbot, tmp_path) -> None:
+def test_clear_favorite_history_removes_only_favorites(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+    favorite = application.repository.add_text("favorite")
+    ordinary = application.repository.add_text("ordinary")
+    application.repository.set_pinned(favorite.id, True)
+    application._reload_history()
+
+    application.clear_favorite_history()
+
+    assert application.repository.get(favorite.id) is None
+    assert application.repository.get(ordinary.id) is not None
+    assert [item.id for item in application.panel._items] == [ordinary.id]
+    assert application.panel.status.text() == "已清空 1 条收藏历史"
+    application.shutdown()
+
+
+def test_favorite_many_keeps_all_order_and_populates_favorite_tab(qtbot, tmp_path) -> None:
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)
     application.clipboard.start()
@@ -317,19 +341,26 @@ def test_pin_many_updates_history_order_and_status(qtbot, tmp_path) -> None:
     newer = application.repository.add_text("newer")
     application._reload_history()
 
-    application._pin_many((older,), True)
+    application._favorite_many((older,), True)
 
-    pinned = application.repository.get(older.id)
-    assert pinned is not None and pinned.pinned
-    assert application.panel._items[0].id == older.id
-    assert application.panel.status.text() == "已置顶 1 条"
+    favorite = application.repository.get(older.id)
+    assert favorite is not None and favorite.pinned
+    assert application.panel._items[0].id == newer.id
+    assert application.panel.model.item_at(0).id == newer.id
+    application.panel._set_filter_kind(FAVORITES_FILTER)
+    application.panel._refresh_results()
+    assert application.panel.model.item_at(0).id == older.id
+    assert application.panel.status.text() == "已收藏 1 条"
 
-    application._pin_many((pinned,), False)
+    application._favorite_many((favorite,), False)
 
-    unpinned = application.repository.get(older.id)
-    assert unpinned is not None and not unpinned.pinned
+    unfavorite = application.repository.get(older.id)
+    assert unfavorite is not None and not unfavorite.pinned
     assert {item.id for item in application.panel._items} == {older.id, newer.id}
-    assert application.panel.status.text() == "已取消置顶 1 条"
+    assert application.panel.status.text() == "已取消收藏 1 条"
+    application.panel._set_filter_kind(FAVORITES_FILTER)
+    application.panel._refresh_results()
+    assert application.panel.model.rowCount() == 0
     application.shutdown()
 
 

@@ -160,6 +160,7 @@ def test_search_unicode_filter_browse_and_stable_tie_break() -> None:
     assert engine.rank("abc", now=20)[0].item.id == "b"
     assert engine.rank("abc", now=20, kind=ClipKind.FILES)[0].item.id == "a"
     assert engine.rank("", now=20)[0].item.id == "a"
+    assert [result.item.id for result in engine.rank("", now=20, favorites_only=True)] == ["b"]
     assert len(engine.rank("abc", now=20, limit=1)) == 1
 
 

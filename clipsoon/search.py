@@ -50,11 +50,14 @@ class SearchEngine:
         *,
         now: float,  # retained in the API for injectable-clock callers
         kind: ClipKind | None = None,
+        favorites_only: bool = False,
         limit: int | None = None,
     ) -> list[SearchResult]:
         del now
         query = normalize(query)
         records = (record for record in self._records if kind is None or record.item.kind is kind)
+        if favorites_only:
+            records = (record for record in records if record.item.pinned)
         if query:
             ranked = []
             for record in records:
@@ -86,9 +89,16 @@ def rank_items(
     *,
     now: float,
     kind: ClipKind | None = None,
+    favorites_only: bool = False,
     limit: int | None = None,
 ) -> list[SearchResult]:
-    return SearchEngine(items).rank(query, now=now, kind=kind, limit=limit)
+    return SearchEngine(items).rank(
+        query,
+        now=now,
+        kind=kind,
+        favorites_only=favorites_only,
+        limit=limit,
+    )
 
 
 def score_text(query: str, content: str) -> float | None:

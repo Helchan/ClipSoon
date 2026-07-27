@@ -19,9 +19,11 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from clipsoon import __version__
 from clipsoon.core import (
+    FAVORITES_FILTER,
     WINDOWS_DEFAULT_HOTKEY,
     AppSettings,
     ClipKind,
+    HistoryFilter,
     HistoryRepository,
     JsonSettingsStore,
     ObservableSettings,
@@ -239,9 +241,9 @@ class ClipSoonApplication(QObject):
         self.panel.send_requested.connect(lambda item: self.sender.send(item, self.target))
         self.panel.settings_requested.connect(self.show_settings)
         self.panel.delete_requested.connect(self._delete_many)
-        self.panel.pin_requested.connect(self._pin_many)
+        self.panel.favorite_requested.connect(self._favorite_many)
         self.panel.clear_requested.connect(self.clear_current_tab_history)
-        self.panel.clear_unpinned_requested.connect(self.clear_history)
+        self.panel.clear_favorites_requested.connect(self.clear_favorite_history)
         self.panel.accessibility_requested.connect(self.open_accessibility_settings)
         self.panel.position_changed.connect(self._save_panel_position)
         self.sender.finished.connect(self._send_finished)
@@ -663,16 +665,22 @@ class ClipSoonApplication(QObject):
         self.clipboard.sync_cursor()
         removed = self.repository.clear_unpinned()
         self._reload_history()
-        self.panel.set_status(f"已清除 {removed} 条未置顶历史")
+        self.panel.set_status(f"已清除 {removed} 条未收藏历史")
+
+    def clear_favorite_history(self) -> None:
+        self.clear_current_tab_history(FAVORITES_FILTER)
 
     def clear_all_history(self) -> None:
         self.clear_current_tab_history(None)
 
-    def clear_current_tab_history(self, kind: ClipKind | None) -> None:
+    def clear_current_tab_history(self, kind: HistoryFilter) -> None:
         self.clipboard.sync_cursor()
         if kind is None:
             removed = self.repository.clear_all()
             kind_label = ""
+        elif kind == FAVORITES_FILTER:
+            removed = self.repository.clear_favorites()
+            kind_label = "收藏"
         else:
             removed = self.repository.clear_kind(kind)
             kind_label = {
@@ -699,17 +707,17 @@ class ClipSoonApplication(QObject):
             self._reload_history()
             self.panel.set_status(f"已删除 {removed} 条")
 
-    def _pin_many(self, items, pinned: bool) -> None:
+    def _favorite_many(self, items, favorite: bool) -> None:
         changed = 0
         for item in items:
             current = self.repository.get(item.id)
-            if current is None or current.pinned == pinned:
+            if current is None or current.pinned == favorite:
                 continue
-            self.repository.set_pinned(current.id, pinned)
+            self.repository.set_pinned(current.id, favorite)
             changed += 1
         if changed:
             self._reload_history()
-            self.panel.set_status(f"已置顶 {changed} 条" if pinned else f"已取消置顶 {changed} 条")
+            self.panel.set_status(f"已收藏 {changed} 条" if favorite else f"已取消收藏 {changed} 条")
 
     def _reload_history(self) -> None:
         self.panel.set_items(self.repository.list_items(self.settings.value.max_history_items + 1_000))
