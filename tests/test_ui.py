@@ -63,12 +63,13 @@ from clipsoon.ui import (
     _DestructiveConfirmationDialog,
     _hotkey_display,
     _hover_color,
-    _paint_liquid_glass_material,
+    _paint_frosted_material,
     _parse_hotkey,
     _platform_hotkey_validation_error,
     _ScaledImageLoader,
     _settings_control_border_token,
     _style_sheet,
+    _theme_appearance,
     _theme_colors,
     _ThemeAppearance,
     create_tray_icon,
@@ -380,7 +381,7 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
 
 
 def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> None:
-    dialog = SettingsDialog(AppSettings(theme="liquid_glass"), accessibility_granted=True)
+    dialog = SettingsDialog(AppSettings(theme="frosted"), accessibility_granted=True)
     qtbot.addWidget(dialog)
     dialog.show()
     qtbot.waitExposed(dialog)
@@ -428,7 +429,7 @@ def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> No
 
 
 def test_settings_behavior_checkboxes_have_stable_non_overlapping_rows(qtbot) -> None:
-    for theme in ("light", "dark", "liquid_glass"):
+    for theme in ("light", "dark", "frosted"):
         dialog = SettingsDialog(AppSettings(theme=theme), accessibility_granted=True)
         qtbot.addWidget(dialog)
         dialog.show()
@@ -615,7 +616,7 @@ def test_settings_changes_and_reset_are_emitted_immediately(qtbot) -> None:
     assert changes[-1]["theme"] == "dark"
 
     dialog.reset_button.click()
-    assert changes[-1]["theme"] == "liquid_glass"
+    assert changes[-1]["theme"] == "frosted"
     assert changes[-1]["max_history_items"] == 500
     assert changes[-1]["capture_enabled"] is True
 
@@ -701,7 +702,7 @@ def test_dark_settings_uses_an_app_owned_opaque_shell_on_macos_after_a_live_them
     rendered = dialog.grab().toImage()
     assert rendered.pixelColor(4, dialog.height() // 2) == QColor("#1C1F27")
 
-    dialog.apply_settings(AppSettings(theme="liquid_glass"))
+    dialog.apply_settings(AppSettings(theme="frosted"))
     assert dialog.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     assert not dialog.autoFillBackground()
 
@@ -772,7 +773,7 @@ def test_settings_checkboxes_use_the_active_theme_and_keep_a_visible_checkmark(q
             for x in range(indicator.width())
         ]
 
-    for theme in ("light", "dark", "liquid_glass"):
+    for theme in ("light", "dark", "frosted"):
         dialog = SettingsDialog(AppSettings(theme=theme), accessibility_granted=True)
         qtbot.addWidget(dialog)
         dialog.show()
@@ -840,18 +841,18 @@ def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -
 
 
 def test_frosted_material_theme_is_selectable_and_uses_a_readable_popup_palette(qtbot) -> None:
-    dialog = SettingsDialog(AppSettings(theme="liquid_glass"), accessibility_granted=True)
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
     qtbot.addWidget(dialog)
-    legacy_dialog = SettingsDialog(AppSettings(theme="system"), accessibility_granted=True)
+    legacy_dialog = SettingsDialog(AppSettings(theme="not-a-theme"), accessibility_granted=True)
     qtbot.addWidget(legacy_dialog)
 
-    assert dialog.theme.currentData() == "liquid_glass"
-    assert dialog.theme.currentText() == "磨砂质感（随系统）"
-    assert dialog.theme.itemData(0) == "liquid_glass"
-    assert legacy_dialog.theme.currentData() == "liquid_glass"
+    assert dialog.theme.currentData() == "frosted"
+    assert dialog.theme.currentText() == "磨砂"
+    assert dialog.theme.itemData(0) == "frosted"
+    assert legacy_dialog.theme.currentData() == "frosted"
     assert f"font-size: {ui_module._POPUP_ITEM_FONT_SIZE_PT}pt" in dialog.theme.view().styleSheet()
     assert [dialog.theme.itemText(index) for index in range(dialog.theme.count())] == [
-        "磨砂质感（随系统）",
+        "磨砂",
         "浅色",
         "深色",
     ]
@@ -869,12 +870,25 @@ def test_frosted_material_theme_is_selectable_and_uses_a_readable_popup_palette(
         assert "background: #2C63D9; color: #FFFFFF" in combo.view().styleSheet()
 
 
-def test_dark_liquid_combo_popup_uses_the_dark_foreground_for_its_solid_accent(qtbot) -> None:
+def test_fixed_frosted_theme_uses_light_app_material(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(theme="frosted"), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+
+    assert dialog.theme.currentData() == "frosted"
+    assert dialog.theme.currentText() == "磨砂"
+    assert dialog._appearance == _ThemeAppearance(dark=False, frosted=True)
+    assert _theme_appearance(AppSettings(theme="frosted")) == _ThemeAppearance(
+        dark=False,
+        frosted=True,
+    )
+
+
+def test_dark_frosted_combo_popup_uses_the_dark_foreground_for_its_solid_accent(qtbot) -> None:
     combo = QComboBox()
     combo.addItems(["一", "二"])
     qtbot.addWidget(combo)
 
-    ui_module._style_combo_popup(combo, _ThemeAppearance(dark=True, liquid_glass=True))
+    ui_module._style_combo_popup(combo, _ThemeAppearance(dark=True, frosted=True))
 
     assert "background: #6B9DFF; color: #0A192F" in combo.view().styleSheet()
 
@@ -898,19 +912,18 @@ def test_confirmation_reserves_danger_color_for_irreversible_actions(qtbot) -> N
     assert "background: #5264E8" in acknowledgement.styleSheet()
 
 
-def _render_liquid_material(
+def _render_frosted_material(
     *,
     light_strength: float = 0.0,
-    native_backdrop: bool = False,
     transparent_canvas: bool = False,
 ) -> QImage:
     image = QImage(320, 220, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor(0, 0, 0, 0) if transparent_canvas else QColor("#101721"))
     painter = QPainter(image)
-    _paint_liquid_glass_material(
+    _paint_frosted_material(
         painter,
         QRectF(20, 20, 280, 180),
-        _ThemeAppearance(dark=False, liquid_glass=True, native_backdrop=native_backdrop),
+        _ThemeAppearance(dark=False, frosted=True),
         light_position=QPointF(112, 84),
         light_strength=light_strength,
     )
@@ -918,9 +931,9 @@ def _render_liquid_material(
     return image
 
 
-def test_liquid_glass_material_has_environmental_depth_rim_and_subtle_pointer_sheen() -> None:
-    resting = _render_liquid_material()
-    active = _render_liquid_material(light_strength=1.0)
+def test_frosted_material_has_environmental_depth_rim_and_subtle_pointer_sheen() -> None:
+    resting = _render_frosted_material()
+    active = _render_frosted_material(light_strength=1.0)
 
     top_rim = resting.pixelColor(160, 21)
     just_inside = resting.pixelColor(160, 44)
@@ -934,10 +947,10 @@ def test_liquid_glass_material_has_environmental_depth_rim_and_subtle_pointer_sh
     assert sum(active_light.getRgb()[:3]) > sum(resting_light.getRgb()[:3]) + 4
 
 
-def test_liquid_surface_recovers_when_qt_tears_down_its_hover_animation(qtbot) -> None:
+def test_frosted_surface_recovers_when_qt_tears_down_its_hover_animation(qtbot) -> None:
     """A deferred theme refresh must not call a stale parent-owned animation."""
 
-    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+    panel = ClipPanel(lambda: AppSettings(theme="frosted"))
     qtbot.addWidget(panel)
     stale_animation = panel.card._hover_animation
     stale_animation.deleteLater()
@@ -949,30 +962,28 @@ def test_liquid_surface_recovers_when_qt_tears_down_its_hover_animation(qtbot) -
     # Theme reconciliation can occur before the next pointer event. It must
     # safely clear the stale effect, and the next hover must restore it.
     panel.card.set_appearance(_ThemeAppearance(dark=False))
-    panel.card.set_appearance(_ThemeAppearance(dark=False, liquid_glass=True))
+    panel.card.set_appearance(_ThemeAppearance(dark=False, frosted=True))
     panel.card.set_light_active(True)
 
     assert panel.card._hover_animation is not stale_animation
     assert panel.card._hover_animation.state() == QVariantAnimation.State.Running
 
 
-def test_native_soft_translucent_material_keeps_a_neutral_frosted_backdrop_visible() -> None:
-    fallback = _render_liquid_material(transparent_canvas=True)
-    frosted = _render_liquid_material(native_backdrop=True, transparent_canvas=True)
+def test_frosted_material_keeps_lower_fields_light_and_neutral() -> None:
+    frosted = _render_frosted_material(transparent_canvas=True)
 
     for point in ((64, 58), (160, 120), (260, 176)):
-        fallback_pixel = fallback.pixelColor(*point)
         frosted_pixel = frosted.pixelColor(*point)
-        assert 0 < frosted_pixel.alpha() < 100
-        assert frosted_pixel.alpha() + 110 < fallback_pixel.alpha()
+        assert frosted_pixel.alpha() >= 200
+        assert frosted_pixel.lightness() >= 176
 
     # The lower-right field must remain a neutral cool tint rather than turn
-    # into a saturated blue panel over the system material.
+    # into a saturated blue panel.
     lower_right = frosted.pixelColor(260, 176)
-    assert lower_right.blue() - lower_right.green() < 28
+    assert lower_right.blue() - lower_right.green() < 22
 
 
-@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+@pytest.mark.parametrize("theme", ("light", "dark", "frosted"))
 def test_every_panel_theme_uses_one_visible_vertical_divider_without_a_detail_card(
     qtbot,
     theme: str,
@@ -1024,12 +1035,12 @@ def test_every_panel_theme_uses_one_visible_vertical_divider_without_a_detail_ca
             id="dark",
         ),
         pytest.param(
-            _ThemeAppearance(dark=False, liquid_glass=True),
+            _ThemeAppearance(dark=False, frosted=True),
             "rgba(35, 65, 98, 38)",
             id="frosted-light",
         ),
         pytest.param(
-            _ThemeAppearance(dark=True, liquid_glass=True),
+            _ThemeAppearance(dark=True, frosted=True),
             "rgba(224, 238, 255, 46)",
             id="frosted-dark",
         ),
@@ -1052,12 +1063,12 @@ def test_settings_sections_share_the_main_panel_divider_material(
     ("appearance", "divider_color"),
     (
         pytest.param(
-            _ThemeAppearance(dark=False, liquid_glass=True),
+            _ThemeAppearance(dark=False, frosted=True),
             "rgba(35, 65, 98, 38)",
             id="frosted-light",
         ),
         pytest.param(
-            _ThemeAppearance(dark=True, liquid_glass=True),
+            _ThemeAppearance(dark=True, frosted=True),
             "rgba(224, 238, 255, 46)",
             id="frosted-dark",
         ),
@@ -1077,7 +1088,7 @@ def test_frosted_settings_controls_share_the_main_panel_divider_material(
     assert "#settingsDialog QPushButton {" in style
 
 
-@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+@pytest.mark.parametrize("theme", ("light", "dark", "frosted"))
 def test_every_panel_theme_keeps_search_and_footer_section_rules_without_a_search_frame(
     qtbot,
     theme: str,
@@ -1189,7 +1200,7 @@ def test_standard_detail_has_no_card_edge_and_its_divider_paints(
     assert (divider_ink.lightness() < 150) is divider_is_dark
 
 
-def test_liquid_glass_panel_uses_one_custom_painted_primary_shell(qtbot) -> None:
+def test_frosted_panel_uses_one_custom_painted_primary_shell(qtbot) -> None:
     current = {"settings": AppSettings(theme="light")}
     panel = ClipPanel(lambda: current["settings"])
     qtbot.addWidget(panel)
@@ -1199,13 +1210,13 @@ def test_liquid_glass_panel_uses_one_custom_painted_primary_shell(qtbot) -> None
     assert light_margins.left() == expected_inset
     assert light_margins.top() == expected_inset
 
-    current["settings"] = AppSettings(theme="liquid_glass")
+    current["settings"] = AppSettings(theme="frosted")
     panel.apply_theme()
 
-    assert panel.card.__class__.__name__ == "_LiquidGlassSurface"
-    liquid_margins = panel.layout().contentsMargins()
-    assert liquid_margins.left() == expected_inset
-    assert liquid_margins.top() == expected_inset
+    assert panel.card.__class__.__name__ == "_FrostedSurface"
+    frosted_margins = panel.layout().contentsMargins()
+    assert frosted_margins.left() == expected_inset
+    assert frosted_margins.top() == expected_inset
     assert "#card { background: transparent; border: none;" in panel.styleSheet()
     assert "#detail { background: transparent; border: none;" in panel.styleSheet()
     if panel.card.graphicsEffect() is not None:
@@ -1221,10 +1232,10 @@ def test_liquid_glass_panel_uses_one_custom_painted_primary_shell(qtbot) -> None
     (
         _ThemeAppearance(dark=False),
         _ThemeAppearance(dark=True),
-        _ThemeAppearance(dark=False, liquid_glass=True),
-        _ThemeAppearance(dark=True, liquid_glass=True),
+        _ThemeAppearance(dark=False, frosted=True),
+        _ThemeAppearance(dark=True, frosted=True),
     ),
-    ids=("light", "dark", "glass-light", "glass-dark"),
+    ids=("light", "dark", "frosted-light", "frosted-dark"),
 )
 def test_confirmation_has_no_opaque_rectangular_root_ring(qtbot, appearance) -> None:
     parent = QDialog()
@@ -1299,24 +1310,23 @@ def test_dark_confirmation_uses_bright_title_and_cancel_text(qtbot) -> None:
         )
 
 
-def test_confirmation_falls_back_to_complete_liquid_material_without_parent_native_backdrop(qtbot) -> None:
+def test_confirmation_uses_complete_frosted_material(qtbot) -> None:
     parent = QDialog()
     prompt = _DestructiveConfirmationDialog(
         parent,
         "清空历史",
         "确认清空？",
         "确定",
-        appearance=_ThemeAppearance(dark=False, liquid_glass=True, native_backdrop=True),
+        appearance=_ThemeAppearance(dark=False, frosted=True),
     )
     qtbot.addWidget(parent)
     qtbot.addWidget(prompt)
 
-    assert prompt._appearance.liquid_glass
-    assert not prompt._appearance.native_backdrop
+    assert prompt._appearance.frosted
 
 
-def test_liquid_list_selection_and_hover_share_one_blue_material_language(qtbot) -> None:
-    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+def test_frosted_list_selection_and_hover_share_one_blue_material_language(qtbot) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme="frosted"))
     qtbot.addWidget(panel)
     panel.set_items(
         [
@@ -1350,8 +1360,8 @@ def test_liquid_list_selection_and_hover_share_one_blue_material_language(qtbot)
     assert selected_fill.alpha() > hover_fill.alpha()
 
 
-def test_liquid_history_scrollbar_is_narrow_and_has_no_opaque_track(qtbot) -> None:
-    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+def test_frosted_history_scrollbar_is_narrow_and_has_no_opaque_track(qtbot) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme="frosted"))
     qtbot.addWidget(panel)
     panel.set_items([clip(str(index), f"item {index}", index) for index in range(42)])
     panel.show_panel()
@@ -1392,7 +1402,7 @@ def test_standard_history_scrollbars_are_narrow_and_have_no_opaque_track(qtbot) 
 
 def test_long_text_preview_scrollbar_is_narrow_and_transparent_in_every_theme(qtbot) -> None:
     text = "\n".join(f"long preview line {index}" for index in range(160))
-    for theme in ("light", "dark", "liquid_glass"):
+    for theme in ("light", "dark", "frosted"):
         panel = ClipPanel(lambda theme=theme: AppSettings(theme=theme))
         qtbot.addWidget(panel)
         panel.set_items([clip("long", text, 1)])
@@ -1410,33 +1420,25 @@ def test_long_text_preview_scrollbar_is_narrow_and_transparent_in_every_theme(qt
         assert "#textPreview QScrollBar:vertical" in panel.styleSheet()
 
 
-def test_windows_liquid_glass_keeps_qt_non_layered_before_and_after_native_backdrop(
+def test_windows_frosted_keeps_qt_non_layered_with_app_owned_material(
     qtbot,
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(ui_module.sys, "platform", "win32")
-    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+    panel = ClipPanel(lambda: AppSettings(theme="frosted"))
     qtbot.addWidget(panel)
 
     assert panel.card.graphicsEffect() is None
     assert not panel.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     assert panel.autoFillBackground()
-    assert not panel.native_backdrop_active
     assert "#panelWindow { background: transparent; }" not in panel.styleSheet()
-
-    panel.set_native_backdrop_active(True)
-
-    assert panel.native_backdrop_active
-    assert not panel.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-    assert panel.autoFillBackground()
-    assert "#panelWindow { background: transparent; }" in panel.styleSheet()
     assert "#card { background: transparent; border: none;" in panel.styleSheet()
     assert "rgba(232, 244, 255, 54)" in panel.styleSheet()
 
 
 def test_windows_dialogs_keep_non_layered_backing_without_qt_drop_shadows(qtbot, monkeypatch) -> None:
     monkeypatch.setattr(ui_module.sys, "platform", "win32")
-    dialog = SettingsDialog(AppSettings(theme="liquid_glass"), accessibility_granted=True)
+    dialog = SettingsDialog(AppSettings(theme="frosted"), accessibility_granted=True)
     prompt = _DestructiveConfirmationDialog(dialog, "清空历史", "确认清空？", "确定", dark=False)
     qtbot.addWidget(dialog)
     qtbot.addWidget(prompt)
@@ -2494,7 +2496,7 @@ def test_settings_shield_blur_removes_readable_detail(qtbot) -> None:
 
 
 def test_settings_interaction_shield_is_physically_rounded(qtbot) -> None:
-    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+    panel = ClipPanel(lambda: AppSettings(theme="frosted"))
     qtbot.addWidget(panel)
     panel.set_items([clip("text", "content", 1)])
     panel.show_panel()
@@ -2894,7 +2896,7 @@ def test_search_icon_click_keeps_the_main_panel_typing_focus(qtbot) -> None:
     assert requested == [True]
 
 
-@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+@pytest.mark.parametrize("theme", ("light", "dark", "frosted"))
 def test_active_panel_keeps_search_focus_after_every_in_panel_interaction(qtbot, theme: str) -> None:
     panel = ClipPanel(lambda: AppSettings(theme=theme))
     qtbot.addWidget(panel)
@@ -2927,7 +2929,7 @@ def test_active_panel_keeps_search_focus_after_every_in_panel_interaction(qtbot,
     assert panel.search_icon.focusPolicy() == Qt.FocusPolicy.NoFocus
 
 
-@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+@pytest.mark.parametrize("theme", ("light", "dark", "frosted"))
 def test_search_uses_an_app_owned_themed_blinking_caret(qtbot, theme: str) -> None:
     panel = ClipPanel(lambda: AppSettings(theme=theme))
     qtbot.addWidget(panel)
@@ -2942,7 +2944,7 @@ def test_search_uses_an_app_owned_themed_blinking_caret(qtbot, theme: str) -> No
     assert f"selection-color: {_accent_foreground(panel._appearance)}" in panel.styleSheet()
 
     # The native QLineEdit caret must be absent during the overlay's hidden
-    # half-cycle, otherwise macOS paints a white line through glass themes.
+    # half-cycle, otherwise macOS paints a white line through frosted themes.
     assert panel.search.property("_clipsoon_app_owned_caret") is True
     assert (
         panel.search.style().pixelMetric(
@@ -2965,7 +2967,7 @@ def test_search_uses_an_app_owned_themed_blinking_caret(qtbot, theme: str) -> No
         )
 
 
-@pytest.mark.parametrize("theme", ("light", "dark", "system", "liquid_glass"))
+@pytest.mark.parametrize("theme", ("light", "dark", "frosted"))
 def test_settings_text_editors_use_the_same_app_owned_blinking_caret(qtbot, theme: str) -> None:
     dialog = SettingsDialog(AppSettings(theme=theme), accessibility_granted=True)
     qtbot.addWidget(dialog)

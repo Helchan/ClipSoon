@@ -2443,28 +2443,6 @@ class PlatformBridge:
         return sys.platform == "win32"
 
     @staticmethod
-    def apply_windows_desktop_acrylic(identifier: int) -> bool:
-        """Request the documented Win11 Desktop Acrylic backdrop for one HWND.
-
-        This keeps the DWM/ctypes implementation at the platform boundary and
-        deliberately does not alter Qt attributes or window styles.
-        """
-        if sys.platform != "win32" or identifier <= 0:
-            return False
-        from clipsoon.windows_backdrop import WindowsBackdropController
-
-        return WindowsBackdropController().apply_transient(identifier).applied
-
-    @staticmethod
-    def clear_windows_desktop_acrylic(identifier: int) -> bool:
-        """Clear a previously requested DWM backdrop without touching Qt flags."""
-        if sys.platform != "win32" or identifier <= 0:
-            return False
-        from clipsoon.windows_backdrop import WindowsBackdropController
-
-        return WindowsBackdropController().clear(identifier).applied
-
-    @staticmethod
     def foreground_window_id() -> int | None:
         if sys.platform != "win32":
             return None

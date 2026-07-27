@@ -177,11 +177,10 @@ _FILE_REVISION_TTL_SECONDS = 1.0
 
 @dataclass(frozen=True)
 class _ThemeAppearance:
-    """Resolved theme plus the independent state of an optional native backdrop."""
+    """Resolved theme with the app-owned frosted material state."""
 
     dark: bool
-    liquid_glass: bool = False
-    native_backdrop: bool = False
+    frosted: bool = False
 
 
 @dataclass(frozen=True)
@@ -241,7 +240,7 @@ _DARK_COLORS = _ThemeColors(
 )
 
 _SETTINGS_THEME_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("磨砂质感（随系统）", "liquid_glass"),
+    ("磨砂", "frosted"),
     ("浅色", "light"),
     ("深色", "dark"),
 )
@@ -254,7 +253,7 @@ _SETTINGS_SHIELD_DARK_VEIL_ALPHA = 234
 _SETTINGS_SHIELD_LIGHT_GLOW_ALPHA = 16
 _SETTINGS_SHIELD_DARK_GLOW_ALPHA = 14
 
-_GLASS_LIGHT_FALLBACK_COLORS = _ThemeColors(
+_FROSTED_LIGHT_COLORS = _ThemeColors(
     window="#EEF4FF",
     card="rgba(247, 251, 255, 248)",
     panel="rgba(225, 236, 253, 244)",
@@ -271,7 +270,7 @@ _GLASS_LIGHT_FALLBACK_COLORS = _ThemeColors(
     menu_hover="#DCE9FC",
     menu_separator="#C8D7EF",
 )
-_GLASS_DARK_FALLBACK_COLORS = _ThemeColors(
+_FROSTED_DARK_COLORS = _ThemeColors(
     window="#17202E",
     card="rgba(24, 34, 50, 248)",
     panel="rgba(34, 47, 68, 244)",
@@ -288,60 +287,11 @@ _GLASS_DARK_FALLBACK_COLORS = _ThemeColors(
     menu_hover="#3D5475",
     menu_separator="#4A6388",
 )
-_GLASS_LIGHT_NATIVE_COLORS = _ThemeColors(
-    window="#F4F8FC",
-    card="rgba(246, 250, 255, 132)",
-    panel="rgba(231, 241, 250, 112)",
-    control="rgba(255, 255, 255, 138)",
-    text="#10203A",
-    muted="#405A7B",
-    border="rgba(255, 255, 255, 116)",
-    accent="#2B62D7",
-    accent_focus="#3B78ED",
-    hover="#D5E5FD",
-    thumbnail="#CCDCF7",
-    popup="#EAF2F8",
-    menu="#F7FAFF",
-    menu_hover="#DCE9FC",
-    menu_separator="#C8D7EF",
-)
-_GLASS_DARK_NATIVE_COLORS = _ThemeColors(
-    window="#1B2633",
-    card="rgba(22, 32, 46, 148)",
-    panel="rgba(36, 51, 70, 122)",
-    control="rgba(53, 68, 91, 148)",
-    text="#F3F7FF",
-    muted="#C0CEE0",
-    border="rgba(226, 239, 255, 62)",
-    accent="#74A4FF",
-    accent_focus="#8AB5FF",
-    hover="#415B80",
-    thumbnail="#466088",
-    popup="#243249",
-    menu="#26364E",
-    menu_hover="#3D5475",
-    menu_separator="#4A6388",
-)
 
 
-def _system_prefers_dark() -> bool:
-    return QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
-
-
-def _theme_appearance(
-    settings: AppSettings,
-    *,
-    native_backdrop: bool = False,
-) -> _ThemeAppearance:
-    liquid_glass = settings.theme == "liquid_glass"
-    dark = settings.theme == "dark" or (
-        settings.theme in {"system", "liquid_glass"} and _system_prefers_dark()
-    )
-    return _ThemeAppearance(
-        dark=dark,
-        liquid_glass=liquid_glass,
-        native_backdrop=liquid_glass and native_backdrop,
-    )
+def _theme_appearance(settings: AppSettings) -> _ThemeAppearance:
+    theme = _settings_theme_key(settings.theme)
+    return _ThemeAppearance(dark=theme == "dark", frosted=theme == "frosted")
 
 
 def _as_theme_appearance(value: bool | _ThemeAppearance) -> _ThemeAppearance:
@@ -351,15 +301,13 @@ def _as_theme_appearance(value: bool | _ThemeAppearance) -> _ThemeAppearance:
 def _theme_colors(theme: bool | _ThemeAppearance) -> _ThemeColors:
     """Return semantic tokens while keeping bool callers backward compatible."""
     appearance = _as_theme_appearance(theme)
-    if not appearance.liquid_glass:
+    if not appearance.frosted:
         return _DARK_COLORS if appearance.dark else _LIGHT_COLORS
-    if appearance.native_backdrop:
-        return _GLASS_DARK_NATIVE_COLORS if appearance.dark else _GLASS_LIGHT_NATIVE_COLORS
-    return _GLASS_DARK_FALLBACK_COLORS if appearance.dark else _GLASS_LIGHT_FALLBACK_COLORS
+    return _FROSTED_DARK_COLORS if appearance.dark else _FROSTED_LIGHT_COLORS
 
 
 def _settings_theme_key(theme: str) -> str:
-    return theme if theme in _SETTINGS_THEME_KEYS else "liquid_glass"
+    return theme if theme in _SETTINGS_THEME_KEYS else "frosted"
 
 
 def _surface_divider_token(appearance: _ThemeAppearance) -> tuple[str, QColor]:
@@ -373,7 +321,7 @@ def _surface_divider_token(appearance: _ThemeAppearance) -> tuple[str, QColor]:
 def _settings_control_border_token(appearance: _ThemeAppearance) -> tuple[str, QColor]:
     """Return an idle settings-control edge without changing standard themes."""
 
-    if appearance.liquid_glass:
+    if appearance.frosted:
         return _surface_divider_token(appearance)
     token = _theme_colors(appearance).border
     return token, QColor(token)
@@ -382,12 +330,12 @@ def _settings_control_border_token(appearance: _ThemeAppearance) -> tuple[str, Q
 def _active_foreground(appearance: _ThemeAppearance) -> str:
     """Return the readable foreground for an active semantic surface.
 
-    Liquid-glass active fills stay intentionally luminous in both appearances.
+    Frosted active fills stay intentionally luminous in both appearances.
     White text falls below readable contrast on those translucent blues, so
-    every liquid active state shares one deep navy foreground instead.
+    every frosted active state shares one deep navy foreground instead.
     """
 
-    return "#0A192F" if appearance.liquid_glass else "#FFFFFF"
+    return "#0A192F" if appearance.frosted else "#FFFFFF"
 
 
 def _accent_foreground(appearance: _ThemeAppearance) -> str:
@@ -396,11 +344,11 @@ def _accent_foreground(appearance: _ThemeAppearance) -> str:
     This is intentionally distinct from :func:`_active_foreground`: list
     selections and filter chips are translucent, luminous surfaces, whereas
     a combo popup or primary button uses the opaque accent token itself.  The
-    light liquid accent needs white text; its darker liquid counterpart needs
-    the same deep navy used by the glass active surface.
+    light frosted accent needs white text; its darker counterpart needs the
+    same deep navy used by the frosted active surface.
     """
 
-    return "#0A192F" if appearance.liquid_glass and appearance.dark else "#FFFFFF"
+    return "#0A192F" if appearance.frosted and appearance.dark else "#FFFFFF"
 
 
 _APP_OWNED_CARET_PROPERTY = "_clipsoon_app_owned_caret"
@@ -709,24 +657,23 @@ class _ThemedTextCaret(QObject):
         return False
 
 
-_LIQUID_GLASS_RADIUS = 18.0
+_FROSTED_RADIUS = 18.0
 
 
-def _paint_liquid_glass_material(
+def _paint_frosted_material(
     painter: QPainter,
     rect: QRectF,
     appearance: _ThemeAppearance,
     *,
     light_position: QPointF | None = None,
     light_strength: float = 0.0,
-    radius: float = _LIQUID_GLASS_RADIUS,
+    radius: float = _FROSTED_RADIUS,
 ) -> None:
     """Paint a self-contained, lens-inspired material without screen capture.
 
-    The scene below the material is deliberately app-owned: platform backdrop
-    APIs may add real desktop blur, while this renderer keeps the same depth,
-    rim light, and interaction response on unsupported systems.  It therefore
-    remains private and predictable on macOS 13--15 and Windows.
+    The scene below the material is deliberately app-owned, so the same depth,
+    rim light, and interaction response stay private and predictable across
+    macOS, Windows, and Linux.
     """
 
     if rect.width() <= 2 or rect.height() <= 2:
@@ -738,36 +685,30 @@ def _paint_liquid_glass_material(
     shell.addRoundedRect(rect, radius, radius)
     painter.setClipPath(shell)
 
-    native = appearance.native_backdrop
     if appearance.dark:
-        # Native backdrop already supplies the blur.  Keep this foreground
-        # coating deliberately thin so the blurred scene can remain visible
-        # without sacrificing the contrast of the actual app content.
-        base = QColor(19, 29, 43, 64 if native else 226)
-        top_tint = QColor(85, 141, 220, 15 if native else 72)
-        lower_tint = QColor(84, 107, 143, 7 if native else 62)
-        warm_tint = QColor(94, 194, 186, 6 if native else 42)
-        top_gloss = QColor(238, 248, 255, 16 if native else 42)
-        bottom_shade = QColor(2, 8, 20, 15 if native else 94)
-        rim_light = QColor(229, 243, 255, 106 if native else 106)
-        inner_rim = QColor(151, 202, 255, 28 if native else 56)
-        top_field_alpha = 10 if native else 58
-        lower_field_alpha = 5 if native else 58
+        base = QColor(19, 29, 43, 226)
+        top_tint = QColor(85, 141, 220, 72)
+        lower_tint = QColor(84, 107, 143, 62)
+        warm_tint = QColor(94, 194, 186, 42)
+        top_gloss = QColor(238, 248, 255, 42)
+        bottom_shade = QColor(2, 8, 20, 94)
+        rim_light = QColor(229, 243, 255, 106)
+        inner_rim = QColor(151, 202, 255, 56)
+        top_field_alpha = 58
+        lower_field_alpha = 58
     else:
-        # Do not use a saturated blue/purple lower field over the native
-        # material: it turns the right-bottom corner into a coloured wall and
-        # hides the frosted background.  A low-alpha neutral cool tone retains
-        # depth while leaving underlying windows visible as blurred silhouettes.
-        base = QColor(231, 240, 248, 32 if native else 218)
-        top_tint = QColor(111, 169, 246, 10 if native else 86)
-        lower_tint = QColor(193, 209, 231, 4 if native else 66)
-        warm_tint = QColor(105, 211, 197, 5 if native else 50)
-        top_gloss = QColor(255, 255, 255, 26 if native else 106)
-        bottom_shade = QColor(41, 66, 94, 4 if native else 50)
-        rim_light = QColor(255, 255, 255, 156 if native else 174)
-        inner_rim = QColor(126, 181, 255, 30 if native else 74)
-        top_field_alpha = 8 if native else 58
-        lower_field_alpha = 4 if native else 58
+        # Keep the lower half close to the light macOS screenshot: the material
+        # should read as pale frost, not a dense blue overlay.
+        base = QColor(239, 247, 252, 236)
+        top_tint = QColor(111, 169, 246, 54)
+        lower_tint = QColor(208, 225, 238, 24)
+        warm_tint = QColor(121, 220, 207, 24)
+        top_gloss = QColor(255, 255, 255, 126)
+        bottom_shade = QColor(41, 66, 94, 14)
+        rim_light = QColor(255, 255, 255, 184)
+        inner_rim = QColor(126, 181, 255, 52)
+        top_field_alpha = 34
+        lower_field_alpha = 22
 
     painter.fillPath(shell, base)
 
@@ -855,7 +796,7 @@ def _paint_liquid_glass_material(
     painter.restore()
 
 
-class _LiquidGlassSurface(QFrame):
+class _FrostedSurface(QFrame):
     """One primary custom-painted material shell for a widget hierarchy."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -877,11 +818,11 @@ class _LiquidGlassSurface(QFrame):
     def _active_hover_animation(self) -> QVariantAnimation:
         """Return a live animation, recreating one Qt already tore down.
 
-        A deferred system-appearance refresh can arrive while Qt is unwinding
-        a modal window or test widget tree.  In that narrow lifecycle window
-        the surface still exists but its parent-owned animation may already
-        have been destroyed.  Recreate the cosmetic animation rather than
-        letting a theme refresh fail; the material remains fully functional.
+        A theme refresh can arrive while Qt is unwinding a modal window or
+        test widget tree.  In that narrow lifecycle window the surface still
+        exists but its parent-owned animation may already have been destroyed.
+        Recreate the cosmetic animation rather than letting the refresh fail;
+        the material remains fully functional.
         """
 
         try:
@@ -892,7 +833,7 @@ class _LiquidGlassSurface(QFrame):
 
     def set_appearance(self, appearance: _ThemeAppearance) -> None:
         self._appearance = appearance
-        if not appearance.liquid_glass:
+        if not appearance.frosted:
             # The effect is optional, and a later hover will lazily create a
             # fresh animation if this QObject was torn down.
             with suppress(RuntimeError):
@@ -901,13 +842,13 @@ class _LiquidGlassSurface(QFrame):
         self.update()
 
     def set_light_position(self, position: QPointF) -> None:
-        if not self._appearance.liquid_glass:
+        if not self._appearance.frosted:
             return
         self._light_position = position
         self.update()
 
     def set_light_active(self, active: bool) -> None:
-        if not self._appearance.liquid_glass:
+        if not self._appearance.frosted:
             return
         animation = self._active_hover_animation()
         target = 1.0 if active else 0.0
@@ -928,10 +869,10 @@ class _LiquidGlassSurface(QFrame):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if not self._appearance.liquid_glass:
+        if not self._appearance.frosted:
             return
         painter = QPainter(self)
-        _paint_liquid_glass_material(
+        _paint_frosted_material(
             painter,
             QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6),
             self._appearance,
@@ -943,7 +884,7 @@ class _LiquidGlassSurface(QFrame):
 def _soft_blurred_snapshot(pixmap: QPixmap) -> QPixmap:
     """Approximate a frosted background by downsampling then upsampling.
 
-    Qt Widgets does not provide CSS-style backdrop blur for another top-level
+    Qt Widgets does not provide CSS-style background blur for another top-level
     window.  Capturing the panel and blurring that app-owned snapshot gives the
     settings layer the expected disabled-background cue without screen-capture
     permissions or platform-specific APIs.
@@ -985,7 +926,7 @@ class _PanelInteractionShield(QWidget):
     def _rounded_path(self) -> QPainterPath:
         path = QPainterPath()
         rect = QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6)
-        path.addRoundedRect(rect, _LIQUID_GLASS_RADIUS, _LIQUID_GLASS_RADIUS)
+        path.addRoundedRect(rect, _FROSTED_RADIUS, _FROSTED_RADIUS)
         return path
 
     def _apply_rounded_mask(self) -> None:
@@ -1024,7 +965,7 @@ class _PanelInteractionShield(QWidget):
             else _SETTINGS_SHIELD_DARK_VEIL_ALPHA
         )
         painter.fillRect(self.rect(), veil)
-        if self._appearance.liquid_glass:
+        if self._appearance.frosted:
             highlight = QRadialGradient(
                 QPointF(self.rect().center().x(), self.rect().top() + self.height() * 0.18),
                 max(1.0, self.width() * 0.42),
@@ -1109,7 +1050,7 @@ class _SettingsCheckBox(QCheckBox):
         if checked or partially_checked:
             fill = QColor(colors.accent)
             border = QColor(colors.accent_focus if hovered or focused else colors.accent)
-        elif self._appearance.liquid_glass:
+        elif self._appearance.frosted:
             _, border = _settings_control_border_token(self._appearance)
             fill = (
                 QColor(223, 240, 255, 27)
@@ -1515,7 +1456,7 @@ class ClipDelegate(QStyledItemDelegate):
         hovered = index.row() == self.hovered_row
         colors = _theme_colors(self._appearance)
         if selected or hovered:
-            if self._appearance.liquid_glass:
+            if self._appearance.frosted:
                 if selected:
                     # Selection and hover deliberately use the same blue-tinted
                     # material language.  Selection earns its priority through
@@ -1739,7 +1680,6 @@ class SettingsDialog(QDialog):
     reveal_requested = Signal()
     accessibility_requested = Signal()
     settings_changed = Signal(object)
-    native_window_shown = Signal()
 
     _HOTKEYS = {
         "双击 Ctrl": "double:ctrl",
@@ -1764,7 +1704,6 @@ class SettingsDialog(QDialog):
         # modal validation prompt while this dialog is closing.
         self._closing = False
         self._theme_settings = settings
-        self._native_backdrop_active = False
         self._external_dismiss_filter_installed = False
         self._external_dismiss_armed = False
         self._external_dismiss_timer = QTimer(self)
@@ -1784,8 +1723,8 @@ class SettingsDialog(QDialog):
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setFixedWidth(580)
         if sys.platform == "win32":
-            # Keep an ordinary Qt backing store.  Native DWM composition is
-            # requested separately after the dialog owns a stable HWND.
+            # Keep an ordinary Qt backing store; frosted material is painted
+            # in-app and never requests DWM composition.
             self.setAutoFillBackground(True)
         else:
             # Keep the macOS top-level mode stable while the user switches
@@ -2296,38 +2235,18 @@ class SettingsDialog(QDialog):
 
         self._apply_theme(settings)
 
-    @property
-    def native_backdrop_active(self) -> bool:
-        return self._native_backdrop_active
-
-    def uses_liquid_glass_theme(self) -> bool:
-        return self._theme_settings.theme == "liquid_glass"
-
-    def set_native_backdrop_active(self, active: bool) -> None:
-        active = bool(active) and self.uses_liquid_glass_theme()
-        if active == self._native_backdrop_active:
-            return
-        self._native_backdrop_active = active
-        self._apply_theme(self._theme_settings)
-
     def _apply_theme(self, settings: AppSettings) -> None:
         self._theme_settings = settings
-        self._appearance = _theme_appearance(
-            settings,
-            native_backdrop=self._native_backdrop_active,
-        )
+        self._appearance = _theme_appearance(settings)
         self._dark_theme = self._appearance.dark
         colors = _theme_colors(self._appearance)
         if sys.platform == "win32":
             palette = self.palette()
-            palette.setColor(
-                QPalette.ColorRole.Window,
-                QColor(0, 0, 0, 0) if self._appearance.native_backdrop else QColor(colors.window),
-            )
+            palette.setColor(QPalette.ColorRole.Window, QColor(colors.window))
             self.setPalette(palette)
         else:
             # Do not toggle ``WA_TranslucentBackground`` after the window is
-            # visible: on macOS that leaves a liquid -> dark root transparent.
+            # visible: on macOS that leaves a frosted -> dark root transparent.
             # ``paintEvent`` supplies the opaque normal-theme shell instead.
             palette = self.palette()
             palette.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0, 0))
@@ -2357,7 +2276,6 @@ class SettingsDialog(QDialog):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._install_external_dismiss_filter()
-        self.native_window_shown.emit()
         QTimer.singleShot(0, self._focus_initial_control)
 
     def _focus_initial_control(self) -> None:
@@ -2382,8 +2300,8 @@ class SettingsDialog(QDialog):
         super().paintEvent(event)
         painter = QPainter(self)
         rect = QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6)
-        if self._appearance.liquid_glass:
-            _paint_liquid_glass_material(
+        if self._appearance.frosted:
+            _paint_frosted_material(
                 painter,
                 rect,
                 self._appearance,
@@ -2392,7 +2310,7 @@ class SettingsDialog(QDialog):
             return
         if sys.platform != "win32":
             # This solid app-owned shell is deliberately painted into the
-            # stable transparent top-level so a live liquid -> dark switch
+            # stable transparent top-level so a live frosted -> dark switch
             # cannot expose the system's light backing around the sections.
             painter.save()
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -2478,7 +2396,6 @@ class ClipPanel(QWidget):
         self._filter_buttons: list[tuple[QToolButton, HistoryFilter]] = []
         self._filter_index = 0
         self._dark_theme = False
-        self._native_backdrop_active = False
         self._appearance = _ThemeAppearance(dark=False)
         self._drag_offset: QPoint | None = None
         self._drag_origin: QPoint | None = None
@@ -2506,7 +2423,7 @@ class ClipPanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(*(1, 1, 1, 1) if sys.platform == "win32" else (14, 14, 14, 14))
         self._outer_layout = outer
-        self.card = _LiquidGlassSurface()
+        self.card = _FrostedSurface()
         self.card.setObjectName("card")
         self._card_shadow: QGraphicsDropShadowEffect | None = None
         if sys.platform != "win32":
@@ -2754,19 +2671,19 @@ class ClipPanel(QWidget):
         self.search.textChanged.connect(self._refresh_results)
         self.search.installEventFilter(self)
         self.list.installEventFilter(self)
-        self._install_glass_tracking()
+        self._install_frosted_tracking()
         self._settings_interaction_shield = _PanelInteractionShield(self.card)
         self._sync_settings_interaction_shield_geometry()
 
-    def _install_glass_tracking(self) -> None:
+    def _install_frosted_tracking(self) -> None:
         """Let one material shell react to pointer movement above its content."""
 
         for widget in self.findChildren(QWidget):
             widget.setMouseTracking(True)
             widget.installEventFilter(self)
 
-    def _update_glass_light(self, global_position: QPointF) -> None:
-        if not self._appearance.liquid_glass:
+    def _update_frosted_light(self, global_position: QPointF) -> None:
+        if not self._appearance.frosted:
             return
         position = self.card.mapFromGlobal(global_position.toPoint())
         self.card.set_light_position(QPointF(position))
@@ -2853,7 +2770,7 @@ class ClipPanel(QWidget):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
-            self._update_glass_light(event.globalPosition())
+            self._update_frosted_light(event.globalPosition())
         if (
             event.button() == Qt.MouseButton.LeftButton
             and self._can_start_drag(event.position().toPoint())
@@ -2869,7 +2786,7 @@ class ClipPanel(QWidget):
         if self._settings_interaction_blocked:
             event.accept()
             return
-        self._update_glass_light(event.globalPosition())
+        self._update_frosted_light(event.globalPosition())
         if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             screen = QApplication.screenAt(event.globalPosition().toPoint()) or self.screen()
             target = event.globalPosition().toPoint() - self._drag_offset
@@ -2882,7 +2799,7 @@ class ClipPanel(QWidget):
         super().enterEvent(event)
         if self._settings_interaction_blocked:
             return
-        self._update_glass_light(QPointF(QCursor.pos()))
+        self._update_frosted_light(QPointF(QCursor.pos()))
 
     def leaveEvent(self, event) -> None:
         self.card.set_light_active(False)
@@ -3058,26 +2975,20 @@ class ClipPanel(QWidget):
             self._select_for_show(restore=False)
 
     def apply_theme(self) -> None:
-        self._appearance = _theme_appearance(
-            self._settings(),
-            native_backdrop=self._native_backdrop_active,
-        )
+        self._appearance = _theme_appearance(self._settings())
         self._dark_theme = self._appearance.dark
         self.card.set_appearance(self._appearance)
         # A theme must not change the panel's visible card geometry.  On macOS
-        # the native visual-effect sibling is inset by the same 14 points, so
-        # this gutter stays transparent instead of becoming a second backdrop.
+        # the frosted custom shell uses the same 14-point gutter as ordinary
+        # themes, so the visible card size stays stable across switches.
         margins = (1, 1, 1, 1) if sys.platform == "win32" else (14, 14, 14, 14)
         self._outer_layout.setContentsMargins(*margins)
         if self._card_shadow is not None:
-            self._card_shadow.setEnabled(not self._appearance.liquid_glass)
+            self._card_shadow.setEnabled(not self._appearance.frosted)
         colors = _theme_colors(self._appearance)
         if sys.platform == "win32":
             palette = self.palette()
-            palette.setColor(
-                QPalette.ColorRole.Window,
-                QColor(0, 0, 0, 0) if self._appearance.native_backdrop else QColor(colors.window),
-            )
+            palette.setColor(QPalette.ColorRole.Window, QColor(colors.window))
             self.setPalette(palette)
         delegate = self.list.itemDelegate()
         if isinstance(delegate, ClipDelegate):
@@ -3098,20 +3009,6 @@ class ClipPanel(QWidget):
             # non-layered backing-store contract after every theme change.
             self.setAutoFillBackground(True)
         self._sync_search_box_height()
-
-    @property
-    def native_backdrop_active(self) -> bool:
-        return self._native_backdrop_active
-
-    def uses_liquid_glass_theme(self) -> bool:
-        return self._settings().theme == "liquid_glass"
-
-    def set_native_backdrop_active(self, active: bool) -> None:
-        active = bool(active) and self.uses_liquid_glass_theme()
-        if active == self._native_backdrop_active:
-            return
-        self._native_backdrop_active = active
-        self.apply_theme()
 
     def _sync_search_box_height(self) -> None:
         """Keep each search-region gap at half the visible search-text height."""
@@ -3195,7 +3092,7 @@ class ClipPanel(QWidget):
                 self._search_ime_composing = False
             return True
         if (
-            self._appearance.liquid_glass
+            self._appearance.frosted
             and isinstance(event, QMouseEvent)
             and (
                 event.type() == QEvent.Type.MouseMove
@@ -3205,7 +3102,7 @@ class ClipPanel(QWidget):
                 )
             )
         ):
-            self._update_glass_light(event.globalPosition())
+            self._update_frosted_light(event.globalPosition())
         if watched is self.search and event.type() == QEvent.Type.InputMethod:
             input_event = event if isinstance(event, QInputMethodEvent) else None
             if input_event is not None:
@@ -3718,16 +3615,14 @@ def _style_sheet(
     detail_background = "transparent"
     detail_border = "none"
     preview_rule = "background: transparent; border: none;"
-    transparent_root = appearance.native_backdrop or (
-        appearance.liquid_glass and sys.platform != "win32"
-    )
+    transparent_root = appearance.frosted and sys.platform != "win32"
     panel_window_rule = "#panelWindow { background: transparent; }" if transparent_root else ""
     dialog_background = (
         "transparent"
         if (transparent_root if dialog_transparent is None else dialog_transparent)
         else colors.window
     )
-    if appearance.liquid_glass:
+    if appearance.frosted:
         overlay = "rgba(232, 244, 255, 54)" if not appearance.dark else "rgba(223, 240, 255, 27)"
         overlay_hover = "rgba(255, 255, 255, 82)" if not appearance.dark else "rgba(230, 244, 255, 48)"
         overlay_border = "rgba(255, 255, 255, 104)" if not appearance.dark else "rgba(205, 230, 255, 68)"
@@ -3766,7 +3661,7 @@ def _style_sheet(
 
     # Settings retain their rounded grouping, but their outer rule is the same
     # quiet 1 px material divider used by the main panel.  In particular, do
-    # not reuse the luminous glass control border here: it reads as a white
+    # not reuse the luminous frosted control border here: it reads as a white
     # card outline rather than a section boundary.
     settings_border = f"1px solid {section_divider}"
     # In the frosted appearance, idle form controls use the same quiet edge as
@@ -3911,24 +3806,24 @@ def _confirmation_style_sheet(
     # rectangular surface around the card. Windows keeps its opaque backing
     # because its top-level dialog must not use Qt's layered-window path.
     dialog_background = "transparent" if sys.platform != "win32" else colors.window
-    card_background = "transparent" if appearance.liquid_glass else colors.card
-    card_border = "none" if appearance.liquid_glass else f"1px solid {colors.border}"
+    card_background = "transparent" if appearance.frosted else colors.card
+    card_border = "none" if appearance.frosted else f"1px solid {colors.border}"
     control = (
-        "rgba(232, 244, 255, 54)" if appearance.liquid_glass and not appearance.dark else colors.control
+        "rgba(232, 244, 255, 54)" if appearance.frosted and not appearance.dark else colors.control
     )
-    if appearance.liquid_glass and appearance.dark:
+    if appearance.frosted and appearance.dark:
         control = "rgba(223, 240, 255, 27)"
     control_border = (
         "rgba(255, 255, 255, 104)"
-        if appearance.liquid_glass and not appearance.dark
-        else ("rgba(205, 230, 255, 68)" if appearance.liquid_glass else colors.border)
+        if appearance.frosted and not appearance.dark
+        else ("rgba(205, 230, 255, 68)" if appearance.frosted else colors.border)
     )
     if destructive:
         # Deleting history is materially different from acknowledging a
         # validation message.  Reserve the danger token for the final action
         # so users can recognize the irreversible choice at a glance without
         # making the whole confirmation visually noisy.
-        if appearance.liquid_glass and appearance.dark:
+        if appearance.frosted and appearance.dark:
             confirm_background = "#F0838D"
             confirm_hover = "#FF9AA3"
             confirm_foreground = "#0A192F"
@@ -4136,13 +4031,11 @@ class _DestructiveConfirmationDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         requested_appearance = appearance or _ThemeAppearance(dark=dark)
-        # A transient confirmation window does not receive its own native
-        # NSVisualEffect/DWM bridge.  It must therefore render the complete
-        # in-app liquid material rather than inherit the parent's lower-alpha
-        # native-backdrop palette and look unexpectedly thin.
+        # A transient confirmation window renders the complete app-owned
+        # frosted material instead of inheriting any parent surface shortcut.
         self._appearance = _ThemeAppearance(
             dark=requested_appearance.dark,
-            liquid_glass=requested_appearance.liquid_glass,
+            frosted=requested_appearance.frosted,
         )
         self._destructive = destructive
         self.setWindowTitle(title)
@@ -4173,7 +4066,7 @@ class _DestructiveConfirmationDialog(QDialog):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 14)
-        card = _LiquidGlassSurface()
+        card = _FrostedSurface()
         card.setObjectName("confirmationCard")
         card.set_appearance(self._appearance)
         self._material_card = card
@@ -4210,7 +4103,7 @@ class _DestructiveConfirmationDialog(QDialog):
             shadow.setColor(QColor(0, 0, 0, 72 if self._appearance.dark else 48))
             card.setGraphicsEffect(shadow)
         root.addWidget(card)
-        if self._appearance.liquid_glass:
+        if self._appearance.frosted:
             self._install_material_tracking()
 
     def _install_material_tracking(self) -> None:
@@ -4228,7 +4121,7 @@ class _DestructiveConfirmationDialog(QDialog):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (
-            self._appearance.liquid_glass
+            self._appearance.frosted
             and isinstance(event, QMouseEvent)
             and (
                 event.type() == QEvent.Type.MouseMove
@@ -4247,7 +4140,7 @@ class _DestructiveConfirmationDialog(QDialog):
 
     def enterEvent(self, event) -> None:
         super().enterEvent(event)
-        if self._appearance.liquid_glass:
+        if self._appearance.frosted:
             self._update_material_light(QPointF(QCursor.pos()))
 
     def leaveEvent(self, event) -> None:

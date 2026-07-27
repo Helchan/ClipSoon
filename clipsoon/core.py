@@ -209,7 +209,7 @@ class AppSettings:
     launch_at_login: bool = False
     panel_x: int | None = None
     panel_y: int | None = None
-    theme: str = "liquid_glass"
+    theme: str = "frosted"
 
     def validated(self) -> AppSettings:
         return AppSettings(
@@ -226,11 +226,7 @@ class AppSettings:
             launch_at_login=bool(self.launch_at_login),
             panel_x=_optional_coordinate(self.panel_x),
             panel_y=_optional_coordinate(self.panel_y),
-            theme=(
-                self.theme
-                if self.theme in {"light", "dark", "liquid_glass"}
-                else "liquid_glass"
-            ),
+            theme=self.theme if self.theme in {"light", "dark", "frosted"} else "frosted",
         )
 
 

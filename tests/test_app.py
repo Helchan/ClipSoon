@@ -69,7 +69,7 @@ def test_settings_dialog_applies_changes_and_reset_without_a_save_step(qtbot, tm
     assert application.settings.value.max_history_items == 800
 
     dialog.reset_button.click()
-    assert application.settings.value.theme == "liquid_glass"
+    assert application.settings.value.theme == "frosted"
     assert application.settings.value.max_history_items == 500
     application.shutdown()
 
@@ -191,7 +191,7 @@ def test_settings_up_key_and_reset_keep_dialog_open(qtbot, tmp_path, monkeypatch
     dialog.reset_button.click()
     assert application._settings_dialog is dialog
     assert dialog.isVisible()
-    assert application.settings.value.theme == "liquid_glass"
+    assert application.settings.value.theme == "frosted"
     assert application.settings.value.max_history_items == 500
     application.shutdown()
 
@@ -366,153 +366,6 @@ def test_favorite_many_keeps_all_order_and_populates_favorite_tab(qtbot, tmp_pat
     application.panel._set_filter_kind(FAVORITES_FILTER)
     application.panel._refresh_results()
     assert application.panel.model.rowCount() == 0
-    application.shutdown()
-
-
-@pytest.mark.parametrize("theme", ("liquid_glass",))
-def test_system_appearance_signals_refresh_dynamic_theme_and_open_settings_dialog(
-    qtbot,
-    tmp_path,
-    monkeypatch,
-    theme: str,
-) -> None:
-    application = ClipSoonApplication(QApplication.instance(), tmp_path)
-    qtbot.addWidget(application.panel)
-    application.clipboard.start()
-    application.settings.update(theme=theme)
-
-    class RecordingDialog:
-        def __init__(self) -> None:
-            self.applied_settings: list[AppSettings] = []
-
-        def apply_settings(self, settings: AppSettings) -> None:
-            self.applied_settings.append(settings)
-
-    dialog = RecordingDialog()
-    application._settings_dialog = dialog  # type: ignore[assignment]
-    panel_repaints: list[None] = []
-    material_syncs: list[object] = []
-    monkeypatch.setattr(application.panel, "apply_theme", lambda: panel_repaints.append(None))
-    monkeypatch.setattr(application, "_sync_native_material", material_syncs.append)
-
-    # A single macOS/Windows appearance transition can send both notifications.
-    # They must resolve the theme only once, after the event loop returns.
-    application.qt_app.paletteChanged.emit(application.qt_app.palette())
-    application.qt_app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Dark)
-
-    qtbot.waitUntil(lambda: panel_repaints == [None], timeout=500)
-    assert dialog.applied_settings == [application.settings.value]
-    assert material_syncs == [application.panel, dialog]
-
-    application._settings_dialog = None
-    application.shutdown()
-
-
-@pytest.mark.parametrize("theme", ("light", "dark"))
-def test_system_appearance_signals_leave_explicit_theme_untouched(
-    qtbot,
-    tmp_path,
-    monkeypatch,
-    theme: str,
-) -> None:
-    application = ClipSoonApplication(QApplication.instance(), tmp_path)
-    qtbot.addWidget(application.panel)
-    application.clipboard.start()
-    application.settings.update(theme=theme)
-    panel_repaints: list[None] = []
-    material_syncs: list[object] = []
-    monkeypatch.setattr(application.panel, "apply_theme", lambda: panel_repaints.append(None))
-    monkeypatch.setattr(application, "_sync_native_material", material_syncs.append)
-
-    application.qt_app.paletteChanged.emit(application.qt_app.palette())
-    application.qt_app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Dark)
-    qtbot.wait(20)
-
-    assert panel_repaints == []
-    assert material_syncs == []
-    application.shutdown()
-
-
-def test_windows_liquid_glass_syncs_native_backdrop_and_clears_when_theme_changes(
-    qtbot,
-    tmp_path,
-    monkeypatch,
-) -> None:
-    application = ClipSoonApplication(QApplication.instance(), tmp_path)
-    qtbot.addWidget(application.panel)
-    application.clipboard.start()
-    applied: list[int] = []
-    cleared: list[int] = []
-    monkeypatch.setattr(PlatformBridge, "is_windows", lambda: True)
-    monkeypatch.setattr(
-        PlatformBridge,
-        "apply_windows_desktop_acrylic",
-        lambda identifier: applied.append(identifier) or True,
-    )
-    monkeypatch.setattr(
-        PlatformBridge,
-        "clear_windows_desktop_acrylic",
-        lambda identifier: cleared.append(identifier) or True,
-    )
-
-    application.settings.update(theme="liquid_glass")
-    application.panel.apply_theme()
-    application._sync_windows_backdrop(application.panel)
-
-    assert applied == [int(application.panel.winId())]
-    assert application.panel.native_backdrop_active
-
-    application.settings.update(theme="light")
-    application.panel.apply_theme()
-    application._sync_windows_backdrop(application.panel)
-
-    assert cleared == [int(application.panel.winId())]
-    assert not application.panel.native_backdrop_active
-    application.shutdown()
-
-
-def test_macos_native_material_matches_each_window_shell_radius(qtbot, tmp_path, monkeypatch) -> None:
-    application = ClipSoonApplication(QApplication.instance(), tmp_path)
-    qtbot.addWidget(application.panel)
-    application.clipboard.start()
-    application.settings.update(theme="liquid_glass")
-    application.panel.apply_theme()
-
-    class RecordingBackdrop:
-        def __init__(self) -> None:
-            self.applied: list[tuple[int, float, float, str]] = []
-            self.removed: list[int] = []
-
-        def apply(
-            self,
-            window_id: int,
-            *,
-            corner_radius: float,
-            content_inset: float,
-            material_role: str,
-        ):
-            self.applied.append((window_id, corner_radius, content_inset, material_role))
-            return type("Result", (), {"applied": True})()
-
-        def remove(self, window_id: int):
-            self.removed.append(window_id)
-            return type("Result", (), {"applied": True})()
-
-    backdrop = RecordingBackdrop()
-    application._macos_backdrop = backdrop  # type: ignore[assignment]
-    monkeypatch.setattr(app_module.sys, "platform", "darwin")
-
-    application._sync_native_material(application.panel)
-    dialog = SettingsDialog(AppSettings(theme="liquid_glass"), accessibility_granted=True)
-    qtbot.addWidget(dialog)
-    application._sync_native_material(dialog)
-
-    assert backdrop.applied == [
-        (int(application.panel.winId()), 18.0, 14.0, "popover"),
-        (int(dialog.winId()), 16.0, 0.0, "under_window"),
-    ]
-    assert application.panel.native_backdrop_active
-    assert dialog.native_backdrop_active
     application.shutdown()
 
 

@@ -101,22 +101,25 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
     assert observed == [value]
     unsubscribe()
     settings.update(theme="not-a-theme", hotkey="bad")
-    assert settings.value.theme == "liquid_glass"
+    assert settings.value.theme == "frosted"
     assert settings.value.hotkey == "double:ctrl"
 
 
-def test_frosted_material_theme_is_the_default_and_legacy_system_migrates(
+def test_frosted_material_theme_is_the_default_and_legacy_themes_migrate(
     tmp_path: Path,
 ) -> None:
     store = JsonSettingsStore(tmp_path / "settings.json")
     legacy = tmp_path / "settings.json"
-    legacy.write_text('{"theme": "system"}\n', encoding="utf-8")
+    legacy.write_text('{"theme": "liquid_glass"}\n', encoding="utf-8")
 
-    assert AppSettings().theme == "liquid_glass"
-    assert store.load().theme == "liquid_glass"
-    store.save(AppSettings(theme="liquid_glass"))
-    assert store.load().theme == "liquid_glass"
-    assert AppSettings(theme="liquid_glass").validated().theme == "liquid_glass"
+    assert AppSettings().theme == "frosted"
+    assert store.load().theme == "frosted"
+    legacy.write_text('{"theme": "system"}\n', encoding="utf-8")
+    assert store.load().theme == "frosted"
+    store.save(AppSettings(theme="frosted"))
+    assert store.load().theme == "frosted"
+    assert AppSettings(theme="liquid_glass").validated().theme == "frosted"
+    assert AppSettings(theme="frosted").validated().theme == "frosted"
 
 
 @pytest.mark.parametrize("payload", ["[1, 2]", "{bad", "null", '"string"'])
