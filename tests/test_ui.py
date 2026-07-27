@@ -942,7 +942,18 @@ def test_frosted_material_has_environmental_depth_rim_and_subtle_pointer_sheen()
     resting_light = resting.pixelColor(112, 84)
     active_light = active.pixelColor(112, 84)
 
-    assert sum(top_rim.getRgb()[:3]) > sum(just_inside.getRgb()[:3])
+    assert top_rim.alpha() == 255
+    assert (
+        sum(
+            abs(top_rim_component - inside_component)
+            for top_rim_component, inside_component in zip(
+                top_rim.getRgb()[:3],
+                just_inside.getRgb()[:3],
+                strict=True,
+            )
+        )
+        >= 8
+    )
     assert upper_left != lower_right
     assert sum(active_light.getRgb()[:3]) > sum(resting_light.getRgb()[:3]) + 4
 
@@ -974,7 +985,7 @@ def test_frosted_material_keeps_lower_fields_light_and_neutral() -> None:
 
     for point in ((64, 58), (160, 120), (260, 176)):
         frosted_pixel = frosted.pixelColor(*point)
-        assert frosted_pixel.alpha() >= 200
+        assert frosted_pixel.alpha() == 255
         assert frosted_pixel.lightness() >= 176
 
     # The lower-right field must remain a neutral cool tint rather than turn

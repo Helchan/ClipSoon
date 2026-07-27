@@ -686,7 +686,7 @@ def _paint_frosted_material(
     painter.setClipPath(shell)
 
     if appearance.dark:
-        base = QColor(19, 29, 43, 226)
+        base = QColor(19, 29, 43, 255)
         top_tint = QColor(85, 141, 220, 72)
         lower_tint = QColor(84, 107, 143, 62)
         warm_tint = QColor(94, 194, 186, 42)
@@ -699,7 +699,7 @@ def _paint_frosted_material(
     else:
         # Keep the lower half close to the light macOS screenshot: the material
         # should read as pale frost, not a dense blue overlay.
-        base = QColor(239, 247, 252, 236)
+        base = QColor(239, 247, 252, 255)
         top_tint = QColor(111, 169, 246, 54)
         lower_tint = QColor(208, 225, 238, 24)
         warm_tint = QColor(121, 220, 207, 24)
