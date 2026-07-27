@@ -80,6 +80,10 @@ def clip(item_id: str, text: str, updated: float) -> ClipItem:
     return ClipItem(item_id, ClipKind.TEXT, item_id, updated, updated, text=text)
 
 
+def menu_label(action) -> str:
+    return action.text().partition("\t")[0]
+
+
 def test_panel_search_keyboard_send_and_escape(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     panel.set_items([clip("old-exact", "invoice 2026", 1), clip("new-prefix", "invoice 2026 final", 2)])
@@ -217,7 +221,7 @@ def test_empty_filter_state_does_not_offer_an_irrelevant_clear_action(qtbot) -> 
 
 def test_favorites_tab_is_left_of_all_but_all_remains_default(qtbot) -> None:
     panel = ClipPanel(AppSettings)
-    favorite = clip("favorite", "favorite", 1).with_pin(True)
+    favorite = clip("favorite", "favorite", 1).with_favorite(True)
     newer = clip("newer", "newer", 2)
     panel.set_items([newer, favorite])
     qtbot.addWidget(panel)
@@ -2302,7 +2306,7 @@ def test_text_file_uses_bounded_read_only_preview(qtbot, tmp_path: Path) -> None
 @pytest.mark.parametrize(
     ("platform_name", "modifier"),
     (
-        ("darwin", Qt.KeyboardModifier.MetaModifier),
+        ("darwin", Qt.KeyboardModifier.ControlModifier),
         ("win32", Qt.KeyboardModifier.ControlModifier),
     ),
 )
@@ -2464,6 +2468,113 @@ def test_physical_ctrl_mouse_modifier_toggles_selection(qtbot) -> None:
     assert {index.row() for index in panel.list.selectionModel().selectedRows()} == {0, 1}
 
 
+def test_panel_shortcuts_select_all_and_favorite_visible_results_from_search_focus(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items(
+        [
+            clip("alpha-1", "alpha one", 3),
+            clip("beta", "beta", 2),
+            clip("alpha-2", "alpha two", 1),
+        ]
+    )
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    panel.search.setText("alpha")
+    favorite_requests: list[tuple[tuple[str, ...], bool]] = []
+    panel.favorite_requested.connect(
+        lambda items, favorite: favorite_requests.append((tuple(item.id for item in items), favorite))
+    )
+    primary = ui_module._primary_shortcut_modifiers()[0]
+
+    qtbot.keyClick(panel.search, Qt.Key.Key_A, primary)
+
+    assert [panel.model.item_at(row).id for row in range(panel.model.rowCount())] == [
+        "alpha-1",
+        "alpha-2",
+    ]
+    assert {index.row() for index in panel.list.selectionModel().selectedRows()} == {0, 1}
+
+    qtbot.keyClick(panel.search, Qt.Key.Key_D, primary)
+    qtbot.keyClick(panel.search, Qt.Key.Key_D, primary | Qt.KeyboardModifier.ShiftModifier)
+
+    assert favorite_requests == [
+        (("alpha-1", "alpha-2"), True),
+        (("alpha-1", "alpha-2"), False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("platform", "key", "modifiers"),
+    (
+        ("darwin", Qt.Key.Key_Backspace, Qt.KeyboardModifier.ControlModifier),
+        ("win32", Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier),
+    ),
+)
+def test_delete_shortcut_routes_selected_items_by_platform(
+    qtbot,
+    monkeypatch,
+    platform,
+    key,
+    modifiers,
+) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", platform)
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    selected = clip("selected", "selected", 1)
+    panel.set_items([selected])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    delete_requests: list[tuple[str, ...]] = []
+    panel.delete_requested.connect(lambda items: delete_requests.append(tuple(item.id for item in items)))
+    event = QKeyEvent(QEvent.Type.KeyPress, key, modifiers)
+
+    assert panel._handle_panel_shortcut(event)
+    assert delete_requests == [("selected",)]
+    delete_requests.clear()
+
+    qtbot.keyClick(panel.search, key, modifiers)
+    assert delete_requests == [("selected",)]
+
+
+def test_panel_shortcuts_route_clear_non_favorites_and_settings(qtbot, monkeypatch) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip("favorite", "favorite", 2).with_favorite(True), clip("ordinary", "ordinary", 1)])
+    confirmations: list[tuple[str, str]] = []
+    clear_requests: list[object] = []
+    clear_non_favorite_requests: list[bool] = []
+    settings_requests: list[bool] = []
+    panel.clear_requested.connect(clear_requests.append)
+    panel.clear_non_favorites_requested.connect(lambda: clear_non_favorite_requests.append(True))
+    panel.settings_requested.connect(lambda: settings_requests.append(True))
+
+    def confirm(parent, title, text, confirm_text, *, dark=False, appearance=None) -> bool:
+        del parent, confirm_text, dark, appearance
+        confirmations.append((title, text))
+        return True
+
+    monkeypatch.setattr(ui_module, "_confirm_destructive_action", confirm)
+    primary = ui_module._primary_shortcut_modifiers()[0]
+    clear_key = Qt.Key.Key_Backspace if sys.platform == "darwin" else Qt.Key.Key_Delete
+
+    assert panel._handle_panel_shortcut(
+        QKeyEvent(QEvent.Type.KeyPress, clear_key, primary | Qt.KeyboardModifier.ShiftModifier)
+    )
+    assert panel._handle_panel_shortcut(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_N, primary | Qt.KeyboardModifier.AltModifier)
+    )
+    assert panel._handle_panel_shortcut(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Comma, primary))
+
+    assert clear_requests == [None]
+    assert clear_non_favorite_requests == [True]
+    assert settings_requests == [True]
+    assert confirmations == [
+        ("清空历史", "清空全部剪贴板历史？此操作无法撤销。"),
+        ("清空历史", "清空所有非收藏历史？此操作无法撤销。"),
+    ]
+
+
 def test_detail_information_for_text_and_image(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
@@ -2548,6 +2659,7 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     panel.set_items([clip("selected", "item", 1)])
     (
         menu,
+        _select_all_action,
         _favorite_action,
         _unfavorite_action,
         delete_action,
@@ -2606,6 +2718,7 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
 
     (
         menu,
+        select_all_action,
         favorite_action,
         unfavorite_action,
         delete_action,
@@ -2614,8 +2727,10 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
         settings_action,
     ) = panel._create_list_menu()
     qtbot.addWidget(menu)
+    assert isinstance(menu, ui_module._CompactMenu)
 
     menu_actions = (
+        select_all_action,
         favorite_action,
         unfavorite_action,
         delete_action,
@@ -2623,7 +2738,8 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
         clear_non_favorites_action,
         settings_action,
     )
-    assert [action.text() for action in menu_actions] == [
+    assert [menu_label(action) for action in menu_actions] == [
+        "全选",
         "收藏",
         "取消收藏",
         "删除",
@@ -2631,23 +2747,38 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
         "清空NF",
         "设置",
     ]
-    assert menu.actions()[0] is favorite_action
-    assert menu.actions()[1] is unfavorite_action
-    assert menu.actions()[2].isSeparator()
-    assert menu.actions()[3] is delete_action
-    assert menu.actions()[4] is clear_action
-    assert menu.actions()[5] is clear_non_favorites_action
-    assert menu.actions()[6].isSeparator()
-    assert menu.actions()[7] is settings_action
+    expected_shortcuts = (
+        ("⌘A", "⌘D", "⇧⌘D", "⌘⌫", "⇧⌘⌫", "⌥⌘N", "⌘,")
+        if sys.platform == "darwin"
+        else ("Ctrl+A", "Ctrl+D", "Ctrl+⇧+D", "Del", "Ctrl+⇧+Del", "Ctrl+Alt+N", "Ctrl+,")
+    )
+    assert [ui_module._action_shortcut_text(action) for action in menu_actions] == list(expected_shortcuts)
+    assert menu.property(ui_module._COMPACT_MENU_TEXT_COLOR_PROPERTY) == _theme_colors(panel._appearance).text
+    assert menu.property(ui_module._COMPACT_MENU_SHORTCUT_COLOR_PROPERTY) == _theme_colors(panel._appearance).muted
+    assert (
+        menu.property(ui_module._COMPACT_MENU_SHORTCUT_COLOR_PROPERTY)
+        != menu.property(ui_module._COMPACT_MENU_TEXT_COLOR_PROPERTY)
+    )
+    assert menu.actions()[0] is select_all_action
+    assert menu.actions()[1].isSeparator()
+    assert menu.actions()[2] is favorite_action
+    assert menu.actions()[3] is unfavorite_action
+    assert menu.actions()[4].isSeparator()
+    assert menu.actions()[5] is delete_action
+    assert menu.actions()[6] is clear_action
+    assert menu.actions()[7] is clear_non_favorites_action
+    assert menu.actions()[8].isSeparator()
+    assert menu.actions()[9] is settings_action
     assert all(not action.icon().isNull() for action in menu_actions)
     assert all(action.isIconVisibleInMenu() for action in menu_actions)
     assert clear_non_favorites_action.isEnabled()
     assert favorite_action.isEnabled()
     assert not unfavorite_action.isEnabled()
 
-    panel.set_items([clip("pinned", "item", 1).with_pin(True)])
+    panel.set_items([clip("favorite", "item", 1).with_favorite(True)])
     (
         menu,
+        _select_all_action,
         favorite_action,
         unfavorite_action,
         _delete_action,
@@ -2685,6 +2816,18 @@ def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     assert f"border-radius: {ui_module._COMPACT_MENU_CORNER_RADIUS}px" in style
     assert "background: #444B5C" in style
     assert "background: #454C5C" in style
+
+
+def test_menu_shortcut_text_uses_compact_platform_labels(monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "darwin")
+    assert ui_module._menu_shortcut_text("unfavorite") == "⇧⌘D"
+    assert ui_module._menu_shortcut_text("clear") == "⇧⌘⌫"
+    assert ui_module._menu_shortcut_text("clear_non_favorites") == "⌥⌘N"
+
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    assert ui_module._menu_shortcut_text("unfavorite") == "Ctrl+⇧+D"
+    assert ui_module._menu_shortcut_text("clear") == "Ctrl+⇧+Del"
+    assert ui_module._menu_shortcut_text("clear_non_favorites") == "Ctrl+Alt+N"
 
 
 @pytest.mark.parametrize(
@@ -2761,6 +2904,7 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
     panel.search.setText("no matching text")
     (
         menu,
+        select_all_action,
         favorite_action,
         unfavorite_action,
         delete_action,
@@ -2772,7 +2916,8 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
     settings_requests: list[bool] = []
     panel.settings_requested.connect(lambda: settings_requests.append(True))
 
-    assert [action.text() for action in menu.actions() if not action.isSeparator()] == [
+    assert [menu_label(action) for action in menu.actions() if not action.isSeparator()] == [
+        "全选",
         "收藏",
         "取消收藏",
         "删除",
@@ -2780,6 +2925,7 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
         "清空NF",
         "设置",
     ]
+    assert not select_all_action.isEnabled()
     assert not delete_action.isEnabled()
     assert clear_action.isEnabled()
     assert clear_non_favorites_action.isEnabled()
@@ -2789,6 +2935,7 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
 
     panel._handle_list_menu_action(
         settings_action,
+        select_all_action,
         delete_action,
         clear_action,
         clear_non_favorites_action,
@@ -2807,6 +2954,7 @@ def test_list_context_menu_routes_favorite_signal(qtbot) -> None:
     panel.set_items([selected])
     (
         menu,
+        select_all_action,
         favorite_action,
         unfavorite_action,
         delete_action,
@@ -2822,6 +2970,7 @@ def test_list_context_menu_routes_favorite_signal(qtbot) -> None:
 
     panel._handle_list_menu_action(
         favorite_action,
+        select_all_action,
         delete_action,
         clear_action,
         clear_non_favorites_action,
@@ -2832,9 +2981,10 @@ def test_list_context_menu_routes_favorite_signal(qtbot) -> None:
 
     assert requests == [(("selected",), True)]
 
-    panel.set_items([selected.with_pin(True)])
+    panel.set_items([selected.with_favorite(True)])
     (
         menu,
+        select_all_action,
         favorite_action,
         unfavorite_action,
         delete_action,
@@ -2846,6 +2996,7 @@ def test_list_context_menu_routes_favorite_signal(qtbot) -> None:
 
     panel._handle_list_menu_action(
         unfavorite_action,
+        select_all_action,
         delete_action,
         clear_action,
         clear_non_favorites_action,

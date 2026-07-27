@@ -510,7 +510,7 @@ class ClipSoonApplication(QObject):
 
     def clear_history(self) -> None:
         self.clipboard.sync_cursor()
-        removed = self.repository.clear_unpinned()
+        removed = self.repository.clear_non_favorites()
         self._reload_history()
         self.panel.set_status(f"已清空 {removed} 条非收藏历史")
 
@@ -549,25 +549,30 @@ class ClipSoonApplication(QObject):
         self.panel.set_status(f"已记录：{item.title}")
 
     def _delete_many(self, items) -> None:
+        context = self.panel.capture_list_operation_context(items)
         removed = self.repository.delete_many(tuple(item.id for item in items))
         if removed:
-            self._reload_history()
+            self._reload_history(operation_context=context)
             self.panel.set_status(f"已删除 {removed} 条")
 
     def _favorite_many(self, items, favorite: bool) -> None:
+        context = self.panel.capture_list_operation_context(items)
         changed = 0
         for item in items:
             current = self.repository.get(item.id)
-            if current is None or current.pinned == favorite:
+            if current is None or current.is_favorite == favorite:
                 continue
-            self.repository.set_pinned(current.id, favorite)
+            self.repository.set_favorite(current.id, favorite)
             changed += 1
         if changed:
-            self._reload_history()
+            self._reload_history(operation_context=context)
             self.panel.set_status(f"已收藏 {changed} 条" if favorite else f"已取消收藏 {changed} 条")
 
-    def _reload_history(self) -> None:
-        self.panel.set_items(self.repository.list_items(self.settings.value.max_history_items + 1_000))
+    def _reload_history(self, *, operation_context=None) -> None:
+        self.panel.set_items(
+            self.repository.list_items(self.settings.value.max_history_items + 1_000),
+            operation_context=operation_context,
+        )
 
     def _toggle_capture(self, paused: bool) -> None:
         enabled = not paused

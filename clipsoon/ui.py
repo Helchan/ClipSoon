@@ -55,6 +55,7 @@ from PySide6.QtGui import (
     QPixmap,
     QRadialGradient,
     QRegion,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -202,6 +203,14 @@ class _ThemeColors:
     menu: str
     menu_hover: str
     menu_separator: str
+
+
+@dataclass(frozen=True)
+class _ListOperationContext:
+    selected_ids: tuple[str, ...]
+    current_id: str | None
+    fallback_row: int
+    scroll_value: int
 
 
 _LIGHT_COLORS = _ThemeColors(
@@ -355,6 +364,10 @@ _APP_OWNED_CARET_PROPERTY = "_clipsoon_app_owned_caret"
 _APP_OWNED_CARET_STYLE: _AppOwnedCaretStyle | None = None
 _COMPACT_MENU_PROPERTY = "_clipsoon_compact_menu"
 _COMPACT_MENU_HAS_ICONS_PROPERTY = "_clipsoon_compact_menu_has_icons"
+_COMPACT_MENU_TEXT_COLOR_PROPERTY = "_clipsoon_compact_menu_text_color"
+_COMPACT_MENU_SHORTCUT_COLOR_PROPERTY = "_clipsoon_compact_menu_shortcut_color"
+_COMPACT_MENU_DISABLED_TEXT_COLOR_PROPERTY = "_clipsoon_compact_menu_disabled_text_color"
+_COMPACT_MENU_ACTION_SHORTCUT_PROPERTY = "_clipsoon_compact_menu_action_shortcut"
 _COMPACT_MENU_ICON_SIZE = 14
 _COMPACT_MENU_ICON_GAP = 3
 _COMPACT_MENU_ICON_LEFT_OFFSET = 10
@@ -418,6 +431,46 @@ class _CompactMenuFrameFilter(QObject):
             _balance_compact_menu_action_margins(watched)
             _apply_compact_menu_mask(watched)
         return super().eventFilter(watched, event)
+
+
+class _CompactMenu(QMenu):
+    """QMenu variant with a muted, right-aligned shortcut column."""
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        shortcut_actions = [
+            action
+            for action in self.actions()
+            if not action.isSeparator() and action.isVisible() and _action_shortcut_text(action)
+        ]
+        if not shortcut_actions:
+            return
+        shortcut_color = QColor(
+            str(self.property(_COMPACT_MENU_SHORTCUT_COLOR_PROPERTY) or _theme_colors(False).muted)
+        )
+        disabled_color = QColor(
+            str(self.property(_COMPACT_MENU_DISABLED_TEXT_COLOR_PROPERTY) or shortcut_color.name())
+        )
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setFont(self.font())
+        for action in shortcut_actions:
+            rect = self.actionGeometry(action)
+            if rect.isEmpty():
+                continue
+            shortcut_rect = QRect(
+                rect.left(),
+                rect.top(),
+                rect.width() - _COMPACT_MENU_ITEM_HORIZONTAL_PADDING,
+                rect.height(),
+            )
+            painter.setPen(shortcut_color if action.isEnabled() else disabled_color)
+            painter.drawText(
+                shortcut_rect,
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                _action_shortcut_text(action),
+            )
+        painter.end()
 
 
 def _apply_compact_menu_mask(menu: QMenu) -> None:
@@ -1485,7 +1538,7 @@ class ClipDelegate(QStyledItemDelegate):
         painter.setFont(title_font)
         painter.setPen(foreground)
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter, _elide(painter, item.title, title_rect.width()))
-        if item.pinned:
+        if item.is_favorite:
             painter.setPen(foreground)
             pin_rect = QRect(rect.right() - 26, rect.center().y() - 9, 16, 18)
             painter.drawText(pin_rect, Qt.AlignmentFlag.AlignCenter, "★")
@@ -2400,6 +2453,7 @@ class ClipPanel(QWidget):
         self._drag_offset: QPoint | None = None
         self._drag_origin: QPoint | None = None
         self._settings_interaction_shield: _PanelInteractionShield | None = None
+        self._panel_shortcuts: list[QShortcut] = []
         self.setObjectName("panelWindow")
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -2417,6 +2471,7 @@ class ClipPanel(QWidget):
         self.setMinimumSize(720, 500)
         self.resize(900, 610)
         self._build()
+        self._install_panel_shortcuts()
         self.apply_theme()
 
     def _build(self) -> None:
@@ -2668,7 +2723,7 @@ class ClipPanel(QWidget):
         footer.addStretch()
         footer.addWidget(hints)
         root.addLayout(footer)
-        self.search.textChanged.connect(self._refresh_results)
+        self.search.textChanged.connect(lambda _text: self._refresh_results())
         self.search.installEventFilter(self)
         self.list.installEventFilter(self)
         self._install_frosted_tracking()
@@ -2689,7 +2744,12 @@ class ClipPanel(QWidget):
         self.card.set_light_position(QPointF(position))
         self.card.set_light_active(True)
 
-    def set_items(self, items: Sequence[ClipItem]) -> None:
+    def set_items(
+        self,
+        items: Sequence[ClipItem],
+        *,
+        operation_context: _ListOperationContext | None = None,
+    ) -> None:
         new_items = list(items)
         removed_image_paths = _item_image_paths(self._items) - _item_image_paths(new_items)
         if removed_image_paths:
@@ -2699,7 +2759,7 @@ class ClipPanel(QWidget):
             self.image_preview.invalidate_paths(removed_image_paths)
         self._items = new_items
         self._engine.replace(self._items)
-        self._refresh_results()
+        self._refresh_results(operation_context=operation_context)
 
     def set_status(self, text: str, timeout_ms: int = _STATUS_TIMEOUT_MS) -> None:
         self._status_timer.stop()
@@ -3137,6 +3197,8 @@ class ClipPanel(QWidget):
             if not self.search.hasSelectedText() and self._copy_preview_selection_if_available():
                 return True
             return super().eventFilter(watched, event)
+        if self._handle_panel_shortcut(key_event):
+            return True
         key = key_event.key()
         if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
             reverse = key == Qt.Key.Key_Backtab or bool(
@@ -3168,9 +3230,6 @@ class ClipPanel(QWidget):
             & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)
         ):
             self._move_selection(1 if key == Qt.Key.Key_Down else -1, key_event.modifiers())
-            return True
-        if watched is self.list and key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            self._request_delete_selected()
             return True
         return super().eventFilter(watched, event)
 
@@ -3243,7 +3302,7 @@ class ClipPanel(QWidget):
         button, kind = self._filter_buttons[self._filter_index]
         self._filter(kind, button)
 
-    def _refresh_results(self) -> None:
+    def _refresh_results(self, *, operation_context: _ListOperationContext | None = None) -> None:
         started = time.perf_counter()
         favorites_only = self._kind == FAVORITES_FILTER
         kind = None if favorites_only else self._kind
@@ -3256,7 +3315,9 @@ class ClipPanel(QWidget):
         )
         self.model.replace([result.item for result in results])
         self.count_label.setText(f"{len(results)} 条")
-        if results:
+        if operation_context is not None:
+            self._restore_list_operation_context(operation_context)
+        elif results:
             self.list.setCurrentIndex(self.model.index(0))
             self._selection_anchor = 0
             self._show_detail(0)
@@ -3389,6 +3450,135 @@ class ClipPanel(QWidget):
         rows = sorted(index.row() for index in self.list.selectionModel().selectedRows())
         return tuple(item for row in rows if (item := self.model.item_at(row)) is not None)
 
+    def capture_list_operation_context(
+        self,
+        affected_items: Sequence[ClipItem],
+    ) -> _ListOperationContext:
+        rows_by_id = {
+            item.id: row
+            for row in range(self.model.rowCount())
+            if (item := self.model.item_at(row)) is not None
+        }
+        selected_ids = tuple(item.id for item in self._selected_items())
+        current = self.model.item_at(self.list.currentIndex().row())
+        affected_rows = [
+            rows_by_id[item.id]
+            for item in affected_items
+            if item.id in rows_by_id
+        ]
+        current_row = rows_by_id.get(current.id, 0) if current is not None else 0
+        fallback_row = min(affected_rows) if affected_rows else current_row
+        return _ListOperationContext(
+            selected_ids=selected_ids,
+            current_id=current.id if current is not None else None,
+            fallback_row=max(0, fallback_row),
+            scroll_value=self.list.verticalScrollBar().value(),
+        )
+
+    def _restore_list_operation_context(self, context: _ListOperationContext) -> None:
+        row_count = self.model.rowCount()
+        selection_model = self.list.selectionModel()
+        if row_count <= 0:
+            selection_model.clearSelection()
+            selection_model.setCurrentIndex(QModelIndex(), QItemSelectionModel.SelectionFlag.NoUpdate)
+            self._selection_anchor = 0
+            self._show_detail(-1)
+            return
+        rows_by_id = {
+            item.id: row
+            for row in range(row_count)
+            if (item := self.model.item_at(row)) is not None
+        }
+        selected_rows = [
+            rows_by_id[item_id]
+            for item_id in context.selected_ids
+            if item_id in rows_by_id
+        ]
+        if selected_rows:
+            current_row = rows_by_id.get(context.current_id or "", selected_rows[0])
+        else:
+            current_row = min(context.fallback_row, row_count - 1)
+            selected_rows = [current_row]
+        selection_model.clearSelection()
+        for row in selected_rows:
+            selection_model.select(
+                self.model.index(row),
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+            )
+        current = self.model.index(current_row)
+        selection_model.setCurrentIndex(current, QItemSelectionModel.SelectionFlag.NoUpdate)
+        self._selection_anchor = current_row
+        self._show_detail(current_row)
+        self.list.verticalScrollBar().setValue(
+            min(context.scroll_value, self.list.verticalScrollBar().maximum())
+        )
+        self.list.scrollTo(current, QAbstractItemView.ScrollHint.EnsureVisible)
+
+    def _select_all_results(self) -> None:
+        row_count = self.model.rowCount()
+        if row_count <= 0:
+            return
+        selection_model = self.list.selectionModel()
+        current = self.list.currentIndex()
+        current_row = current.row() if current.isValid() and 0 <= current.row() < row_count else 0
+        selection_model.select(
+            QItemSelection(self.model.index(0), self.model.index(row_count - 1)),
+            QItemSelectionModel.SelectionFlag.ClearAndSelect
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        selection_model.setCurrentIndex(self.model.index(current_row), QItemSelectionModel.SelectionFlag.NoUpdate)
+        self._selection_anchor = current_row
+
+    def _install_panel_shortcuts(self) -> None:
+        shortcut_handlers = {
+            "select_all": self._select_all_results,
+            "favorite": lambda: self._request_favorite_selected(True),
+            "unfavorite": lambda: self._request_favorite_selected(False),
+            "delete": self._request_delete_selected,
+            "clear": lambda: self._request_clear_current_kind()
+            if self._has_history_in_current_kind()
+            else None,
+            "clear_non_favorites": lambda: self._request_clear_non_favorites()
+            if self._has_non_favorites()
+            else None,
+            "settings": self._request_settings,
+        }
+        for shortcut_id, handler in shortcut_handlers.items():
+            for sequence in _shortcut_sequence_texts(shortcut_id):
+                shortcut = QShortcut(QKeySequence(sequence), self)
+                shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                shortcut.activated.connect(handler)
+                self._panel_shortcuts.append(shortcut)
+
+    def _has_non_favorites(self) -> bool:
+        return any(not item.is_favorite for item in self._items)
+
+    def _handle_panel_shortcut(self, event: QKeyEvent) -> bool:
+        if _matches_select_all_shortcut(event):
+            self._select_all_results()
+            return True
+        if _matches_favorite_shortcut(event):
+            self._request_favorite_selected(True)
+            return True
+        if _matches_unfavorite_shortcut(event):
+            self._request_favorite_selected(False)
+            return True
+        if _matches_delete_shortcut(event):
+            self._request_delete_selected()
+            return True
+        if _matches_clear_shortcut(event):
+            if self._has_history_in_current_kind():
+                self._request_clear_current_kind()
+            return True
+        if _matches_clear_non_favorites_shortcut(event):
+            if self._has_non_favorites():
+                self._request_clear_non_favorites()
+            return True
+        if _matches_settings_shortcut(event):
+            self._request_settings()
+            return True
+        return False
+
     def _request_delete_selected(self) -> None:
         items = self._selected_items()
         if items:
@@ -3406,7 +3596,7 @@ class ClipPanel(QWidget):
 
     def _has_history_in_current_kind(self) -> bool:
         if self._kind == FAVORITES_FILTER:
-            return any(item.pinned for item in self._items)
+            return any(item.is_favorite for item in self._items)
         if self._kind is None:
             return bool(self._items)
         return any(item.kind is self._kind for item in self._items)
@@ -3482,31 +3672,39 @@ class ClipPanel(QWidget):
 
     def _create_list_menu(
         self,
-    ) -> tuple[QMenu, QAction, QAction, QAction, QAction, QAction, QAction]:
-        menu = QMenu(self.list)
+    ) -> tuple[QMenu, QAction, QAction, QAction, QAction, QAction, QAction, QAction]:
+        menu = _CompactMenu(self.list)
 
-        def add_menu_action(icon_name: str, text: str) -> QAction:
-            action = menu.addAction(_menu_action_icon(icon_name, self._appearance), text)
+        def add_menu_action(icon_name: str, text: str, shortcut_id: str) -> QAction:
+            action = menu.addAction(
+                _menu_action_icon(icon_name, self._appearance),
+                _menu_action_text(text, shortcut_id),
+            )
+            _set_menu_action_shortcut(action, shortcut_id)
             action.setIconVisibleInMenu(True)
             return action
 
         selected_items = self._selected_items()
-        favorite_action = add_menu_action("favorite", "收藏")
-        favorite_action.setEnabled(any(not item.pinned for item in selected_items))
-        unfavorite_action = add_menu_action("unfavorite", "取消收藏")
-        unfavorite_action.setEnabled(any(item.pinned for item in selected_items))
+        select_all_action = add_menu_action("select_all", "全选", "select_all")
+        select_all_action.setEnabled(self.model.rowCount() > 0)
         menu.addSeparator()
-        delete_action = add_menu_action("delete", "删除")
+        favorite_action = add_menu_action("favorite", "收藏", "favorite")
+        favorite_action.setEnabled(any(not item.is_favorite for item in selected_items))
+        unfavorite_action = add_menu_action("unfavorite", "取消收藏", "unfavorite")
+        unfavorite_action.setEnabled(any(item.is_favorite for item in selected_items))
+        menu.addSeparator()
+        delete_action = add_menu_action("delete", "删除", "delete")
         delete_action.setEnabled(bool(selected_items))
-        clear_action = add_menu_action("clear", "清空")
+        clear_action = add_menu_action("clear", "清空", "clear")
         clear_action.setEnabled(self._has_history_in_current_kind())
-        clear_non_favorites_action = add_menu_action("clear", "清空NF")
-        clear_non_favorites_action.setEnabled(any(not item.pinned for item in self._items))
+        clear_non_favorites_action = add_menu_action("clear", "清空NF", "clear_non_favorites")
+        clear_non_favorites_action.setEnabled(self._has_non_favorites())
         menu.addSeparator()
-        settings_action = add_menu_action("settings", "设置")
+        settings_action = add_menu_action("settings", "设置", "settings")
         _compact_menu(menu, appearance=self._appearance)
         return (
             menu,
+            select_all_action,
             favorite_action,
             unfavorite_action,
             delete_action,
@@ -3518,6 +3716,7 @@ class ClipPanel(QWidget):
     def _handle_list_menu_action(
         self,
         selected: QAction | None,
+        select_all_action: QAction,
         delete_action: QAction,
         clear_action: QAction,
         clear_non_favorites_action: QAction,
@@ -3525,7 +3724,9 @@ class ClipPanel(QWidget):
         unfavorite_action: QAction,
         settings_action: QAction,
     ) -> None:
-        if selected is delete_action:
+        if selected is select_all_action:
+            self._select_all_results()
+        elif selected is delete_action:
             self._request_delete_selected()
         elif selected is clear_action:
             self._request_clear_current_kind()
@@ -3544,6 +3745,7 @@ class ClipPanel(QWidget):
             self.list.setCurrentIndex(index)
         (
             menu,
+            select_all_action,
             favorite_action,
             unfavorite_action,
             delete_action,
@@ -3561,6 +3763,7 @@ class ClipPanel(QWidget):
         self._schedule_search_focus_restore()
         self._handle_list_menu_action(
             selected,
+            select_all_action,
             delete_action,
             clear_action,
             clear_non_favorites_action,
@@ -4189,6 +4392,60 @@ def _show_themed_warning(
     prompt.exec()
 
 
+def _menu_shortcut_text(shortcut_id: str) -> str:
+    if sys.platform == "darwin":
+        shortcuts = {
+            "select_all": "⌘A",
+            "favorite": "⌘D",
+            "unfavorite": "⇧⌘D",
+            "delete": "⌘⌫",
+            "clear": "⇧⌘⌫",
+            "clear_non_favorites": "⌥⌘N",
+            "settings": "⌘,",
+        }
+    else:
+        shortcuts = {
+            "select_all": "Ctrl+A",
+            "favorite": "Ctrl+D",
+            "unfavorite": "Ctrl+⇧+D",
+            "delete": "Del",
+            "clear": "Ctrl+⇧+Del",
+            "clear_non_favorites": "Ctrl+Alt+N",
+            "settings": "Ctrl+,",
+        }
+    return shortcuts[shortcut_id]
+
+
+def _shortcut_sequence_texts(shortcut_id: str) -> tuple[str, ...]:
+    if sys.platform == "darwin" and shortcut_id == "delete":
+        return ("Ctrl+Backspace", "Ctrl+Delete")
+    if sys.platform == "darwin" and shortcut_id == "clear":
+        return ("Ctrl+Shift+Backspace", "Ctrl+Shift+Delete")
+    shortcuts = {
+        "select_all": ("Ctrl+A",),
+        "favorite": ("Ctrl+D",),
+        "unfavorite": ("Ctrl+Shift+D",),
+        "delete": ("Delete",),
+        "clear": ("Ctrl+Shift+Delete",),
+        "clear_non_favorites": ("Ctrl+Alt+N",),
+        "settings": ("Ctrl+,",),
+    }
+    return shortcuts[shortcut_id]
+
+
+def _menu_action_text(label: str, shortcut_id: str) -> str:
+    del shortcut_id
+    return label
+
+
+def _set_menu_action_shortcut(action: QAction, shortcut_id: str) -> None:
+    action.setProperty(_COMPACT_MENU_ACTION_SHORTCUT_PROPERTY, _menu_shortcut_text(shortcut_id))
+
+
+def _action_shortcut_text(action: QAction) -> str:
+    return str(action.property(_COMPACT_MENU_ACTION_SHORTCUT_PROPERTY) or "")
+
+
 def _menu_action_icon(icon_name: str, appearance: _ThemeAppearance) -> QIcon:
     """Draw compact contextual-menu symbols in the active theme."""
 
@@ -4206,7 +4463,11 @@ def _menu_action_icon(icon_name: str, appearance: _ThemeAppearance) -> QIcon:
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
 
-    if icon_name == "delete":
+    if icon_name == "select_all":
+        painter.drawRoundedRect(QRectF(2.7, 2.7, 8.6, 8.6), 1.0, 1.0)
+        painter.drawLine(QPointF(4.7, 7.0), QPointF(6.4, 8.7))
+        painter.drawLine(QPointF(6.4, 8.7), QPointF(9.4, 5.1))
+    elif icon_name == "delete":
         painter.drawLine(QPointF(3.0, 3.0), QPointF(11.0, 11.0))
         painter.drawLine(QPointF(11.0, 3.0), QPointF(3.0, 11.0))
     elif icon_name == "clear":
@@ -4251,12 +4512,84 @@ def _matches_copy_shortcut(event: QKeyEvent) -> bool:
 
     if event.matches(QKeySequence.StandardKey.Copy):
         return True
-    primary_modifier = (
-        Qt.KeyboardModifier.MetaModifier
-        if sys.platform == "darwin"
-        else Qt.KeyboardModifier.ControlModifier
+    return _matches_primary_key(event, Qt.Key.Key_C)
+
+
+def _primary_shortcut_modifiers() -> tuple[Qt.KeyboardModifiers, ...]:
+    return (Qt.KeyboardModifier.ControlModifier,)
+
+
+def _shortcut_modifiers(event: QKeyEvent) -> Qt.KeyboardModifiers:
+    return event.modifiers() & (
+        Qt.KeyboardModifier.ControlModifier
+        | Qt.KeyboardModifier.MetaModifier
+        | Qt.KeyboardModifier.AltModifier
+        | Qt.KeyboardModifier.ShiftModifier
     )
-    return event.key() == Qt.Key.Key_C and event.modifiers() == primary_modifier
+
+
+def _matches_primary_key(
+    event: QKeyEvent,
+    key: Qt.Key,
+    *,
+    shift: bool = False,
+    alt: bool = False,
+) -> bool:
+    expected_modifiers = []
+    for modifiers in _primary_shortcut_modifiers():
+        expected = modifiers
+        if shift:
+            expected |= Qt.KeyboardModifier.ShiftModifier
+        if alt:
+            expected |= Qt.KeyboardModifier.AltModifier
+        expected_modifiers.append(expected)
+    return event.key() == key and any(
+        _shortcut_modifiers(event) == modifiers
+        for modifiers in expected_modifiers
+    )
+
+
+def _matches_select_all_shortcut(event: QKeyEvent) -> bool:
+    return _matches_primary_key(event, Qt.Key.Key_A)
+
+
+def _matches_favorite_shortcut(event: QKeyEvent) -> bool:
+    return _matches_primary_key(event, Qt.Key.Key_D)
+
+
+def _matches_unfavorite_shortcut(event: QKeyEvent) -> bool:
+    return _matches_primary_key(event, Qt.Key.Key_D, shift=True)
+
+
+def _matches_delete_shortcut(event: QKeyEvent) -> bool:
+    if sys.platform == "darwin":
+        return event.key() in {
+            Qt.Key.Key_Backspace,
+            Qt.Key.Key_Delete,
+        } and any(
+            _shortcut_modifiers(event) == modifiers
+            for modifiers in _primary_shortcut_modifiers()
+        )
+    return event.key() == Qt.Key.Key_Delete and _shortcut_modifiers(event) == Qt.KeyboardModifier.NoModifier
+
+
+def _matches_clear_shortcut(event: QKeyEvent) -> bool:
+    if sys.platform == "darwin":
+        return event.key() in {Qt.Key.Key_Backspace, Qt.Key.Key_Delete} and any(
+            _shortcut_modifiers(event) == (modifiers | Qt.KeyboardModifier.ShiftModifier)
+            for modifiers in _primary_shortcut_modifiers()
+        )
+    return event.key() == Qt.Key.Key_Delete and _shortcut_modifiers(event) == (
+        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+    )
+
+
+def _matches_clear_non_favorites_shortcut(event: QKeyEvent) -> bool:
+    return _matches_primary_key(event, Qt.Key.Key_N, alt=True)
+
+
+def _matches_settings_shortcut(event: QKeyEvent) -> bool:
+    return _matches_primary_key(event, Qt.Key.Key_Comma)
 
 
 def _compact_menu(
@@ -4286,6 +4619,9 @@ def _compact_menu(
     icon_column_width = (_COMPACT_MENU_ICON_SIZE + _COMPACT_MENU_ICON_GAP) if has_icons else 0
     menu.setProperty(_COMPACT_MENU_PROPERTY, True)
     menu.setProperty(_COMPACT_MENU_HAS_ICONS_PROPERTY, has_icons)
+    menu.setProperty(_COMPACT_MENU_TEXT_COLOR_PROPERTY, colors.text)
+    menu.setProperty(_COMPACT_MENU_SHORTCUT_COLOR_PROPERTY, colors.muted)
+    menu.setProperty(_COMPACT_MENU_DISABLED_TEXT_COLOR_PROPERTY, disabled)
     menu.setStyleSheet(
         f"QMenu {{ background: {colors.menu}; color: {colors.text}; "
         f"padding: {vertical_inset}px {shell_horizontal_inset}px; "
@@ -4307,10 +4643,15 @@ def _compact_menu(
     font.setPointSize(_POPUP_ITEM_FONT_SIZE_PT)
     menu.setFont(font)
     text_metrics = QFontMetrics(font)
-    text_width = max(
-        (text_metrics.horizontalAdvance(action.text()) for action in menu.actions() if not action.isSeparator()),
-        default=0,
-    )
+
+    def action_text_width(action: QAction) -> int:
+        shortcut = _action_shortcut_text(action)
+        label_width = text_metrics.horizontalAdvance(action.text())
+        if not shortcut:
+            return label_width
+        return label_width + 24 + text_metrics.horizontalAdvance(shortcut)
+
+    text_width = max((action_text_width(action) for action in menu.actions() if not action.isSeparator()), default=0)
     # The icon column and text gap are explicit, while shell inset, item
     # margin and item padding remain mirrored so the item hover capsule and
     # content have equal optical space on both sides.

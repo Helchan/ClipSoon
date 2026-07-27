@@ -41,7 +41,7 @@ def item(
     text: str,
     *,
     updated: float = 100,
-    pinned: bool = False,
+    is_favorite: bool = False,
     kind: ClipKind = ClipKind.TEXT,
 ) -> ClipItem:
     return ClipItem(
@@ -52,7 +52,7 @@ def item(
         updated_at=updated,
         text=text if kind is ClipKind.TEXT else "",
         files=(text,) if kind is ClipKind.FILES else (),
-        pinned=pinned,
+        is_favorite=is_favorite,
     )
 
 
@@ -67,7 +67,7 @@ def test_clip_item_presentations_and_bytes() -> None:
     assert format_bytes(0) == "0 B"
     assert format_bytes(2 * 1024**2) == "2.0 MB"
     assert format_bytes(3 * 1024**3) == "3.0 GB"
-    assert text.with_pin(True).pinned
+    assert text.with_favorite(True).is_favorite
     assert "Hello world" in text.searchable_text
     assert "/tmp/a.txt" in files.searchable_text
     assert "image" in image.searchable_text
@@ -156,7 +156,7 @@ def test_search_contract_exact_prefix_substring_subsequence_and_rejection() -> N
 
 
 def test_search_unicode_filter_browse_and_stable_tie_break() -> None:
-    text = item("b", "发布计划 ＡＢＣ", updated=10, pinned=True)
+    text = item("b", "发布计划 ＡＢＣ", updated=10, is_favorite=True)
     file_item = item("a", "/tmp/abc.txt", updated=20, kind=ClipKind.FILES)
     engine = SearchEngine([text, file_item])
     assert normalize("  ＡｂＣ  ") == "  abc  "
@@ -223,13 +223,13 @@ def test_repository_text_file_image_dedup_and_persistence(tmp_path: Path) -> Non
     image = repo.add_image(png, 2, 3)
     assert Path(image.image_path).read_bytes() == png
     assert repo.add_image(png, 2, 3).id == image.id
-    repo.set_pinned(first.id, True)
+    repo.set_favorite(first.id, True)
     repo.mark_used(first.id)
     repo.close()
 
     reopened = HistoryRepository(tmp_path, clock=clock)
     restored = reopened.get(first.id)
-    assert restored and restored.pinned and restored.use_count == 1
+    assert restored and restored.is_favorite and restored.use_count == 1
     assert reopened.delete(image.id)
     assert not reopened.delete("missing")
     assert not Path(image.image_path).exists()
@@ -256,7 +256,7 @@ def test_repository_rejects_empty_inputs_and_removes_startup_orphan(tmp_path: Pa
     repo.close()
 
 
-def test_repository_migrates_existing_history_with_revision_column(tmp_path: Path) -> None:
+def test_repository_migrates_existing_history_with_favorite_column(tmp_path: Path) -> None:
     database = sqlite3.connect(tmp_path / "history.sqlite3")
     database.execute(
         """
@@ -274,10 +274,17 @@ def test_repository_migrates_existing_history_with_revision_column(tmp_path: Pat
             source_app TEXT NOT NULL DEFAULT '',
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
-            pinned INTEGER NOT NULL DEFAULT 0,
+            favorite INTEGER NOT NULL DEFAULT 0,
             use_count INTEGER NOT NULL DEFAULT 0,
             last_used_at REAL NOT NULL DEFAULT 0
         )
+        """
+    )
+    database.execute(
+        """
+        INSERT INTO clips (
+            id, kind, content_hash, text_content, created_at, updated_at, favorite
+        ) VALUES ('legacy', 'text', 'legacy-hash', 'legacy favorite', 1, 1, 1)
         """
     )
     database.commit()
@@ -290,6 +297,9 @@ def test_repository_migrates_existing_history_with_revision_column(tmp_path: Pat
     }
 
     assert "revision" in columns
+    assert "favorite" in columns
+    legacy = repo.get("legacy")
+    assert legacy is not None and legacy.is_favorite
     assert repo.add_text("after migration").text == "after migration"
     repo.close()
 
@@ -307,7 +317,7 @@ def test_image_write_failure_does_not_leave_orphan(tmp_path: Path, monkeypatch: 
     repo.close()
 
 
-def test_cleanup_keeps_pins_and_reports_actual_count(tmp_path: Path) -> None:
+def test_cleanup_keeps_favorites_and_reports_actual_count(tmp_path: Path) -> None:
     clock = FakeClock()
     repo = HistoryRepository(tmp_path, clock=clock)
     ids = []
@@ -315,16 +325,16 @@ def test_cleanup_keeps_pins_and_reports_actual_count(tmp_path: Path) -> None:
         ids.append(repo.add_text(f"item {index}").id)
         clock.advance(86_400)
     for item_id in ids[:3]:
-        repo.set_pinned(item_id, True)
+        repo.set_favorite(item_id, True)
     deleted = repo.cleanup(max_items=2, retention_days=2)
     remaining = repo.list_items()
     assert deleted == 2
     assert {clip.id for clip in remaining} == set(ids[:3])
-    assert all(clip.pinned for clip in remaining)
+    assert all(clip.is_favorite for clip in remaining)
     repo.close()
 
 
-def test_cleanup_retention_and_clear_unpinned(tmp_path: Path) -> None:
+def test_cleanup_retention_and_clear_non_favorites(tmp_path: Path) -> None:
     clock = FakeClock()
     repo = HistoryRepository(tmp_path, clock=clock)
     old = repo.add_text("old")
@@ -332,7 +342,7 @@ def test_cleanup_retention_and_clear_unpinned(tmp_path: Path) -> None:
     recent = repo.add_text("recent")
     assert repo.cleanup(max_items=50, retention_days=2) == 1
     assert repo.get(old.id) is None
-    assert repo.clear_unpinned() == 1
+    assert repo.clear_non_favorites() == 1
     assert repo.get(recent.id) is None
     repo.close()
 
@@ -342,7 +352,7 @@ def test_batch_delete_and_clear_all(tmp_path: Path) -> None:
     first = repo.add_text("first")
     second = repo.add_text("second")
     third = repo.add_text("third")
-    repo.set_pinned(third.id, True)
+    repo.set_favorite(third.id, True)
 
     assert repo.delete_many((first.id, second.id, first.id, "missing")) == 2
     assert repo.get(first.id) is None
@@ -389,12 +399,12 @@ def test_prune_missing_file_items_keeps_complete_files_and_directories(tmp_path:
     repo.close()
 
 
-def test_prune_missing_file_items_removes_pinned_missing_file(tmp_path: Path) -> None:
+def test_prune_missing_file_items_removes_favorite_missing_file(tmp_path: Path) -> None:
     repo = HistoryRepository(tmp_path)
     file_path = tmp_path / "deleted.txt"
     file_path.write_text("deleted", encoding="utf-8")
     missing = repo.add_files((str(file_path),))
-    repo.set_pinned(missing.id, True)
+    repo.set_favorite(missing.id, True)
     file_path.unlink()
 
     assert repo.prune_missing_file_items() == (missing.id,)

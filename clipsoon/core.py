@@ -44,7 +44,7 @@ class ClipItem:
     height: int = 0
     byte_size: int = 0
     source_app: str = ""
-    pinned: bool = False
+    is_favorite: bool = False
     use_count: int = 0
     last_used_at: float = 0.0
 
@@ -88,8 +88,8 @@ class ClipItem:
         # must remain distinguishable from prefix matches.
         return " ".join(part for part in (body, self.source_app) if part)
 
-    def with_pin(self, pinned: bool) -> ClipItem:
-        return replace(self, pinned=pinned)
+    def with_favorite(self, favorite: bool) -> ClipItem:
+        return replace(self, is_favorite=favorite)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,9 +150,11 @@ class HistoryStore(Protocol):
 
     def mark_used(self, item_id: str) -> None: ...
 
-    def set_pinned(self, item_id: str, pinned: bool) -> None: ...
+    def set_favorite(self, item_id: str, favorite: bool) -> None: ...
 
     def delete(self, item_id: str) -> None: ...
+
+    def clear_non_favorites(self) -> int: ...
 
     def clear_favorites(self) -> int: ...
 
@@ -349,26 +351,36 @@ class HistoryRepository:
                     source_app TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
-                    pinned INTEGER NOT NULL DEFAULT 0,
+                    favorite INTEGER NOT NULL DEFAULT 0,
                     use_count INTEGER NOT NULL DEFAULT 0,
                     last_used_at REAL NOT NULL DEFAULT 0,
                     revision INTEGER NOT NULL DEFAULT 0
                 );
-                CREATE INDEX IF NOT EXISTS idx_clips_recent
-                    ON clips(updated_at DESC, created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_clips_kind ON clips(kind);
-                CREATE INDEX IF NOT EXISTS idx_clips_favorites_recent
-                    ON clips(pinned DESC, updated_at DESC, created_at DESC);
                 """
             )
             columns = {
                 str(row["name"])
                 for row in self._connection.execute("PRAGMA table_info(clips)").fetchall()
             }
+            if "favorite" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE clips ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"
+                )
+                columns.add("favorite")
             if "revision" not in columns:
                 self._connection.execute(
                     "ALTER TABLE clips ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
                 )
+            self._connection.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_clips_recent
+                    ON clips(updated_at DESC, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_clips_kind ON clips(kind);
+                DROP INDEX IF EXISTS idx_clips_favorites_recent;
+                CREATE INDEX idx_clips_favorites_recent
+                    ON clips(favorite DESC, updated_at DESC, created_at DESC);
+                """
+            )
 
     def list_items(self, limit: int | None = None) -> list[ClipItem]:
         sql = "SELECT * FROM clips ORDER BY updated_at DESC, created_at DESC"
@@ -542,11 +554,11 @@ class HistoryRepository:
                 (self._clock.now(), item_id),
             )
 
-    def set_pinned(self, item_id: str, pinned: bool) -> None:
+    def set_favorite(self, item_id: str, favorite: bool) -> None:
         with self._lock, self._connection:
             self._connection.execute(
-                "UPDATE clips SET pinned = ?, revision = revision + 1 WHERE id = ?",
-                (int(pinned), item_id),
+                "UPDATE clips SET favorite = ?, revision = revision + 1 WHERE id = ?",
+                (int(favorite), item_id),
             )
 
     def delete(self, item_id: str) -> bool:
@@ -578,7 +590,7 @@ class HistoryRepository:
             placeholders = ",".join("?" for _ in selected_ids)
             sql += f" AND id IN ({placeholders})"
             parameters.extend(selected_ids)
-        sql += " ORDER BY pinned DESC, updated_at DESC, created_at DESC"
+        sql += " ORDER BY favorite DESC, updated_at DESC, created_at DESC"
         with self._lock:
             rows = self._connection.execute(sql, parameters).fetchall()
 
@@ -669,24 +681,24 @@ class HistoryRepository:
             if retention_days:
                 cutoff = self._clock.now() - retention_days * 86_400
                 rows = self._connection.execute(
-                    "SELECT id FROM clips WHERE pinned = 0 AND updated_at < ?", (cutoff,)
+                    "SELECT id FROM clips WHERE favorite = 0 AND updated_at < ?", (cutoff,)
                 ).fetchall()
                 remove_ids.extend(str(row["id"]) for row in rows)
 
-            pinned_count = int(
-                self._connection.execute("SELECT COUNT(*) FROM clips WHERE pinned = 1").fetchone()[0]
+            favorite_count = int(
+                self._connection.execute("SELECT COUNT(*) FROM clips WHERE favorite = 1").fetchone()[0]
             )
-            allowed_unpinned = max(0, max_items - pinned_count)
+            allowed_non_favorites = max(0, max_items - favorite_count)
             excluded = set(remove_ids)
-            unpinned = self._connection.execute(
-                "SELECT id FROM clips WHERE pinned = 0 ORDER BY updated_at DESC"
+            non_favorites = self._connection.execute(
+                "SELECT id FROM clips WHERE favorite = 0 ORDER BY updated_at DESC"
             ).fetchall()
             kept = 0
-            for row in unpinned:
+            for row in non_favorites:
                 item_id = str(row["id"])
                 if item_id in excluded:
                     continue
-                if kept < allowed_unpinned:
+                if kept < allowed_non_favorites:
                     kept += 1
                 else:
                     remove_ids.append(item_id)
@@ -696,11 +708,11 @@ class HistoryRepository:
             deleted += int(self.delete(item_id))
         return deleted
 
-    def clear_unpinned(self) -> int:
-        return sum(int(self.delete(item.id)) for item in self.list_items() if not item.pinned)
+    def clear_non_favorites(self) -> int:
+        return sum(int(self.delete(item.id)) for item in self.list_items() if not item.is_favorite)
 
     def clear_favorites(self) -> int:
-        return sum(int(self.delete(item.id)) for item in self.list_items() if item.pinned)
+        return sum(int(self.delete(item.id)) for item in self.list_items() if item.is_favorite)
 
     def clear_all(self) -> int:
         return self.delete_many(tuple(item.id for item in self.list_items()))
@@ -756,7 +768,7 @@ class HistoryRepository:
             height=int(row["height"]),
             byte_size=int(row["byte_size"]),
             source_app=str(row["source_app"]),
-            pinned=bool(row["pinned"]),
+            is_favorite=bool(row["favorite"]),
             use_count=int(row["use_count"]),
             last_used_at=float(row["last_used_at"]),
         )

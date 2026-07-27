@@ -5,7 +5,7 @@ import time
 from dataclasses import asdict
 
 import pytest
-from PySide6.QtCore import QEvent, QPointF, QRunnable, Qt, QThreadPool
+from PySide6.QtCore import QEvent, QItemSelectionModel, QPointF, QRunnable, Qt, QThreadPool
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication
 
@@ -20,6 +20,42 @@ from clipsoon.core import (
 )
 from clipsoon.system import ForegroundTargetHandle, HotkeyActivationContext, PlatformBridge
 from clipsoon.ui import SettingsDialog
+
+
+def _select_panel_row(application: ClipSoonApplication, row: int) -> None:
+    index = application.panel.model.index(row)
+    selection = application.panel.list.selectionModel()
+    selection.clearSelection()
+    selection.select(
+        index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect
+        | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    selection.setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+
+
+def _panel_current_id(application: ClipSoonApplication) -> str | None:
+    item = application.panel.model.item_at(application.panel.list.currentIndex().row())
+    return item.id if item is not None else None
+
+
+def _panel_visible_ids(application: ClipSoonApplication) -> list[str]:
+    return [
+        item.id
+        for row in range(application.panel.model.rowCount())
+        if (item := application.panel.model.item_at(row)) is not None
+    ]
+
+
+def _add_three_ordered_texts(application: ClipSoonApplication):
+    oldest = application.repository.add_text("oldest")
+    time.sleep(0.002)
+    middle = application.repository.add_text("middle")
+    time.sleep(0.002)
+    newest = application.repository.add_text("newest")
+    application._reload_history()
+    assert _panel_visible_ids(application) == [newest.id, middle.id, oldest.id]
+    return newest, middle, oldest
 
 
 def test_windows_panel_guard_hides_on_first_outside_click_without_prior_activation() -> None:
@@ -297,20 +333,20 @@ def test_clear_current_tab_history_preserves_other_kinds(qtbot, tmp_path) -> Non
     application.shutdown()
 
 
-def test_clear_history_removes_only_unpinned_items(qtbot, tmp_path) -> None:
+def test_clear_history_removes_only_non_favorite_items(qtbot, tmp_path) -> None:
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)
     application.clipboard.start()
-    pinned = application.repository.add_text("pinned")
-    unpinned = application.repository.add_text("unpinned")
-    application.repository.set_pinned(pinned.id, True)
+    favorite = application.repository.add_text("favorite")
+    ordinary = application.repository.add_text("ordinary")
+    application.repository.set_favorite(favorite.id, True)
     application._reload_history()
 
     application.clear_history()
 
-    assert application.repository.get(pinned.id) is not None
-    assert application.repository.get(unpinned.id) is None
-    assert [item.id for item in application.panel._items] == [pinned.id]
+    assert application.repository.get(favorite.id) is not None
+    assert application.repository.get(ordinary.id) is None
+    assert [item.id for item in application.panel._items] == [favorite.id]
     assert application.panel.status.text() == "已清空 1 条非收藏历史"
     application.shutdown()
 
@@ -321,7 +357,7 @@ def test_clear_non_favorite_history_removes_only_non_favorites(qtbot, tmp_path) 
     application.clipboard.start()
     favorite = application.repository.add_text("favorite")
     ordinary = application.repository.add_text("ordinary")
-    application.repository.set_pinned(favorite.id, True)
+    application.repository.set_favorite(favorite.id, True)
     application._reload_history()
 
     application.clear_non_favorite_history()
@@ -345,7 +381,7 @@ def test_favorite_many_keeps_all_order_and_populates_favorite_tab(qtbot, tmp_pat
     application._favorite_many((older,), True)
 
     favorite = application.repository.get(older.id)
-    assert favorite is not None and favorite.pinned
+    assert favorite is not None and favorite.is_favorite
     assert [item.id for item in application.panel._items] == all_order_before
     visible_order = [
         application.panel.model.item_at(row).id
@@ -360,12 +396,50 @@ def test_favorite_many_keeps_all_order_and_populates_favorite_tab(qtbot, tmp_pat
     application._favorite_many((favorite,), False)
 
     unfavorite = application.repository.get(older.id)
-    assert unfavorite is not None and not unfavorite.pinned
+    assert unfavorite is not None and not unfavorite.is_favorite
     assert {item.id for item in application.panel._items} == {older.id, newer.id}
     assert application.panel.status.text() == "已取消收藏 1 条"
     application.panel._set_filter_kind(FAVORITES_FILTER)
     application.panel._refresh_results()
     assert application.panel.model.rowCount() == 0
+    application.shutdown()
+
+
+def test_favorite_many_preserves_current_selection_without_jumping_to_top(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+    newest, middle, oldest = _add_three_ordered_texts(application)
+    _select_panel_row(application, 1)
+
+    application._favorite_many((middle,), True)
+
+    assert application.repository.get(middle.id).is_favorite
+    assert _panel_visible_ids(application) == [newest.id, middle.id, oldest.id]
+    assert _panel_current_id(application) == middle.id
+    assert [index.row() for index in application.panel.list.selectionModel().selectedRows()] == [1]
+    application.shutdown()
+
+
+def test_delete_many_selects_next_or_previous_without_jumping_to_top(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+    newest, middle, oldest = _add_three_ordered_texts(application)
+    _select_panel_row(application, 1)
+
+    application._delete_many((middle,))
+
+    assert _panel_visible_ids(application) == [newest.id, oldest.id]
+    assert _panel_current_id(application) == oldest.id
+    assert [index.row() for index in application.panel.list.selectionModel().selectedRows()] == [1]
+
+    _select_panel_row(application, 1)
+    application._delete_many((oldest,))
+
+    assert _panel_visible_ids(application) == [newest.id]
+    assert _panel_current_id(application) == newest.id
+    assert [index.row() for index in application.panel.list.selectionModel().selectedRows()] == [0]
     application.shutdown()
 
 

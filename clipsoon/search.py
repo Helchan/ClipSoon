@@ -57,7 +57,7 @@ class SearchEngine:
         query = normalize(query)
         records = (record for record in self._records if kind is None or record.item.kind is kind)
         if favorites_only:
-            records = (record for record in records if record.item.pinned)
+            records = (record for record in records if record.item.is_favorite)
         if query:
             ranked = []
             for record in records:
