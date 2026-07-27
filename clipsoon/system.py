@@ -576,6 +576,19 @@ class GlobalHotkeyService:
             LOGGER.exception("Could not start global hotkey listener")
             self._failed(f"全局快捷键不可用：{exc}")
 
+    def update_settings(self, settings: AppSettings) -> None:
+        """Apply new hotkey settings without recreating stable native listeners."""
+
+        if sys.platform == "win32":
+            if self._windows_worker is not None:
+                self.start(settings)
+            return
+        self._machine = HotkeyStateMachine(
+            settings.hotkey,
+            settings.double_tap_interval_ms,
+            lambda: self._activated(None),
+        )
+
     def stop(self) -> None:
         if self._windows_worker is not None:
             self._windows_worker.stop()

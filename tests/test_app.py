@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import asdict
 
 import pytest
-from PySide6.QtCore import QRunnable, Qt, QThreadPool
+from PySide6.QtCore import QEvent, QPointF, QRunnable, Qt, QThreadPool
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication
 
 import clipsoon.app as app_module
@@ -86,6 +88,122 @@ def test_closing_settings_returns_focus_to_the_permanent_search_target(qtbot, tm
     qtbot.waitUntil(application.panel.search.hasFocus, timeout=500)
     assert not application.panel.search_icon.hasFocus()
     assert not application.panel._keep_open
+    application.shutdown()
+
+
+def test_open_settings_blocks_panel_hover_keyboard_and_search_input(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+    application.repository.add_text("第一条")
+    application.repository.add_text("第二条")
+    application._reload_history()
+    application.panel.show_panel()
+    qtbot.waitExposed(application.panel)
+
+    application.show_settings()
+    dialog = application._settings_dialog
+    assert dialog is not None
+    assert application.panel._settings_interaction_blocked
+    assert application.panel._settings_interaction_shield is not None
+    assert application.panel._settings_interaction_shield.isVisible()
+    assert not application.panel.search.hasFocus()
+
+    initial_text = application.panel.search.text()
+    initial_row = application.panel.list.currentIndex().row()
+    qtbot.keyClicks(application.panel.search, "blocked")
+    qtbot.keyPress(application.panel.search, Qt.Key.Key_Down)
+    qtbot.keyPress(application.panel, Qt.Key.Key_Down)
+    assert application.panel.search.text() == initial_text
+    assert application.panel.list.currentIndex().row() == initial_row
+
+    delegate = application.panel.list.itemDelegate()
+    target = application.panel.model.index(1)
+    hover_position = application.panel.list.visualRect(target).center()
+    hover_event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(hover_position),
+        QPointF(application.panel.list.viewport().mapToGlobal(hover_position)),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    assert application.panel.eventFilter(application.panel.list.viewport(), hover_event)
+    assert delegate.hovered_row == -1
+
+    dialog.reject()
+
+    qtbot.waitUntil(lambda: application._settings_dialog is None, timeout=500)
+    qtbot.waitUntil(application.panel.search.hasFocus, timeout=500)
+    assert not application.panel._settings_interaction_blocked
+    assert not application.panel._settings_interaction_shield.isVisible()
+    qtbot.keyClicks(application.panel.search, "ok")
+    assert application.panel.search.text() == "ok"
+    application.shutdown()
+
+
+def test_show_settings_centers_dialog_on_visible_panel(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.panel.show_panel()
+    qtbot.waitExposed(application.panel)
+
+    application.show_settings()
+    dialog = application._settings_dialog
+    assert dialog is not None
+    qtbot.waitExposed(dialog)
+
+    panel_center = application.panel.frameGeometry().center()
+    dialog_center = dialog.frameGeometry().center()
+    assert abs(dialog_center.x() - panel_center.x()) <= 1
+    assert abs(dialog_center.y() - panel_center.y()) <= 1
+    application.shutdown()
+
+
+def test_settings_up_key_and_reset_keep_dialog_open(qtbot, tmp_path, monkeypatch) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.settings.update(theme="dark", max_history_items=800, double_tap_interval_ms=500)
+    monkeypatch.setattr(application.hotkey, "start", lambda _settings: None)
+    application.panel.show_panel()
+    qtbot.waitExposed(application.panel)
+
+    application.show_settings()
+    dialog = application._settings_dialog
+    assert dialog is not None
+    qtbot.waitExposed(dialog)
+
+    hotkey_before = application.settings.value.hotkey
+    interval_before = application.settings.value.double_tap_interval_ms
+    qtbot.keyPress(dialog, Qt.Key.Key_Up)
+    assert application._settings_dialog is dialog
+    assert dialog.isVisible()
+    assert application.panel.isVisible()
+    assert application.settings.value.hotkey == hotkey_before
+    assert application.settings.value.double_tap_interval_ms == interval_before
+
+    dialog.reset_button.click()
+    assert application._settings_dialog is dialog
+    assert dialog.isVisible()
+    assert application.settings.value.theme == "liquid_glass"
+    assert application.settings.value.max_history_items == 500
+    application.shutdown()
+
+
+def test_settings_hotkey_restart_is_deferred_out_of_the_input_event(qtbot, tmp_path, monkeypatch) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    starts: list[AppSettings] = []
+    monkeypatch.setattr(application.hotkey, "update_settings", starts.append)
+
+    values = asdict(application.settings.value)
+    values["double_tap_interval_ms"] = 520
+    application._apply_settings(values)
+
+    assert application.settings.value.double_tap_interval_ms == 520
+    assert starts == []
+    qtbot.waitUntil(lambda: len(starts) == 1, timeout=500)
+    assert starts[0].double_tap_interval_ms == 520
     application.shutdown()
 
 

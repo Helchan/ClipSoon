@@ -144,6 +144,10 @@ class ClipSoonApplication(QObject):
         self._hotkey_health_timer = QTimer(self)
         self._hotkey_health_timer.setInterval(_HOTKEY_HEALTH_INTERVAL_MS)
         self._hotkey_health_timer.timeout.connect(self._ensure_hotkey_listener)
+        self._hotkey_restart_timer = QTimer(self)
+        self._hotkey_restart_timer.setSingleShot(True)
+        self._hotkey_restart_timer.setInterval(180)
+        self._hotkey_restart_timer.timeout.connect(self._restart_pending_hotkey)
         self._file_history_sweep_timer = QTimer(self)
         self._file_history_sweep_timer.setInterval(_FILE_HISTORY_SWEEP_INTERVAL_MS)
         self._file_history_sweep_timer.timeout.connect(self._schedule_file_history_sweep)
@@ -156,6 +160,7 @@ class ClipSoonApplication(QObject):
         self._confirmed_windows_hotkey: AppSettings | None = None
         self._pending_hotkey_rollback: AppSettings | None = None
         self._pending_hotkey_candidate = ""
+        self._pending_hotkey_restart_settings: AppSettings | None = None
         self._macos_backdrop = MacosBackdropController()
         self._settings_dialog: SettingsDialog | None = None
         self._system_theme_refresh_pending = False
@@ -397,10 +402,12 @@ class ClipSoonApplication(QObject):
 
     def show_settings(self) -> None:
         if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            self.panel.set_settings_interaction_blocked(True)
             self._settings_dialog.raise_()
             self._settings_dialog.activateWindow()
             return
         self.panel.keep_open(True)
+        self.panel.set_settings_interaction_blocked(True)
         dialog = SettingsDialog(
             self.settings.value,
             self.panel if self.panel.isVisible() else None,
@@ -422,6 +429,7 @@ class ClipSoonApplication(QObject):
                 # hierarchy.
                 self._macos_backdrop.remove(int(dialog.winId()))
             self._settings_dialog = None
+            self.panel.set_settings_interaction_blocked(False)
             self.panel.keep_open(False)
             # Dialog teardown can briefly leave the command panel without a
             # focus widget or inactive behind its just-dismissed child. Restore
@@ -433,12 +441,18 @@ class ClipSoonApplication(QObject):
             dialog.deleteLater()
 
         dialog.finished.connect(settings_finished)
+        dialog.center_on_widget(self.panel)
         dialog.show()
+        dialog.center_on_widget(self.panel)
         dialog.raise_()
         dialog.activateWindow()
 
     def _restore_panel_search_focus(self) -> None:
-        if self.panel.isVisible() and QApplication.activeModalWidget() is None:
+        if (
+            self.panel.isVisible()
+            and QApplication.activeModalWidget() is None
+            and self._settings_dialog is None
+        ):
             # On Windows, QDialog.exec() can restore its last child editor as
             # the focus widget after returning to this finally block. The
             # panel must first regain window activation; otherwise setFocus()
@@ -597,7 +611,7 @@ class ClipSoonApplication(QObject):
             if PlatformBridge.is_windows() and hotkey_changed:
                 self._pending_hotkey_rollback = self._confirmed_windows_hotkey or old
                 self._pending_hotkey_candidate = new.hotkey
-            self.hotkey.start(new)
+            self._queue_hotkey_restart(new)
         if old.capture_enabled != new.capture_enabled:
             self.clipboard.sync_cursor()
         if (
@@ -608,6 +622,20 @@ class ClipSoonApplication(QObject):
             self._reload_history()
         if launch_message:
             self.panel.set_status(launch_message)
+
+    def _queue_hotkey_restart(self, settings: AppSettings) -> None:
+        # Restarting the pynput/macOS listener synchronously from a settings
+        # key or button event can tear down its native event tap while Qt is
+        # still dispatching that input event.  Coalesce quick settings changes
+        # and restart after the UI event stack has fully unwound.
+        self._pending_hotkey_restart_settings = settings
+        self._hotkey_restart_timer.start()
+
+    def _restart_pending_hotkey(self) -> None:
+        settings = self._pending_hotkey_restart_settings
+        self._pending_hotkey_restart_settings = None
+        if settings is not None:
+            self.hotkey.update_settings(settings)
 
     def _save_panel_position(self, x: int, y: int) -> None:
         if self.settings.value.panel_x == x and self.settings.value.panel_y == y:
@@ -780,6 +808,8 @@ class ClipSoonApplication(QObject):
     def shutdown(self) -> None:
         self._panel_watch_timer.stop()
         self._hotkey_health_timer.stop()
+        self._hotkey_restart_timer.stop()
+        self._pending_hotkey_restart_settings = None
         self._file_history_sweep_timer.stop()
         self._settings_focus_restore_timer.stop()
         self._system_theme_refresh_timer.stop()
@@ -793,6 +823,7 @@ class ClipSoonApplication(QObject):
         if self._settings_dialog is not None:
             self._settings_dialog.close()
             self._settings_dialog = None
+        self.panel.set_settings_interaction_blocked(False)
         if sys.platform == "darwin":
             self._macos_backdrop.remove(int(self.panel.winId()))
         QThreadPool.globalInstance().waitForDone(3_000)

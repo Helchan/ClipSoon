@@ -30,6 +30,7 @@ from PySide6.QtGui import (
     QMouseEvent,
     QPainter,
     QPalette,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -70,6 +71,7 @@ from clipsoon.ui import (
     _style_sheet,
     _theme_colors,
     _ThemeAppearance,
+    create_tray_icon,
 )
 
 
@@ -443,7 +445,7 @@ def test_frameless_settings_footer_has_an_app_owned_close_control(qtbot) -> None
     assert dialog.close_button.geometry().right() < dialog.reset_button.geometry().left()
     assert dialog.close_button.accessibleName() == "关闭设置"
     qtbot.wait(10)
-    assert dialog.focusWidget() is (dialog.hotkey_mode or dialog.custom_hotkey)
+    assert dialog.focusWidget() is dialog
     assert not dialog.close_button.hasFocus()
     qtbot.mouseClick(dialog.close_button, Qt.MouseButton.LeftButton)
     assert dialog.result() == QDialog.DialogCode.Rejected
@@ -2417,6 +2419,48 @@ def test_detail_information_for_text_and_image(qtbot) -> None:
     assert panel.info_detail_value.text() == "2.0 KB"
 
 
+def test_settings_shield_blur_removes_readable_detail(qtbot) -> None:
+    pixmap = QPixmap(352, 88)
+    pixmap.fill(QColor("white"))
+    painter = QPainter(pixmap)
+    for x in range(0, pixmap.width(), 4):
+        color = QColor("black") if (x // 4) % 2 else QColor("white")
+        painter.fillRect(x, 0, 4, pixmap.height(), color)
+    painter.end()
+
+    blurred = ui_module._soft_blurred_snapshot(pixmap).toImage()
+    source = pixmap.toImage()
+
+    def max_neighbor_lightness_delta(image: QImage) -> int:
+        y = image.height() // 2
+        return max(
+            abs(image.pixelColor(x, y).lightness() - image.pixelColor(x + 1, y).lightness())
+            for x in range(image.width() - 1)
+        )
+
+    assert ui_module._SETTINGS_SHIELD_BLUR_DOWNSAMPLE >= 40
+    assert ui_module._SETTINGS_SHIELD_LIGHT_VEIL_ALPHA >= 180
+    assert max_neighbor_lightness_delta(source) > 200
+    assert max_neighbor_lightness_delta(blurred) < 55
+
+
+def test_tray_menu_uses_generic_show_window_label(qtbot) -> None:
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    tray, menu, actions = create_tray_icon(parent)
+    qtbot.addWidget(menu)
+
+    assert actions["show"].text() == "显示窗口"
+    assert [action.text() for action in menu.actions() if not action.isSeparator()] == [
+        "显示窗口",
+        "暂停记录",
+        "设置…",
+        "退出",
+    ]
+
+    tray.hide()
+
+
 def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     panel = ClipPanel(lambda: AppSettings(theme="light"))
     qtbot.addWidget(panel)
@@ -2429,17 +2473,27 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     expected = (
         QFontMetrics(font).horizontalAdvance("删除")
         + (ui_module._COMPACT_MENU_ICON_SIZE + ui_module._COMPACT_MENU_ICON_GAP)
-        + 2 * ui_module._COMPACT_MENU_HORIZONTAL_INSET
+        + 2
+        * (
+            ui_module._COMPACT_MENU_SHELL_HORIZONTAL_INSET
+            + ui_module._COMPACT_MENU_ITEM_HORIZONTAL_MARGIN
+            + ui_module._COMPACT_MENU_ITEM_HORIZONTAL_PADDING
+        )
     )
     assert menu.width() >= expected
     assert menu.style().pixelMetric(QStyle.PixelMetric.PM_SmallIconSize, None, menu) == 14
     assert f"font-size: {ui_module._POPUP_ITEM_FONT_SIZE_PT}pt" in menu.styleSheet()
     assert (
         f"padding: {ui_module._COMPACT_MENU_VERTICAL_INSET}px "
-        f"{ui_module._COMPACT_MENU_HORIZONTAL_INSET}px"
+        f"{ui_module._COMPACT_MENU_SHELL_HORIZONTAL_INSET}px"
     ) in menu.styleSheet()
     assert f"border-radius: {ui_module._COMPACT_MENU_CORNER_RADIUS}px" in menu.styleSheet()
-    assert "QMenu::item { padding: 6px 0px 6px 0px; border-radius: 6px; }" in menu.styleSheet()
+    assert (
+        f"QMenu::item {{ margin: 0px {ui_module._COMPACT_MENU_ITEM_HORIZONTAL_MARGIN}px; "
+        f"padding: 6px {ui_module._COMPACT_MENU_ITEM_HORIZONTAL_PADDING}px "
+        f"6px {ui_module._COMPACT_MENU_ITEM_HORIZONTAL_PADDING}px; border-radius: 6px; }}"
+    ) in menu.styleSheet()
+    assert f"QMenu::icon {{ left: {ui_module._COMPACT_MENU_ICON_LEFT_OFFSET}px; }}" in menu.styleSheet()
     assert "QMenu::item:selected" in menu.styleSheet()
     assert "background: #E0E6F3" in menu.styleSheet()
 
@@ -2447,6 +2501,7 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     qtbot.waitExposed(menu)
     action_rect = menu.actionGeometry(delete_action)
     assert action_rect.x() == menu.width() - action_rect.x() - action_rect.width()
+    assert action_rect.width() >= menu.width() - 2
     qtbot.mouseMove(menu, action_rect.center())
     qtbot.wait(20)
 

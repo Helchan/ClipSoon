@@ -238,6 +238,13 @@ _SETTINGS_THEME_OPTIONS: tuple[tuple[str, str], ...] = (
     ("深色", "dark"),
 )
 _SETTINGS_THEME_KEYS = {key for _, key in _SETTINGS_THEME_OPTIONS}
+_SETTINGS_SHIELD_BLUR_DOWNSAMPLE = 96
+_SETTINGS_SHIELD_LIGHT_VEIL = "#D8DBDF"
+_SETTINGS_SHIELD_DARK_VEIL = "#0F1724"
+_SETTINGS_SHIELD_LIGHT_VEIL_ALPHA = 230
+_SETTINGS_SHIELD_DARK_VEIL_ALPHA = 234
+_SETTINGS_SHIELD_LIGHT_GLOW_ALPHA = 16
+_SETTINGS_SHIELD_DARK_GLOW_ALPHA = 14
 
 _GLASS_LIGHT_FALLBACK_COLORS = _ThemeColors(
     window="#EEF4FF",
@@ -393,8 +400,11 @@ _APP_OWNED_CARET_STYLE: _AppOwnedCaretStyle | None = None
 _COMPACT_MENU_PROPERTY = "_clipsoon_compact_menu"
 _COMPACT_MENU_HAS_ICONS_PROPERTY = "_clipsoon_compact_menu_has_icons"
 _COMPACT_MENU_ICON_SIZE = 14
-_COMPACT_MENU_ICON_GAP = 6
-_COMPACT_MENU_HORIZONTAL_INSET = 10
+_COMPACT_MENU_ICON_GAP = 3
+_COMPACT_MENU_ICON_LEFT_OFFSET = 10
+_COMPACT_MENU_SHELL_HORIZONTAL_INSET = 0
+_COMPACT_MENU_ITEM_HORIZONTAL_MARGIN = 6
+_COMPACT_MENU_ITEM_HORIZONTAL_PADDING = 8
 _COMPACT_MENU_VERTICAL_INSET = 5
 _COMPACT_MENU_CORNER_RADIUS = 10
 _POPUP_ITEM_FONT_SIZE_PT = 12
@@ -920,6 +930,111 @@ class _LiquidGlassSurface(QFrame):
             light_position=self._light_position,
             light_strength=self._light_strength,
         )
+
+
+def _soft_blurred_snapshot(pixmap: QPixmap) -> QPixmap:
+    """Approximate a frosted background by downsampling then upsampling.
+
+    Qt Widgets does not provide CSS-style backdrop blur for another top-level
+    window.  Capturing the panel and blurring that app-owned snapshot gives the
+    settings layer the expected disabled-background cue without screen-capture
+    permissions or platform-specific APIs.
+    """
+
+    if pixmap.isNull():
+        return pixmap
+    size = pixmap.size()
+    small = pixmap.scaled(
+        QSize(
+            max(1, size.width() // _SETTINGS_SHIELD_BLUR_DOWNSAMPLE),
+            max(1, size.height() // _SETTINGS_SHIELD_BLUR_DOWNSAMPLE),
+        ),
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    blurred = small.scaled(
+        size,
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    blurred.setDevicePixelRatio(pixmap.devicePixelRatio())
+    return blurred
+
+
+class _PanelInteractionShield(QWidget):
+    """Blur and disable the command panel while settings owns interaction."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._appearance = _ThemeAppearance(dark=False)
+        self._snapshot = QPixmap()
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.hide()
+
+    def set_appearance(self, appearance: _ThemeAppearance) -> None:
+        self._appearance = appearance
+        self.update()
+
+    def refresh_from(self, source: QWidget) -> None:
+        was_visible = self.isVisible()
+        if was_visible:
+            self.hide()
+        self._snapshot = _soft_blurred_snapshot(source.grab())
+        if was_visible:
+            self.show()
+            self.raise_()
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if not self._snapshot.isNull():
+            painter.drawPixmap(self.rect(), self._snapshot)
+        colors = _theme_colors(self._appearance)
+        veil = QColor(
+            _SETTINGS_SHIELD_LIGHT_VEIL if not self._appearance.dark else _SETTINGS_SHIELD_DARK_VEIL
+        )
+        veil.setAlpha(
+            _SETTINGS_SHIELD_LIGHT_VEIL_ALPHA
+            if not self._appearance.dark
+            else _SETTINGS_SHIELD_DARK_VEIL_ALPHA
+        )
+        painter.fillRect(self.rect(), veil)
+        if self._appearance.liquid_glass:
+            highlight = QRadialGradient(
+                QPointF(self.rect().center().x(), self.rect().top() + self.height() * 0.18),
+                max(1.0, self.width() * 0.42),
+            )
+            glow = QColor(colors.accent_focus if not self._appearance.dark else colors.accent)
+            glow.setAlpha(
+                _SETTINGS_SHIELD_LIGHT_GLOW_ALPHA
+                if not self._appearance.dark
+                else _SETTINGS_SHIELD_DARK_GLOW_ALPHA
+            )
+            highlight.setColorAt(0.0, glow)
+            highlight.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillRect(self.rect(), QBrush(highlight))
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        event.accept()
+
+    def wheelEvent(self, event) -> None:
+        event.accept()
+
+    def contextMenuEvent(self, event) -> None:
+        event.accept()
 
 
 class _SettingsCheckBox(QCheckBox):
@@ -1615,11 +1730,16 @@ class SettingsDialog(QDialog):
         self._external_dismiss_timer = QTimer(self)
         self._external_dismiss_timer.setInterval(_SETTINGS_EXTERNAL_DISMISS_POLL_MS)
         self._external_dismiss_timer.timeout.connect(self._poll_external_dismiss)
+        self._external_dismiss_suppressed = False
+        self._external_dismiss_resume_timer = QTimer(self)
+        self._external_dismiss_resume_timer.setSingleShot(True)
+        self._external_dismiss_resume_timer.timeout.connect(self._resume_external_dismiss)
         self._appearance = _theme_appearance(settings)
         self._dark_theme = self._appearance.dark
         self.setObjectName("settingsDialog")
         self.setWindowTitle("ClipSoon 设置")
         self.setAccessibleName("ClipSoon 设置")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setModal(False)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setFixedWidth(580)
@@ -1891,10 +2011,12 @@ class SettingsDialog(QDialog):
 
         self._connect_immediate_changes()
         self._apply_theme(settings)
-        # A frameless dialog can otherwise place initial keyboard focus on the
-        # footer close action. Start in the first editable field instead; the
-        # close control remains available in normal tab order.
-        self._primary_focus_control: QWidget = self.hotkey_mode or self.custom_hotkey
+        # A frameless dialog can otherwise place initial keyboard focus on a
+        # footer button or the first combo box. Keep initial focus on the
+        # dialog shell itself so bare ↑/↓ cannot accidentally change settings
+        # immediately after the window opens. The controls remain available in
+        # normal tab order and by pointer.
+        self._initial_focus_control: QWidget = self
 
     def values(self) -> dict[str, object]:
         if self.hotkey_mode is None:
@@ -1981,19 +2103,24 @@ class SettingsDialog(QDialog):
 
         self._closing = True
         self._remove_external_dismiss_filter()
+        self._external_dismiss_resume_timer.stop()
         super().done(result)
 
     def closeEvent(self, event) -> None:
         self._closing = True
         self._remove_external_dismiss_filter()
+        self._external_dismiss_resume_timer.stop()
         super().closeEvent(event)
 
     def hideEvent(self, event) -> None:
         self._remove_external_dismiss_filter()
+        self._external_dismiss_resume_timer.stop()
         super().hideEvent(event)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if self._closing or not self.isVisible() or self._has_active_popup_or_child_modal():
+            return super().eventFilter(watched, event)
+        if self._external_dismiss_suppressed:
             return super().eventFilter(watched, event)
         event_type = event.type()
         if (
@@ -2031,10 +2158,19 @@ class SettingsDialog(QDialog):
             return
         self._external_dismiss_timer.stop()
         self._external_dismiss_armed = False
+        self._external_dismiss_suppressed = False
+        self._external_dismiss_resume_timer.stop()
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
         self._external_dismiss_filter_installed = False
+
+    def _suppress_external_dismiss_briefly(self) -> None:
+        self._external_dismiss_suppressed = True
+        self._external_dismiss_resume_timer.start(180)
+
+    def _resume_external_dismiss(self) -> None:
+        self._external_dismiss_suppressed = False
 
     def _has_active_popup_or_child_modal(self) -> bool:
         if QApplication.activePopupWidget() is not None:
@@ -2063,6 +2199,8 @@ class SettingsDialog(QDialog):
     ) -> bool:
         if self._closing or not self.isVisible() or self._has_active_popup_or_child_modal():
             return False
+        if self._external_dismiss_suppressed:
+            return False
         active_buttons = QApplication.mouseButtons() if buttons is None else buttons
         if not bool(active_buttons):
             self._external_dismiss_armed = True
@@ -2086,6 +2224,7 @@ class SettingsDialog(QDialog):
 
     def apply_settings(self, settings: AppSettings) -> None:
         """Reflect the persisted value while leaving the dialog open."""
+        self._suppress_external_dismiss_briefly()
         self._updating_controls = True
         try:
             hotkey = settings.hotkey
@@ -2179,11 +2318,25 @@ class SettingsDialog(QDialog):
         super().showEvent(event)
         self._install_external_dismiss_filter()
         self.native_window_shown.emit()
-        QTimer.singleShot(0, self._focus_primary_setting)
+        QTimer.singleShot(0, self._focus_initial_control)
 
-    def _focus_primary_setting(self) -> None:
+    def _focus_initial_control(self) -> None:
         if self.isVisible() and self.focusWidget() in (None, self.close_button):
-            self._primary_focus_control.setFocus(Qt.FocusReason.OtherFocusReason)
+            self._initial_focus_control.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def center_on_widget(self, anchor: QWidget | None) -> None:
+        if anchor is None or not anchor.isVisible():
+            return
+        self.adjustSize()
+        own_size = self.size()
+        anchor_geometry = anchor.frameGeometry()
+        target = anchor_geometry.center() - QPoint(own_size.width() // 2, own_size.height() // 2)
+        screen = QApplication.screenAt(anchor_geometry.center()) or anchor.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            target.setX(min(max(target.x(), available.left()), available.right() - own_size.width() + 1))
+            target.setY(min(max(target.y(), available.top()), available.bottom() - own_size.height() + 1))
+        self.move(target)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -2219,6 +2372,7 @@ class SettingsDialog(QDialog):
             painter.restore()
 
     def _reset(self) -> None:
+        self._suppress_external_dismiss_briefly()
         defaults = AppSettings(
             hotkey=WINDOWS_DEFAULT_HOTKEY if sys.platform == "win32" else AppSettings().hotkey
         )
@@ -2275,6 +2429,7 @@ class ClipPanel(QWidget):
         self._selection_hide_prepared = False
         self._search_ime_composing = False
         self._search_focus_restore_pending = False
+        self._settings_interaction_blocked = False
         self._selection_memory_timer = QTimer(self)
         self._selection_memory_timer.setSingleShot(True)
         self._selection_memory_timer.timeout.connect(self._expire_selection_memory)
@@ -2285,6 +2440,7 @@ class ClipPanel(QWidget):
         self._appearance = _ThemeAppearance(dark=False)
         self._drag_offset: QPoint | None = None
         self._drag_origin: QPoint | None = None
+        self._settings_interaction_shield: _PanelInteractionShield | None = None
         self.setObjectName("panelWindow")
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -2554,6 +2710,8 @@ class ClipPanel(QWidget):
         self.search.installEventFilter(self)
         self.list.installEventFilter(self)
         self._install_glass_tracking()
+        self._settings_interaction_shield = _PanelInteractionShield(self.card)
+        self._sync_settings_interaction_shield_geometry()
 
     def _install_glass_tracking(self) -> None:
         """Let one material shell react to pointer movement above its content."""
@@ -2637,12 +2795,18 @@ class ClipPanel(QWidget):
         self._search_ime_composing = False
         self.show()
         self.raise_()
-        self.activateWindow()
-        self.search.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
-        self._schedule_search_focus_restore()
+        if self._settings_interaction_blocked:
+            self.set_settings_interaction_blocked(True)
+        else:
+            self.activateWindow()
+            self.search.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+            self._schedule_search_focus_restore()
         return (time.perf_counter() - started) * 1_000
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._settings_interaction_blocked:
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._update_glass_light(event.globalPosition())
         if (
@@ -2657,6 +2821,9 @@ class ClipPanel(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._settings_interaction_blocked:
+            event.accept()
+            return
         self._update_glass_light(event.globalPosition())
         if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             screen = QApplication.screenAt(event.globalPosition().toPoint()) or self.screen()
@@ -2668,6 +2835,8 @@ class ClipPanel(QWidget):
 
     def enterEvent(self, event) -> None:
         super().enterEvent(event)
+        if self._settings_interaction_blocked:
+            return
         self._update_glass_light(QPointF(QCursor.pos()))
 
     def leaveEvent(self, event) -> None:
@@ -2675,6 +2844,9 @@ class ClipPanel(QWidget):
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._settings_interaction_blocked:
+            event.accept()
+            return
         if self._drag_offset is not None and event.button() == Qt.MouseButton.LeftButton:
             origin = self._drag_origin
             self._drag_offset = None
@@ -2686,7 +2858,34 @@ class ClipPanel(QWidget):
             return
         super().mouseReleaseEvent(event)
 
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self._settings_interaction_blocked:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        if self._settings_interaction_blocked:
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def inputMethodEvent(self, event: QInputMethodEvent) -> None:
+        if self._settings_interaction_blocked:
+            self._search_ime_composing = False
+            event.accept()
+            return
+        super().inputMethodEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_settings_interaction_shield_geometry()
+        if self._settings_interaction_blocked:
+            QTimer.singleShot(0, self._refresh_settings_interaction_shield)
+
     def _can_start_drag(self, position: QPoint) -> bool:
+        if self._settings_interaction_blocked:
+            return False
         widget = self.childAt(position)
         blocked = (QAbstractButton, QAbstractItemView, QLineEdit, QPlainTextEdit, QLabel, QStackedWidget)
         while widget is not None and widget is not self:
@@ -2845,6 +3044,10 @@ class ClipPanel(QWidget):
         # macOS cannot reveal its native white caret during the hidden phase.
         self._apply_search_input_palette(colors)
         self._search_caret.set_color(QColor(colors.text))
+        if self._settings_interaction_shield is not None:
+            self._settings_interaction_shield.set_appearance(self._appearance)
+            if self._settings_interaction_blocked:
+                QTimer.singleShot(0, self._refresh_settings_interaction_shield)
         if sys.platform == "win32":
             # QSS may reset this property while polishing; restore the
             # non-layered backing-store contract after every theme change.
@@ -2875,6 +3078,42 @@ class ClipPanel(QWidget):
         # deliberately borderless in every appearance.
         self.search_box.setFixedHeight(text_height * 2)
 
+    def _sync_settings_interaction_shield_geometry(self) -> None:
+        if self._settings_interaction_shield is None:
+            return
+        self._settings_interaction_shield.setGeometry(self.card.rect())
+
+    def _refresh_settings_interaction_shield(self) -> None:
+        if (
+            self._settings_interaction_shield is None
+            or not self._settings_interaction_blocked
+            or not self.isVisible()
+        ):
+            return
+        self._sync_settings_interaction_shield_geometry()
+        self._settings_interaction_shield.set_appearance(self._appearance)
+        self._settings_interaction_shield.refresh_from(self.card)
+        self._settings_interaction_shield.show()
+        self._settings_interaction_shield.raise_()
+
+    def set_settings_interaction_blocked(self, blocked: bool) -> None:
+        blocked = bool(blocked)
+        self._settings_interaction_blocked = blocked
+        if blocked:
+            self._drag_offset = None
+            self._drag_origin = None
+            self.unsetCursor()
+            delegate = self.list.itemDelegate()
+            if isinstance(delegate, ClipDelegate):
+                delegate.set_hovered_index(QModelIndex())
+            self.card.set_light_active(False)
+            self.search.clearFocus()
+            if self.isVisible():
+                self._refresh_settings_interaction_shield()
+            return
+        if self._settings_interaction_shield is not None:
+            self._settings_interaction_shield.hide()
+
     def _apply_search_input_palette(self, colors: _ThemeColors) -> None:
         """Keep the search text and themed blinking caret readable per theme."""
 
@@ -2885,6 +3124,8 @@ class ClipPanel(QWidget):
 
         if self._search_focus_restore_pending:
             return
+        if self._settings_interaction_blocked:
+            return
         self._search_focus_restore_pending = True
         QTimer.singleShot(0, self._restore_search_focus_if_panel_active)
 
@@ -2892,6 +3133,7 @@ class ClipPanel(QWidget):
         self._search_focus_restore_pending = False
         if (
             not self.isVisible()
+            or self._settings_interaction_blocked
             or not self.isActiveWindow()
             or QApplication.activeModalWidget() is not None
             or QApplication.activePopupWidget() is not None
@@ -2901,6 +3143,10 @@ class ClipPanel(QWidget):
         self.search.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if self._settings_interaction_blocked and self._is_blocked_panel_input_event(event):
+            if watched is self.search and event.type() == QEvent.Type.InputMethod:
+                self._search_ime_composing = False
+            return True
         if (
             self._appearance.liquid_glass
             and isinstance(event, QMouseEvent)
@@ -2986,7 +3232,11 @@ class ClipPanel(QWidget):
 
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
-        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+        if (
+            event.type() == QEvent.Type.ActivationChange
+            and self.isActiveWindow()
+            and not self._settings_interaction_blocked
+        ):
             self._schedule_search_focus_restore()
             return
         if (
@@ -3005,6 +3255,28 @@ class ClipPanel(QWidget):
 
     def keep_open(self, value: bool) -> None:
         self._keep_open = value
+
+    def _is_blocked_panel_input_event(self, event: QEvent) -> bool:
+        blocked_events = {
+            QEvent.Type.KeyPress,
+            QEvent.Type.KeyRelease,
+            QEvent.Type.ShortcutOverride,
+            QEvent.Type.InputMethod,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.MouseMove,
+            QEvent.Type.HoverEnter,
+            QEvent.Type.HoverMove,
+            QEvent.Type.HoverLeave,
+            QEvent.Type.Wheel,
+            QEvent.Type.ContextMenu,
+            QEvent.Type.FocusIn,
+        }
+        shortcut_event = getattr(QEvent.Type, "Shortcut", None)
+        if shortcut_event is not None:
+            blocked_events.add(shortcut_event)
+        return event.type() in blocked_events
 
     def set_native_deactivation_managed(self, value: bool) -> None:
         self._native_deactivation_managed = bool(value)
@@ -3301,7 +3573,7 @@ def create_tray_icon(parent: QWidget) -> tuple[QSystemTrayIcon, QMenu, dict[str,
     tray.setToolTip("ClipSoon")
     menu = QMenu()
     actions = {
-        "show": menu.addAction("显示 ClipSoon"),
+        "show": menu.addAction("显示窗口"),
         "pause": menu.addAction("暂停记录"),
         "settings": menu.addAction("设置…"),
     }
@@ -3983,14 +4255,15 @@ def _compact_menu(
     colors = _theme_colors(appearance)
     disabled = "#9299A9" if appearance.dark else "#757C8D"
     has_icons = any(not action.isSeparator() and not action.icon().isNull() for action in menu.actions())
-    # Icon menus use the root inset as their sole outer whitespace. Qt adds
-    # its own icon gutter inside each item, so duplicating item insets would
-    # leave a visibly oversized gap before the text and a wider right edge.
-    # Horizontal and vertical insets are split intentionally: the menu needs
-    # side breathing room without recreating large blank caps above and below.
-    horizontal_inset = _COMPACT_MENU_HORIZONTAL_INSET
+    # Keep horizontal space on the item rather than on the QMenu shell.  Qt
+    # paints the hover/active background inside the action item, so shell
+    # padding visually narrows the highlight capsule even though the popup
+    # itself has enough width.  Item margin creates the intended outer gap;
+    # item padding creates the icon/text breathing room.
+    shell_horizontal_inset = _COMPACT_MENU_SHELL_HORIZONTAL_INSET
     vertical_inset = _COMPACT_MENU_VERTICAL_INSET
-    item_inset = 0 if has_icons else 8
+    item_margin = _COMPACT_MENU_ITEM_HORIZONTAL_MARGIN
+    item_padding = _COMPACT_MENU_ITEM_HORIZONTAL_PADDING
     # Menus with icons get a 14 px icon column and a deliberate 6 px text
     # allocation; plain text menus do not reserve an empty icon gutter.
     icon_column_width = (_COMPACT_MENU_ICON_SIZE + _COMPACT_MENU_ICON_GAP) if has_icons else 0
@@ -3998,14 +4271,17 @@ def _compact_menu(
     menu.setProperty(_COMPACT_MENU_HAS_ICONS_PROPERTY, has_icons)
     menu.setStyleSheet(
         f"QMenu {{ background: {colors.menu}; color: {colors.text}; "
-        f"padding: {vertical_inset}px {horizontal_inset}px; "
+        f"padding: {vertical_inset}px {shell_horizontal_inset}px; "
         f"border: 1px solid {colors.menu_separator}; "
         f"border-radius: {_COMPACT_MENU_CORNER_RADIUS}px; "
         f"font-size: {_POPUP_ITEM_FONT_SIZE_PT}pt; }}"
-        f"QMenu::item {{ padding: 6px {item_inset}px 6px {item_inset}px; border-radius: 6px; }}"
+        f"QMenu::item {{ margin: 0px {item_margin}px; "
+        f"padding: 6px {item_padding}px 6px {item_padding}px; border-radius: 6px; }}"
         f"QMenu::item:selected {{ background: {colors.menu_hover}; color: {colors.text}; }}"
         f"QMenu::item:disabled {{ color: {disabled}; }}"
-        f"QMenu::separator {{ background: {colors.menu_separator}; height: 1px; margin: 2px {item_inset}px; }}"
+        f"QMenu::icon {{ left: {_COMPACT_MENU_ICON_LEFT_OFFSET}px; }}"
+        f"QMenu::separator {{ background: {colors.menu_separator}; height: 1px; "
+        f"margin: 2px {item_margin + item_padding}px; }}"
     )
     if not isinstance(getattr(menu, "_clipsoon_frame_filter", None), _CompactMenuFrameFilter):
         menu._clipsoon_frame_filter = _CompactMenuFrameFilter(menu)  # type: ignore[attr-defined]
@@ -4018,9 +4294,14 @@ def _compact_menu(
         (text_metrics.horizontalAdvance(action.text()) for action in menu.actions() if not action.isSeparator()),
         default=0,
     )
-    # The icon column and its text gap are explicit, while the root and item
-    # insets remain mirrored so no action has unexplained right-side padding.
-    menu.setFixedWidth(text_width + icon_column_width + 2 * (horizontal_inset + item_inset))
+    # The icon column and text gap are explicit, while shell inset, item
+    # margin and item padding remain mirrored so the item hover capsule and
+    # content have equal optical space on both sides.
+    menu.setFixedWidth(
+        text_width
+        + icon_column_width
+        + 2 * (shell_horizontal_inset + item_margin + item_padding)
+    )
     _balance_compact_menu_action_margins(menu)
 
 
