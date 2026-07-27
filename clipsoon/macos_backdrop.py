@@ -135,30 +135,19 @@ class MacosBackdropController:
                     existing.material_role == material_role
                     and self._effect_is_current_sibling(existing.effect, host, root_view, window)
                 ):
+                    self._configure_effect(
+                        modules.appkit,
+                        existing.effect,
+                        frame,
+                        corner_radius,
+                        material_role,
+                    )
                     return MacosBackdropResult(True, "already-applied")
                 existing.effect.removeFromSuperview()
                 self._effects.pop(native_view_id, None)
 
             effect = modules.appkit.NSVisualEffectView.alloc().initWithFrame_(frame)
-            effect.setAutoresizingMask_(
-                modules.appkit.NSViewWidthSizable | modules.appkit.NSViewHeightSizable
-            )
-            effect.setMaterial_(self._material_for_role(modules.appkit, material_role))
-            effect.setBlendingMode_(modules.appkit.NSVisualEffectBlendingModeBehindWindow)
-            # ClipSoon is a floating Qt Tool/NSPanel. Such a panel can remain
-            # visible without becoming the key window, where the follow-window
-            # state weakens the material enough to look like an opaque tint.
-            # Pinning the effect active keeps the documented behind-window
-            # frost stable while Qt continues to own focus and interaction.
-            effect.setState_(modules.appkit.NSVisualEffectStateActive)
-            # ``alphaValue`` is not a blur-strength control. Reducing it
-            # blends sharp, unfiltered desktop pixels back into the material.
-            # Pin the native view to full opacity and use the Qt veil above it
-            # only for the final, already-frosted contrast balance.
-            set_alpha = getattr(effect, "setAlphaValue_", None)
-            if callable(set_alpha):
-                set_alpha(1.0)
-            self._round_effect(effect, corner_radius)
+            self._configure_effect(modules.appkit, effect, frame, corner_radius, material_role)
             host.addSubview_positioned_relativeTo_(
                 effect,
                 modules.appkit.NSWindowBelow,
@@ -223,6 +212,38 @@ class MacosBackdropController:
         if material_role == _POPOVER_MATERIAL:
             return appkit.NSVisualEffectMaterialPopover
         return appkit.NSVisualEffectMaterialUnderWindowBackground
+
+    @classmethod
+    def _configure_effect(
+        cls,
+        appkit: object,
+        effect: object,
+        frame: object,
+        corner_radius: float,
+        material_role: str,
+    ) -> None:
+        """Keep a reused visual-effect sibling aligned with the Qt shell."""
+
+        set_frame = getattr(effect, "setFrame_", None)
+        if callable(set_frame):
+            set_frame(frame)
+        effect.setAutoresizingMask_(appkit.NSViewWidthSizable | appkit.NSViewHeightSizable)
+        effect.setMaterial_(cls._material_for_role(appkit, material_role))
+        effect.setBlendingMode_(appkit.NSVisualEffectBlendingModeBehindWindow)
+        # ClipSoon is a floating Qt Tool/NSPanel. Such a panel can remain
+        # visible without becoming the key window, where the follow-window
+        # state weakens the material enough to look like an opaque tint.
+        # Pinning the effect active keeps the documented behind-window frost
+        # stable while Qt continues to own focus and interaction.
+        effect.setState_(appkit.NSVisualEffectStateActive)
+        # ``alphaValue`` is not a blur-strength control. Reducing it blends
+        # sharp, unfiltered desktop pixels back into the material. Pin the
+        # native view to full opacity and use the Qt veil above it only for
+        # the final, already-frosted contrast balance.
+        set_alpha = getattr(effect, "setAlphaValue_", None)
+        if callable(set_alpha):
+            set_alpha(1.0)
+        cls._round_effect(effect, corner_radius)
 
     @staticmethod
     def _valid_content_inset(value: float) -> bool:

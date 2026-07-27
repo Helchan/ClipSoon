@@ -2444,6 +2444,25 @@ def test_settings_shield_blur_removes_readable_detail(qtbot) -> None:
     assert max_neighbor_lightness_delta(blurred) < 55
 
 
+def test_settings_interaction_shield_is_physically_rounded(qtbot) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme="liquid_glass"))
+    qtbot.addWidget(panel)
+    panel.set_items([clip("text", "content", 1)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    panel.set_settings_interaction_blocked(True)
+    shield = panel._settings_interaction_shield
+
+    assert shield is not None
+    assert shield.isVisible()
+    assert not shield.mask().contains(QPoint(0, 0))
+    assert shield.mask().contains(shield.rect().center())
+
+    panel.set_settings_interaction_blocked(False)
+    assert not shield.isVisible()
+
+
 def test_tray_menu_uses_generic_show_window_label(qtbot) -> None:
     parent = QWidget()
     qtbot.addWidget(parent)

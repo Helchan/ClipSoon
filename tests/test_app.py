@@ -193,18 +193,21 @@ def test_settings_up_key_and_reset_keep_dialog_open(qtbot, tmp_path, monkeypatch
 def test_settings_hotkey_restart_is_deferred_out_of_the_input_event(qtbot, tmp_path, monkeypatch) -> None:
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)
-    starts: list[AppSettings] = []
-    monkeypatch.setattr(application.hotkey, "update_settings", starts.append)
+    try:
+        starts: list[AppSettings] = []
+        monkeypatch.setattr(application.hotkey, "update_settings", starts.append)
 
-    values = asdict(application.settings.value)
-    values["double_tap_interval_ms"] = 520
-    application._apply_settings(values)
+        candidate_hotkey = "combo:ctrl+alt+k"
+        values = asdict(application.settings.value)
+        values["hotkey"] = candidate_hotkey
+        application._apply_settings(values)
 
-    assert application.settings.value.double_tap_interval_ms == 520
-    assert starts == []
-    qtbot.waitUntil(lambda: len(starts) == 1, timeout=500)
-    assert starts[0].double_tap_interval_ms == 520
-    application.shutdown()
+        assert application.settings.value.hotkey == candidate_hotkey
+        assert starts == []
+        qtbot.waitUntil(lambda: len(starts) == 1, timeout=500)
+        assert starts[0].hotkey == candidate_hotkey
+    finally:
+        application.shutdown()
 
 
 def test_windows_settings_close_reactivates_panel_before_restoring_search_focus(

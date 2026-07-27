@@ -477,14 +477,25 @@ class ClipSoonApplication(QObject):
         if settings.theme not in {"system", "liquid_glass"}:
             return
 
-        self.panel.apply_theme()
-        self._sync_native_material(self.panel)
-        if self._settings_dialog is not None:
+        try:
+            self.panel.apply_theme()
+            self._sync_native_material(self.panel)
+        except RuntimeError:
+            LOGGER.debug("Skipping deferred system theme refresh after panel teardown")
+            return
+
+        dialog = self._settings_dialog
+        if dialog is not None:
             # Settings are applied immediately, so reflecting the persisted
             # object keeps the currently open dialog in the same resolved
             # system appearance as the panel.
-            self._settings_dialog.apply_settings(settings)
-            self._sync_native_material(self._settings_dialog)
+            try:
+                dialog.apply_settings(settings)
+                self._sync_native_material(dialog)
+            except RuntimeError:
+                LOGGER.debug("Skipping deferred system theme refresh after settings teardown")
+                if self._settings_dialog is dialog:
+                    self._settings_dialog = None
 
     def _sync_native_material(self, window: ClipPanel | SettingsDialog) -> None:
         """Synchronize optional platform material without changing Qt window modes.

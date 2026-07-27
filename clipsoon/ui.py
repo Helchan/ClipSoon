@@ -974,6 +974,17 @@ class _PanelInteractionShield(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.hide()
 
+    def _rounded_path(self) -> QPainterPath:
+        path = QPainterPath()
+        rect = QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6)
+        path.addRoundedRect(rect, _LIQUID_GLASS_RADIUS, _LIQUID_GLASS_RADIUS)
+        return path
+
+    def _apply_rounded_mask(self) -> None:
+        if self.rect().isEmpty():
+            return
+        self.setMask(QRegion(self._rounded_path().toFillPolygon().toPolygon()))
+
     def set_appearance(self, appearance: _ThemeAppearance) -> None:
         self._appearance = appearance
         self.update()
@@ -991,6 +1002,8 @@ class _PanelInteractionShield(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setClipPath(self._rounded_path())
         if not self._snapshot.isNull():
             painter.drawPixmap(self.rect(), self._snapshot)
         colors = _theme_colors(self._appearance)
@@ -1023,6 +1036,14 @@ class _PanelInteractionShield(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         event.accept()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_rounded_mask()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._apply_rounded_mask()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         event.accept()
@@ -3113,6 +3134,8 @@ class ClipPanel(QWidget):
             return
         if self._settings_interaction_shield is not None:
             self._settings_interaction_shield.hide()
+        self.card.update()
+        self.update()
 
     def _apply_search_input_palette(self, colors: _ThemeColors) -> None:
         """Keep the search text and themed blinking caret readable per theme."""

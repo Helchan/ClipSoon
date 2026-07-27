@@ -41,6 +41,9 @@ class _FakeEffect:
         self.frame = frame
         return self
 
+    def setFrame_(self, frame: object) -> None:
+        self.frame = frame
+
     def setAutoresizingMask_(self, value: int) -> None:
         self.autoresize_mask = value
 
@@ -241,6 +244,30 @@ def test_controller_can_symmetrically_inset_the_effect_to_match_an_inner_card() 
     # The existing flexible dimensions retain the 14-point gutter after an
     # AppKit content-view resize instead of pinning the effect to one edge.
     assert effect.autoresize_mask == 3
+
+
+def test_controller_refreshes_reused_effect_geometry_and_radius() -> None:
+    _FakeEffect.instances.clear()
+    content = _FakeHost(bounds=(0, 0, 900, 610))
+    root = _FakeRootView(
+        _FakeWindow(content),
+        superview=content,
+        frame=(0, 0, 900, 610),
+    )
+    modules, _objc = _modules_for(root)
+    controller = MacosBackdropController(lambda: modules, platform="darwin")
+
+    assert controller.apply(246, corner_radius=18.0, content_inset=14.0).reason == "applied"
+    effect = _FakeEffect.instances[0]
+    root._frame = (0, 0, 920, 630)
+
+    result = controller.apply(246, corner_radius=20.0, content_inset=14.0)
+
+    assert result.applied and result.reason == "already-applied"
+    assert len(_FakeEffect.instances) == 1
+    assert effect.frame == (14.0, 14.0, 892.0, 602.0)
+    assert effect.layer().corner_radius == 20.0
+    assert not effect.removed
 
 
 def test_controller_uses_the_popover_material_for_a_contextual_floating_surface() -> None:
