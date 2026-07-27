@@ -340,13 +340,18 @@ def test_favorite_many_keeps_all_order_and_populates_favorite_tab(qtbot, tmp_pat
     older = application.repository.add_text("older")
     newer = application.repository.add_text("newer")
     application._reload_history()
+    all_order_before = [item.id for item in application.panel._items]
 
     application._favorite_many((older,), True)
 
     favorite = application.repository.get(older.id)
     assert favorite is not None and favorite.pinned
-    assert application.panel._items[0].id == newer.id
-    assert application.panel.model.item_at(0).id == newer.id
+    assert [item.id for item in application.panel._items] == all_order_before
+    visible_order = [
+        application.panel.model.item_at(row).id
+        for row in range(application.panel.model.rowCount())
+    ]
+    assert visible_order == all_order_before
     application.panel._set_filter_kind(FAVORITES_FILTER)
     application.panel._refresh_results()
     assert application.panel.model.item_at(0).id == older.id
