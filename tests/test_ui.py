@@ -2484,7 +2484,9 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     panel = ClipPanel(lambda: AppSettings(theme="light"))
     qtbot.addWidget(panel)
     panel.set_items([clip("selected", "item", 1)])
-    menu, delete_action, _clear_action, _settings_action = panel._create_list_menu()
+    menu, delete_action, _clear_action, _clear_unpinned_action, _pin_action, _settings_action = (
+        panel._create_list_menu()
+    )
     qtbot.addWidget(menu)
 
     font = QFont(menu.font())
@@ -2534,16 +2536,40 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
     qtbot.addWidget(panel)
     panel.set_items([clip("selected", "item", 1)])
 
-    menu, delete_action, clear_action, settings_action = panel._create_list_menu()
+    menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action = (
+        panel._create_list_menu()
+    )
     qtbot.addWidget(menu)
 
-    assert [action.text() for action in (delete_action, clear_action, settings_action)] == [
+    menu_actions = (
+        delete_action,
+        clear_action,
+        clear_unpinned_action,
+        pin_action,
+        settings_action,
+    )
+    assert [action.text() for action in menu_actions] == [
         "删除",
         "清空",
+        "清空NP",
+        "置顶",
         "设置",
     ]
-    assert all(not action.icon().isNull() for action in (delete_action, clear_action, settings_action))
-    assert all(action.isIconVisibleInMenu() for action in (delete_action, clear_action, settings_action))
+    assert all(not action.icon().isNull() for action in menu_actions)
+    assert all(action.isIconVisibleInMenu() for action in menu_actions)
+    assert clear_unpinned_action.isEnabled()
+    assert pin_action.isEnabled()
+    assert pin_action.data() is True
+
+    panel.set_items([clip("pinned", "item", 1).with_pin(True)])
+    menu, _delete_action, _clear_action, clear_unpinned_action, pin_action, _settings_action = (
+        panel._create_list_menu()
+    )
+    qtbot.addWidget(menu)
+
+    assert not clear_unpinned_action.isEnabled()
+    assert pin_action.text() == "取消置顶"
+    assert pin_action.data() is False
 
 
 def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
@@ -2551,6 +2577,8 @@ def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     qtbot.addWidget(menu)
     menu.addAction("删除")
     menu.addAction("清空")
+    menu.addAction("清空NP")
+    menu.addAction("置顶")
     menu.addSeparator()
     menu.addAction("设置")
 
@@ -2605,6 +2633,26 @@ def test_clear_current_tab_history_uses_its_own_confirmation_and_signal(
     assert requested == [kind]
 
 
+def test_clear_unpinned_history_uses_its_own_confirmation_and_signal(qtbot, monkeypatch) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    confirmations: list[tuple[str, str, str]] = []
+    requested: list[bool] = []
+    panel.clear_unpinned_requested.connect(lambda: requested.append(True))
+
+    def confirm(parent, title, text, confirm_text, *, dark=False, appearance=None) -> bool:
+        del parent, dark, appearance
+        confirmations.append((title, text, confirm_text))
+        return True
+
+    monkeypatch.setattr(ui_module, "_confirm_destructive_action", confirm)
+
+    panel._request_clear_unpinned()
+
+    assert confirmations == [("清空历史", "清空所有非置顶历史？此操作无法撤销。", "确定")]
+    assert requested == [True]
+
+
 def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) -> None:
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
@@ -2616,7 +2664,9 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
     )
     panel._set_filter_kind(ClipKind.TEXT)
     panel.search.setText("no matching text")
-    menu, delete_action, clear_action, settings_action = panel._create_list_menu()
+    menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action = (
+        panel._create_list_menu()
+    )
     qtbot.addWidget(menu)
     settings_requests: list[bool] = []
     panel.settings_requested.connect(lambda: settings_requests.append(True))
@@ -2624,15 +2674,50 @@ def test_list_context_menu_keeps_clear_scoped_to_tab_and_routes_settings(qtbot) 
     assert [action.text() for action in menu.actions() if not action.isSeparator()] == [
         "删除",
         "清空",
+        "清空NP",
+        "置顶",
         "设置",
     ]
     assert not delete_action.isEnabled()
     assert clear_action.isEnabled()
+    assert clear_unpinned_action.isEnabled()
+    assert not pin_action.isEnabled()
     assert settings_action.isEnabled()
 
-    panel._handle_list_menu_action(settings_action, delete_action, clear_action, settings_action)
+    panel._handle_list_menu_action(
+        settings_action,
+        delete_action,
+        clear_action,
+        clear_unpinned_action,
+        pin_action,
+        settings_action,
+    )
 
     assert settings_requests == [True]
+
+
+def test_list_context_menu_routes_pin_signal(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    selected = clip("selected", "item", 1)
+    panel.set_items([selected])
+    menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action = (
+        panel._create_list_menu()
+    )
+    qtbot.addWidget(menu)
+    requests: list[tuple[tuple[str, ...], bool]] = []
+    panel.pin_requested.connect(lambda items, pinned: requests.append((tuple(item.id for item in items), pinned)))
+
+    panel._handle_list_menu_action(
+        pin_action,
+        delete_action,
+        clear_action,
+        clear_unpinned_action,
+        pin_action,
+        settings_action,
+    )
+
+    assert requests == [(("selected",), True)]
 
 
 def test_filter_and_list_background_align_with_borderless_search_region(qtbot) -> None:

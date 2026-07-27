@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def test_release_version_is_consistent() -> None:
     project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert __version__ == "1.0.0"
+    assert __version__ == "1.0.1"
     assert project["project"]["version"] == __version__
 
 

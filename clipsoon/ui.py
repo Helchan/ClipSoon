@@ -2422,7 +2422,9 @@ class ClipPanel(QWidget):
     send_requested = Signal(object)
     settings_requested = Signal()
     delete_requested = Signal(object)
+    pin_requested = Signal(object, bool)
     clear_requested = Signal(object)
+    clear_unpinned_requested = Signal()
     accessibility_requested = Signal()
     position_changed = Signal(int, int)
 
@@ -3464,6 +3466,11 @@ class ClipPanel(QWidget):
         if items:
             self.delete_requested.emit(items)
 
+    def _request_pin_selected(self, pinned: bool) -> None:
+        items = self._selected_items()
+        if items:
+            self.pin_requested.emit(items, pinned)
+
     def _request_settings(self) -> None:
         """Open settings through the same signal used by the search icon."""
 
@@ -3490,6 +3497,16 @@ class ClipPanel(QWidget):
             appearance=self._appearance,
         ):
             self.clear_requested.emit(kind)
+
+    def _request_clear_unpinned(self) -> None:
+        if _confirm_destructive_action(
+            self,
+            "清空历史",
+            "清空所有非置顶历史？此操作无法撤销。",
+            "确定",
+            appearance=self._appearance,
+        ):
+            self.clear_unpinned_requested.emit()
 
     def _clear_search_selection_for_preview(self, preview: QPlainTextEdit) -> None:
         """Let a newly selected preview range be the intended copy target.
@@ -3532,7 +3549,7 @@ class ClipPanel(QWidget):
         menu, _copy_action, _select_all_action = self._create_preview_menu(preview)
         menu.exec(preview.mapToGlobal(position))
 
-    def _create_list_menu(self) -> tuple[QMenu, QAction, QAction, QAction]:
+    def _create_list_menu(self) -> tuple[QMenu, QAction, QAction, QAction, QAction, QAction]:
         menu = QMenu(self.list)
 
         def add_menu_action(icon_name: str, text: str) -> QAction:
@@ -3540,26 +3557,39 @@ class ClipPanel(QWidget):
             action.setIconVisibleInMenu(True)
             return action
 
+        selected_items = self._selected_items()
         delete_action = add_menu_action("delete", "删除")
-        delete_action.setEnabled(bool(self._selected_items()))
+        delete_action.setEnabled(bool(selected_items))
         clear_action = add_menu_action("clear", "清空")
         clear_action.setEnabled(self._has_history_in_current_kind())
+        clear_unpinned_action = add_menu_action("clear", "清空NP")
+        clear_unpinned_action.setEnabled(any(not item.pinned for item in self._items))
+        pin_to = True if not selected_items else any(not item.pinned for item in selected_items)
+        pin_action = add_menu_action("pin", "置顶" if pin_to else "取消置顶")
+        pin_action.setEnabled(bool(selected_items))
+        pin_action.setData(pin_to)
         menu.addSeparator()
         settings_action = add_menu_action("settings", "设置")
         _compact_menu(menu, appearance=self._appearance)
-        return menu, delete_action, clear_action, settings_action
+        return menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action
 
     def _handle_list_menu_action(
         self,
         selected: QAction | None,
         delete_action: QAction,
         clear_action: QAction,
+        clear_unpinned_action: QAction,
+        pin_action: QAction,
         settings_action: QAction,
     ) -> None:
         if selected is delete_action:
             self._request_delete_selected()
         elif selected is clear_action:
             self._request_clear_current_kind()
+        elif selected is clear_unpinned_action:
+            self._request_clear_unpinned()
+        elif selected is pin_action:
+            self._request_pin_selected(bool(pin_action.data()))
         elif selected is settings_action:
             self._request_settings()
 
@@ -3567,7 +3597,9 @@ class ClipPanel(QWidget):
         index = self.list.indexAt(position)
         if index.isValid() and not self.list.selectionModel().isSelected(index):
             self.list.setCurrentIndex(index)
-        menu, delete_action, clear_action, settings_action = self._create_list_menu()
+        menu, delete_action, clear_action, clear_unpinned_action, pin_action, settings_action = (
+            self._create_list_menu()
+        )
         selected = menu.exec(self.list.viewport().mapToGlobal(position))
         # QMenu closes in a nested event loop and can leave the panel with no
         # focus widget or inactive state even when the list itself is NoFocus.
@@ -3576,7 +3608,14 @@ class ClipPanel(QWidget):
         if self.isVisible():
             self.activateWindow()
         self._schedule_search_focus_restore()
-        self._handle_list_menu_action(selected, delete_action, clear_action, settings_action)
+        self._handle_list_menu_action(
+            selected,
+            delete_action,
+            clear_action,
+            clear_unpinned_action,
+            pin_action,
+            settings_action,
+        )
 
 
 def create_tray_icon(parent: QWidget) -> tuple[QSystemTrayIcon, QMenu, dict[str, QAction]]:
@@ -4203,7 +4242,7 @@ def _show_themed_warning(
 
 
 def _menu_action_icon(icon_name: str, appearance: _ThemeAppearance) -> QIcon:
-    """Draw the three compact contextual-menu symbols in the active theme."""
+    """Draw compact contextual-menu symbols in the active theme."""
 
     logical_size = _COMPACT_MENU_ICON_SIZE
     device_scale = 2
@@ -4228,6 +4267,16 @@ def _menu_action_icon(icon_name: str, appearance: _ThemeAppearance) -> QIcon:
         painter.drawRoundedRect(QRectF(3.7, 4.5, 6.6, 7.0), 1.1, 1.1)
         painter.drawLine(QPointF(6.0, 6.3), QPointF(6.0, 9.9))
         painter.drawLine(QPointF(8.0, 6.3), QPointF(8.0, 9.9))
+    elif icon_name == "pin":
+        head = QPainterPath()
+        head.moveTo(5.0, 2.9)
+        head.lineTo(10.0, 5.0)
+        head.lineTo(8.1, 8.0)
+        head.lineTo(4.1, 6.4)
+        head.closeSubpath()
+        painter.fillPath(head, color)
+        painter.drawLine(QPointF(6.0, 7.0), QPointF(3.1, 11.2))
+        painter.drawLine(QPointF(7.2, 7.4), QPointF(10.6, 10.8))
     elif icon_name == "settings":
         # Six short rectangular teeth make this read as a cog rather than a
         # crosshair, while retaining the menu's restrained monochrome weight.

@@ -239,7 +239,9 @@ class ClipSoonApplication(QObject):
         self.panel.send_requested.connect(lambda item: self.sender.send(item, self.target))
         self.panel.settings_requested.connect(self.show_settings)
         self.panel.delete_requested.connect(self._delete_many)
+        self.panel.pin_requested.connect(self._pin_many)
         self.panel.clear_requested.connect(self.clear_current_tab_history)
+        self.panel.clear_unpinned_requested.connect(self.clear_history)
         self.panel.accessibility_requested.connect(self.open_accessibility_settings)
         self.panel.position_changed.connect(self._save_panel_position)
         self.sender.finished.connect(self._send_finished)
@@ -696,6 +698,18 @@ class ClipSoonApplication(QObject):
         if removed:
             self._reload_history()
             self.panel.set_status(f"已删除 {removed} 条")
+
+    def _pin_many(self, items, pinned: bool) -> None:
+        changed = 0
+        for item in items:
+            current = self.repository.get(item.id)
+            if current is None or current.pinned == pinned:
+                continue
+            self.repository.set_pinned(current.id, pinned)
+            changed += 1
+        if changed:
+            self._reload_history()
+            self.panel.set_status(f"已置顶 {changed} 条" if pinned else f"已取消置顶 {changed} 条")
 
     def _reload_history(self) -> None:
         self.panel.set_items(self.repository.list_items(self.settings.value.max_history_items + 1_000))

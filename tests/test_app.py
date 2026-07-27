@@ -291,6 +291,48 @@ def test_clear_current_tab_history_preserves_other_kinds(qtbot, tmp_path) -> Non
     application.shutdown()
 
 
+def test_clear_history_removes_only_unpinned_items(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+    pinned = application.repository.add_text("pinned")
+    unpinned = application.repository.add_text("unpinned")
+    application.repository.set_pinned(pinned.id, True)
+    application._reload_history()
+
+    application.clear_history()
+
+    assert application.repository.get(pinned.id) is not None
+    assert application.repository.get(unpinned.id) is None
+    assert [item.id for item in application.panel._items] == [pinned.id]
+    assert application.panel.status.text() == "已清除 1 条未置顶历史"
+    application.shutdown()
+
+
+def test_pin_many_updates_history_order_and_status(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.clipboard.start()
+    older = application.repository.add_text("older")
+    newer = application.repository.add_text("newer")
+    application._reload_history()
+
+    application._pin_many((older,), True)
+
+    pinned = application.repository.get(older.id)
+    assert pinned is not None and pinned.pinned
+    assert application.panel._items[0].id == older.id
+    assert application.panel.status.text() == "已置顶 1 条"
+
+    application._pin_many((pinned,), False)
+
+    unpinned = application.repository.get(older.id)
+    assert unpinned is not None and not unpinned.pinned
+    assert application.panel._items[0].id == newer.id
+    assert application.panel.status.text() == "已取消置顶 1 条"
+    application.shutdown()
+
+
 @pytest.mark.parametrize("theme", ("liquid_glass",))
 def test_system_appearance_signals_refresh_dynamic_theme_and_open_settings_dialog(
     qtbot,
