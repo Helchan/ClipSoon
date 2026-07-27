@@ -1956,6 +1956,26 @@ def test_scaled_image_cache_is_byte_bounded_lru_and_revision_aware(
     assert before != after
 
 
+def test_scaled_image_loader_discards_qt_deleted_task_on_invalidate(tmp_path: Path, monkeypatch) -> None:
+    loader = _ScaledImageLoader(max_cache_bytes=80_000, max_cache_entries=2)
+    path = tmp_path / "deleted-task.png"
+    path.write_bytes(b"placeholder")
+    key = (str(path), 1, 1, 100, 100, True)
+    loader._tasks[key] = object()
+
+    class DeletedTaskPool:
+        def tryTake(self, task) -> bool:
+            del task
+            raise RuntimeError("libshiboken: Internal C++ object already deleted.")
+
+    monkeypatch.setattr(ui_module.QThreadPool, "globalInstance", DeletedTaskPool)
+
+    loader.invalidate_paths({str(path)})
+
+    assert key not in loader._tasks
+    assert key in loader._discarded_tasks
+
+
 def test_preview_size_is_bucketed_to_avoid_resize_cache_churn() -> None:
     assert _bucketed_size(QSize(301, 449)) == QSize(320, 512)
     assert _bucketed_size(QSize(319, 500)) == QSize(320, 512)

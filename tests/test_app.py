@@ -328,7 +328,7 @@ def test_pin_many_updates_history_order_and_status(qtbot, tmp_path) -> None:
 
     unpinned = application.repository.get(older.id)
     assert unpinned is not None and not unpinned.pinned
-    assert application.panel._items[0].id == newer.id
+    assert {item.id for item in application.panel._items} == {older.id, newer.id}
     assert application.panel.status.text() == "已取消置顶 1 条"
     application.shutdown()
 

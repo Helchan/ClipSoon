@@ -1390,10 +1390,7 @@ class _ScaledImageLoader(QObject):
             if key[0] == path:
                 self._discarded_tasks.discard(key)
                 continue
-            if pool.tryTake(task):
-                self._tasks.pop(key, None)
-            else:
-                self._discarded_tasks.add(key)
+            self._discard_or_take(pool, key, task)
 
     def invalidate_paths(self, paths: set[str]) -> None:
         if not paths:
@@ -1406,10 +1403,24 @@ class _ScaledImageLoader(QObject):
         for key, task in tuple(self._tasks.items()):
             if key[0] not in paths:
                 continue
-            if pool.tryTake(task):
-                self._tasks.pop(key, None)
-            else:
-                self._discarded_tasks.add(key)
+            self._discard_or_take(pool, key, task)
+
+    def _discard_or_take(
+        self,
+        pool: QThreadPool,
+        key: ImageLoadKey,
+        task: _ImageLoadTask,
+    ) -> None:
+        try:
+            taken = pool.tryTake(task)
+        except RuntimeError:
+            self._tasks.pop(key, None)
+            self._discarded_tasks.add(key)
+            return
+        if taken:
+            self._tasks.pop(key, None)
+        else:
+            self._discarded_tasks.add(key)
 
     def _revision(self, path: str) -> tuple[int, int]:
         now = time.monotonic()
