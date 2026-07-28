@@ -177,6 +177,44 @@ _FILE_REVISION_TTL_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
+class _UiMetrics:
+    root_font_size_pt: int
+    search_font_size_pt: int
+    content_font_size_pt: int
+    empty_message_font_size_pt: int
+    muted_font_size_pt: int
+    thumbnail_letter_font_size_pt: int
+    popup_item_font_size_pt: int
+    settings_title_font_size_pt: int
+    settings_section_font_size_pt: int
+    settings_control_font_size_pt: int
+    settings_label_font_size_pt: int
+    settings_help_font_size_pt: int
+    settings_checkbox_indicator_size: int
+    settings_control_min_height: int
+    settings_label_column_width: int
+    settings_form_column_gap: int
+    settings_checkbox_row_height: int
+    list_row_height: int
+    list_thumbnail_size: int
+    list_min_width: int
+    search_icon_size: int
+    settings_window_width: int
+    panel_min_width: int
+    panel_min_height: int
+    panel_initial_width: int
+    panel_initial_height: int
+    panel_max_width: int
+    panel_max_height: int
+    panel_width_ratio: float
+    panel_height_ratio: float
+    filter_chip_vertical_padding: int
+    filter_chip_horizontal_padding: int
+    text_preview_padding: int
+    popup_item_min_height: int
+
+
+@dataclass(frozen=True)
 class _ThemeAppearance:
     """Resolved theme with the app-owned frosted material state."""
 
@@ -388,6 +426,94 @@ _SETTINGS_LABEL_COLUMN_WIDTH = 112
 _SETTINGS_FORM_COLUMN_GAP = 14
 _SETTINGS_CHECKBOX_ROW_HEIGHT = 26
 _SETTINGS_EXTERNAL_DISMISS_POLL_MS = 25
+_DEFAULT_UI_METRICS = _UiMetrics(
+    root_font_size_pt=10,
+    search_font_size_pt=16,
+    content_font_size_pt=13,
+    empty_message_font_size_pt=10,
+    muted_font_size_pt=9,
+    thumbnail_letter_font_size_pt=16,
+    popup_item_font_size_pt=_POPUP_ITEM_FONT_SIZE_PT,
+    settings_title_font_size_pt=_SETTINGS_TITLE_FONT_SIZE_PT,
+    settings_section_font_size_pt=_SETTINGS_SECTION_FONT_SIZE_PT,
+    settings_control_font_size_pt=_SETTINGS_CONTROL_FONT_SIZE_PT,
+    settings_label_font_size_pt=_SETTINGS_LABEL_FONT_SIZE_PT,
+    settings_help_font_size_pt=_SETTINGS_HELP_FONT_SIZE_PT,
+    settings_checkbox_indicator_size=_SETTINGS_CHECKBOX_INDICATOR_SIZE,
+    settings_control_min_height=_SETTINGS_CONTROL_MIN_HEIGHT,
+    settings_label_column_width=_SETTINGS_LABEL_COLUMN_WIDTH,
+    settings_form_column_gap=_SETTINGS_FORM_COLUMN_GAP,
+    settings_checkbox_row_height=_SETTINGS_CHECKBOX_ROW_HEIGHT,
+    list_row_height=_LIST_ROW_HEIGHT,
+    list_thumbnail_size=_LIST_THUMBNAIL_SIZE,
+    list_min_width=410,
+    search_icon_size=30,
+    settings_window_width=580,
+    panel_min_width=720,
+    panel_min_height=500,
+    panel_initial_width=900,
+    panel_initial_height=610,
+    panel_max_width=920,
+    panel_max_height=630,
+    panel_width_ratio=0.68,
+    panel_height_ratio=0.66,
+    filter_chip_vertical_padding=5,
+    filter_chip_horizontal_padding=12,
+    text_preview_padding=11,
+    popup_item_min_height=30,
+)
+_WINDOWS_UI_METRICS = _UiMetrics(
+    root_font_size_pt=9,
+    search_font_size_pt=13,
+    content_font_size_pt=10,
+    empty_message_font_size_pt=9,
+    muted_font_size_pt=8,
+    thumbnail_letter_font_size_pt=13,
+    popup_item_font_size_pt=10,
+    settings_title_font_size_pt=11,
+    settings_section_font_size_pt=10,
+    settings_control_font_size_pt=10,
+    settings_label_font_size_pt=9,
+    settings_help_font_size_pt=9,
+    settings_checkbox_indicator_size=12,
+    settings_control_min_height=30,
+    settings_label_column_width=100,
+    settings_form_column_gap=12,
+    settings_checkbox_row_height=24,
+    list_row_height=38,
+    list_thumbnail_size=26,
+    list_min_width=350,
+    search_icon_size=26,
+    settings_window_width=520,
+    panel_min_width=620,
+    panel_min_height=420,
+    panel_initial_width=780,
+    panel_initial_height=520,
+    panel_max_width=840,
+    panel_max_height=560,
+    panel_width_ratio=0.60,
+    panel_height_ratio=0.58,
+    filter_chip_vertical_padding=4,
+    filter_chip_horizontal_padding=9,
+    text_preview_padding=9,
+    popup_item_min_height=26,
+)
+
+
+def _ui_metrics() -> _UiMetrics:
+    return _WINDOWS_UI_METRICS if sys.platform == "win32" else _DEFAULT_UI_METRICS
+
+
+def _platform_font_family_rule() -> str:
+    if sys.platform != "win32":
+        return ""
+    return 'font-family: "Segoe UI", "Microsoft YaHei UI"; '
+
+
+def _apply_platform_font_family(font: QFont) -> QFont:
+    if sys.platform == "win32":
+        font.setFamily("Segoe UI")
+    return font
 
 
 class _AppOwnedCaretStyle(QProxyStyle):
@@ -1220,7 +1346,7 @@ class SearchIcon(QWidget):
         super().__init__(parent)
         self._dark_theme = False
         self._appearance = _ThemeAppearance(dark=False)
-        self.setFixedSize(30, 30)
+        self.setFixedSize(_ui_metrics().search_icon_size, _ui_metrics().search_icon_size)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         # The command panel has one permanent typing target.  Opening settings
         # is a pointer action here, so the small magnifier must never displace
@@ -1520,7 +1646,7 @@ class ClipDelegate(QStyledItemDelegate):
         return False
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
-        return QSize(option.rect.width(), _LIST_ROW_HEIGHT)
+        return QSize(option.rect.width(), _ui_metrics().list_row_height)
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         item: ClipItem = index.data(ITEM_ROLE)
@@ -1570,7 +1696,7 @@ class ClipDelegate(QStyledItemDelegate):
 
     @staticmethod
     def _thumbnail_rect(row_rect: QRect) -> QRect:
-        size = _LIST_THUMBNAIL_SIZE
+        size = _ui_metrics().list_thumbnail_size
         top = row_rect.top() + (row_rect.height() - size) // 2
         return QRect(row_rect.left() + 8, top, size, size)
 
@@ -1602,7 +1728,7 @@ class ClipDelegate(QStyledItemDelegate):
             color = QColor(_active_foreground(self._appearance))
         painter.setPen(color)
         font = painter.font()
-        font.setPointSize(16)
+        font.setPointSize(_ui_metrics().thumbnail_letter_font_size_pt)
         font.setWeight(QFont.Weight.Bold)
         painter.setFont(font)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "T" if item.kind is ClipKind.TEXT else "F")
@@ -1798,7 +1924,8 @@ class SettingsDialog(QDialog):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setModal(False)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setFixedWidth(580)
+        metrics = _ui_metrics()
+        self.setFixedWidth(metrics.settings_window_width)
         if sys.platform == "win32":
             # Keep an ordinary Qt backing store; frosted material is painted
             # in-app and never requests DWM composition.
@@ -1843,9 +1970,9 @@ class SettingsDialog(QDialog):
         def form_grid() -> QGridLayout:
             grid = QGridLayout()
             grid.setContentsMargins(0, 0, 0, 0)
-            grid.setHorizontalSpacing(_SETTINGS_FORM_COLUMN_GAP)
+            grid.setHorizontalSpacing(metrics.settings_form_column_gap)
             grid.setVerticalSpacing(2)
-            grid.setColumnMinimumWidth(0, _SETTINGS_LABEL_COLUMN_WIDTH)
+            grid.setColumnMinimumWidth(0, metrics.settings_label_column_width)
             grid.setColumnStretch(1, 1)
             return grid
 
@@ -1853,7 +1980,7 @@ class SettingsDialog(QDialog):
             label = QLabel(text)
             label.setObjectName("settingsFieldLabel")
             label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            control.setMinimumHeight(_SETTINGS_CONTROL_MIN_HEIGHT)
+            control.setMinimumHeight(metrics.settings_control_min_height)
             control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             grid.addWidget(label, row, 0)
             grid.addWidget(control, row, 1)
@@ -1958,13 +2085,13 @@ class SettingsDialog(QDialog):
         # Native QCheckBox metrics differ enough across macOS scales that a
         # content-driven grid can place consecutive labels on top of one
         # another. Give this compact three-row group an explicit row rhythm.
-        checkbox_row_height = _SETTINGS_CHECKBOX_ROW_HEIGHT
+        checkbox_row_height = metrics.settings_checkbox_row_height
         for checkbox in behavior_checkboxes:
             checkbox.setFixedHeight(checkbox_row_height)
             checkbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         behavior_options = QGridLayout()
         behavior_options.setContentsMargins(
-            _SETTINGS_LABEL_COLUMN_WIDTH + _SETTINGS_FORM_COLUMN_GAP,
+            metrics.settings_label_column_width + metrics.settings_form_column_gap,
             3,
             0,
             0,
@@ -2504,8 +2631,9 @@ class ClipPanel(QWidget):
         else:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
-        self.setMinimumSize(720, 500)
-        self.resize(900, 610)
+        metrics = _ui_metrics()
+        self.setMinimumSize(metrics.panel_min_width, metrics.panel_min_height)
+        self.resize(metrics.panel_initial_width, metrics.panel_initial_height)
         self._build()
         self._install_panel_shortcuts()
         self.apply_theme()
@@ -2616,7 +2744,7 @@ class ClipPanel(QWidget):
         self.list.setUniformItemSizes(True)
         self.list.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list.setMinimumWidth(410)
+        self.list.setMinimumWidth(_ui_metrics().list_min_width)
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._open_list_menu)
         self.list.doubleClicked.connect(lambda index: self._send(index.row()))
@@ -2831,8 +2959,15 @@ class ClipPanel(QWidget):
             else None
         ) or QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         geometry = screen.availableGeometry()
-        width = min(920, max(720, int(geometry.width() * 0.68)))
-        height = min(630, max(500, int(geometry.height() * 0.66)))
+        metrics = _ui_metrics()
+        width = min(
+            metrics.panel_max_width,
+            max(metrics.panel_min_width, int(geometry.width() * metrics.panel_width_ratio)),
+        )
+        height = min(
+            metrics.panel_max_height,
+            max(metrics.panel_min_height, int(geometry.height() * metrics.panel_height_ratio)),
+        )
         self.resize(width, height)
         if saved_position is None:
             saved_position = QPoint(
@@ -3875,6 +4010,20 @@ def _style_sheet(
 ) -> str:
     appearance = _as_theme_appearance(theme)
     colors = _theme_colors(appearance)
+    metrics = _ui_metrics()
+    font_family_rule = _platform_font_family_rule()
+    search_text_rule = (
+        f"color: {colors.text}; font-size: {metrics.search_font_size_pt}pt; padding: 0 2px;"
+    )
+    filter_chip_padding = (
+        f"padding: {metrics.filter_chip_vertical_padding}px "
+        f"{metrics.filter_chip_horizontal_padding}px;"
+    )
+    history_font_rule = f"font-size: {metrics.content_font_size_pt}pt;"
+    preview_typography_rule = (
+        f"font-size: {metrics.content_font_size_pt}pt; "
+        f"padding: {metrics.text_preview_padding}px;"
+    )
     active_foreground = _active_foreground(appearance)
     accent_foreground = _accent_foreground(appearance)
     # One shared low-contrast rule defines every app boundary: settings sections,
@@ -3975,27 +4124,27 @@ def _style_sheet(
         }}
     """
     return f"""
-        QWidget {{ color: {colors.text}; font-size: 10pt; }}
+        QWidget {{ color: {colors.text}; {font_family_rule}font-size: {metrics.root_font_size_pt}pt; }}
         {panel_window_rule}
         #card {{ background: {card_background}; border: {card_border}; border-radius: 18px; }}
         #searchBox {{ background: transparent; border: none; }}
         #search {{
-            background: transparent; border: none; color: {colors.text}; font-size: 16pt; padding: 0 2px;
+            background: transparent; border: none; {search_text_rule}
             selection-background-color: {colors.accent}; selection-color: {accent_foreground};
         }}
         QToolButton {{ border: none; border-radius: 8px; padding: 7px 10px; background: transparent; }}
         QToolButton:hover {{ background: {overlay_hover}; }}
         QToolButton[filterChip="true"] {{
-            color: {colors.muted}; font-size: 13pt; font-weight: 500; padding: 5px 12px;
+            color: {colors.muted}; {history_font_rule} font-weight: 500; {filter_chip_padding}
         }}
         QToolButton[filterChip="true"]:checked {{
             color: {active_foreground}; background: {active_chip}; border: 1px solid {overlay_border};
         }}
-        #historyList {{ background: transparent; border: none; outline: none; font-size: 13pt; }}
+        #historyList {{ background: transparent; border: none; outline: none; {history_font_rule} }}
         {content_scrollbar_rule}
         #emptyState {{ background: transparent; border: none; }}
-        #emptyStateTitle {{ color: {colors.text}; font-size: 13pt; font-weight: 600; }}
-        #emptyStateMessage {{ color: {colors.muted}; font-size: 10pt; }}
+        #emptyStateTitle {{ color: {colors.text}; font-size: {metrics.content_font_size_pt}pt; font-weight: 600; }}
+        #emptyStateMessage {{ color: {colors.muted}; font-size: {metrics.empty_message_font_size_pt}pt; }}
         QToolButton#emptyStateClear {{
             color: {colors.accent_focus}; background: transparent; border: none;
             border-radius: 7px; padding: 4px 6px;
@@ -4006,30 +4155,30 @@ def _style_sheet(
         #searchFiltersDivider, #contentFooterDivider {{
             background: {section_divider}; border: none; min-height: 1px; max-height: 1px;
         }}
-        #textPreview, #fileTextPreview {{ font-size: 13pt; padding: 11px; {preview_rule} }}
+        #textPreview, #fileTextPreview {{ {preview_typography_rule} {preview_rule} }}
         #informationDivider {{
             background: {section_divider}; margin: 3px 8px 1px; min-height: 1px; max-height: 1px;
         }}
-        #informationTitle {{ font-size: 13pt; font-weight: 650; padding: 6px 0 0 0; }}
+        #informationTitle {{ font-size: {metrics.content_font_size_pt}pt; font-weight: 650; padding: 6px 0 0 0; }}
         #informationLabel, #informationValue {{
-            color: {colors.muted}; font-size: 13pt; font-weight: 500;
+            color: {colors.muted}; font-size: {metrics.content_font_size_pt}pt; font-weight: 500;
         }}
-        #muted {{ color: {colors.muted}; font-size: 9pt; }}
+        #muted {{ color: {colors.muted}; font-size: {metrics.muted_font_size_pt}pt; }}
         #muted a {{ color: {colors.accent_focus}; text-decoration: none; }}
         #settingsDialog #platformNote {{
             background: {overlay}; border: 1px solid {settings_control_border}; border-radius: 10px;
         }}
-        #settingsWindowTitle {{ font-size: {_SETTINGS_TITLE_FONT_SIZE_PT}pt; font-weight: 650; }}
-        #settingsSubtitle {{ color: {colors.muted}; font-size: {_SETTINGS_HELP_FONT_SIZE_PT}pt; }}
+        #settingsWindowTitle {{ font-size: {metrics.settings_title_font_size_pt}pt; font-weight: 650; }}
+        #settingsSubtitle {{ color: {colors.muted}; font-size: {metrics.settings_help_font_size_pt}pt; }}
         #settingsSection {{ background: {settings_background}; border: {settings_border}; border-radius: 12px; }}
-        #settingsSectionTitle {{ font-size: {_SETTINGS_SECTION_FONT_SIZE_PT}pt; font-weight: 650; }}
+        #settingsSectionTitle {{ font-size: {metrics.settings_section_font_size_pt}pt; font-weight: 650; }}
         #settingsFieldLabel {{
-            color: {colors.muted}; font-size: {_SETTINGS_LABEL_FONT_SIZE_PT}pt; font-weight: 500;
+            color: {colors.muted}; font-size: {metrics.settings_label_font_size_pt}pt; font-weight: 500;
         }}
         #settingsDialog QPlainTextEdit, #settingsDialog QLineEdit,
         #settingsDialog QKeySequenceEdit, #settingsDialog QComboBox, #settingsDialog QSpinBox {{
             background: {overlay}; border: 1px solid {settings_control_border}; border-radius: 10px; padding: 6px 8px;
-            font-size: {_SETTINGS_CONTROL_FONT_SIZE_PT}pt;
+            font-size: {metrics.settings_control_font_size_pt}pt;
             selection-background-color: {colors.accent}; selection-color: {accent_foreground};
         }}
         #settingsDialog QPlainTextEdit:focus, #settingsDialog QLineEdit:focus,
@@ -4045,18 +4194,18 @@ def _style_sheet(
             color: {colors.muted}; background: {colors.panel};
         }}
         #settingsDialog QCheckBox {{
-            color: {colors.text}; spacing: 6px; font-size: {_SETTINGS_CONTROL_FONT_SIZE_PT}pt;
+            color: {colors.text}; spacing: 6px; font-size: {metrics.settings_control_font_size_pt}pt;
         }}
         #settingsDialog QCheckBox:disabled {{ color: {colors.muted}; }}
         #settingsDialog QCheckBox::indicator {{
-            width: {_SETTINGS_CHECKBOX_INDICATOR_SIZE}px;
-            height: {_SETTINGS_CHECKBOX_INDICATOR_SIZE}px;
+            width: {metrics.settings_checkbox_indicator_size}px;
+            height: {metrics.settings_checkbox_indicator_size}px;
             image: none; background: transparent; border: none;
         }}
         #settingsDialog QPlainTextEdit {{ selection-background-color: {colors.accent}; }}
         #settingsDialog QPushButton {{
             background: {overlay}; border: 1px solid {settings_control_border};
-            border-radius: 10px; padding: 6px 13px; font-size: {_SETTINGS_CONTROL_FONT_SIZE_PT}pt;
+            border-radius: 10px; padding: 6px 13px; font-size: {metrics.settings_control_font_size_pt}pt;
         }}
         #settingsDialog QPushButton:hover {{ border-color: {colors.accent_focus}; }}
         #settingsDialog QPushButton:focus {{ border: 1px solid {colors.accent_focus}; }}
@@ -4071,6 +4220,16 @@ def _confirmation_style_sheet(
 ) -> str:
     appearance = _as_theme_appearance(theme)
     colors = _theme_colors(appearance)
+    metrics = _ui_metrics()
+    font_family_rule = _platform_font_family_rule()
+    dialog_typography_rule = (
+        f"color: {colors.text}; {font_family_rule}font-size: {metrics.root_font_size_pt}pt;"
+    )
+    confirmation_title_rule = (
+        f"color: {colors.text}; "
+        f"font-size: {metrics.settings_title_font_size_pt + 1}pt; "
+        "font-weight: 650;"
+    )
     # On macOS and Linux the confirmation root only reserves breathing room
     # for the rounded card's shadow. Painting it opaque creates a second,
     # rectangular surface around the card. Windows keeps its opaque backing
@@ -4106,12 +4265,12 @@ def _confirmation_style_sheet(
         confirm_hover = colors.accent_focus
         confirm_foreground = _accent_foreground(appearance)
     return f"""
-        QDialog {{ background: {dialog_background}; color: {colors.text}; font-size: 10pt; }}
+        QDialog {{ background: {dialog_background}; {dialog_typography_rule} }}
         #confirmationCard {{
             background: {card_background}; border: {card_border}; border-radius: 16px;
         }}
-        #confirmationTitle {{ color: {colors.text}; font-size: 14pt; font-weight: 650; }}
-        #confirmationMessage {{ color: {colors.muted}; font-size: 11pt; }}
+        #confirmationTitle {{ {confirmation_title_rule} }}
+        #confirmationMessage {{ color: {colors.muted}; font-size: {metrics.settings_label_font_size_pt}pt; }}
         #confirmationCancel, #confirmationConfirm {{
             border-radius: 9px; padding: 7px 10px;
         }}
@@ -4246,6 +4405,8 @@ def _read_text_file_preview(files: Sequence[str]) -> str | None:
 def _style_combo_popup(combo: QComboBox, theme: bool | _ThemeAppearance) -> None:
     appearance = _as_theme_appearance(theme)
     colors = _theme_colors(appearance)
+    metrics = _ui_metrics()
+    font_family_rule = _platform_font_family_rule()
     accent_foreground = _accent_foreground(appearance)
     popup_background = colors.popup
     popup_hover = colors.hover
@@ -4273,8 +4434,9 @@ def _style_combo_popup(combo: QComboBox, theme: bool | _ThemeAppearance) -> None
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(colors.muted))
     view.setStyleSheet(
         f"QAbstractItemView {{ background: {popup_background}; color: {colors.text}; "
-        f"border: none; outline: none; padding: 2px; font-size: {_POPUP_ITEM_FONT_SIZE_PT}pt; }}"
-        "QAbstractItemView::item { min-height: 30px; padding: 4px 8px; }"
+        f"border: none; outline: none; padding: 2px; {font_family_rule}"
+        f"font-size: {metrics.popup_item_font_size_pt}pt; }}"
+        f"QAbstractItemView::item {{ min-height: {metrics.popup_item_min_height}px; padding: 4px 8px; }}"
         f"QAbstractItemView::item:hover {{ background: {popup_hover}; color: {colors.text}; }}"
         f"QAbstractItemView::item:selected {{ background: {colors.accent}; color: {accent_foreground}; }}"
         f"QAbstractItemView::item:disabled {{ color: {colors.muted}; }}"
@@ -4327,7 +4489,7 @@ class _DestructiveConfirmationDialog(QDialog):
             palette = self.palette()
             palette.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0, 0))
             self.setPalette(palette)
-        self.setFixedWidth(420)
+        self.setFixedWidth(380 if sys.platform == "win32" else 420)
         self.setStyleSheet(
             _confirmation_style_sheet(self._appearance, destructive=self._destructive)
         )
@@ -4670,6 +4832,8 @@ def _compact_menu(
             dark = menu.palette().color(QPalette.ColorRole.Window).lightness() < 128
         appearance = _ThemeAppearance(dark=dark)
     colors = _theme_colors(appearance)
+    metrics = _ui_metrics()
+    font_family_rule = _platform_font_family_rule()
     disabled = "#9299A9" if appearance.dark else "#757C8D"
     has_icons = any(not action.isSeparator() and not action.icon().isNull() for action in menu.actions())
     # Keep horizontal space on the item rather than on the QMenu shell.  Qt
@@ -4694,7 +4858,7 @@ def _compact_menu(
         f"padding: {vertical_inset}px {shell_horizontal_inset}px; "
         f"border: 1px solid {colors.menu_separator}; "
         f"border-radius: {_COMPACT_MENU_CORNER_RADIUS}px; "
-        f"font-size: {_POPUP_ITEM_FONT_SIZE_PT}pt; }}"
+        f"{font_family_rule}font-size: {metrics.popup_item_font_size_pt}pt; }}"
         f"QMenu::item {{ margin: 0px {item_margin}px; "
         f"padding: 6px {item_padding}px 6px {item_padding}px; border-radius: 6px; }}"
         f"QMenu::item:selected {{ background: {colors.menu_hover}; color: {colors.text}; }}"
@@ -4707,7 +4871,8 @@ def _compact_menu(
         menu._clipsoon_frame_filter = _CompactMenuFrameFilter(menu)  # type: ignore[attr-defined]
         menu.installEventFilter(menu._clipsoon_frame_filter)  # type: ignore[attr-defined]
     font = QFont(menu.font())
-    font.setPointSize(_POPUP_ITEM_FONT_SIZE_PT)
+    font = _apply_platform_font_family(font)
+    font.setPointSize(metrics.popup_item_font_size_pt)
     menu.setFont(font)
     text_metrics = QFontMetrics(font)
 

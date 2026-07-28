@@ -1569,6 +1569,60 @@ def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
     assert "selection-background-color: #5264E8; selection-color: #FFFFFF;" in search_style
 
 
+@pytest.mark.parametrize("theme", ("light", "dark", "frosted"))
+def test_windows_themes_use_compact_visual_metrics(qtbot, monkeypatch, theme: str) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    metrics = ui_module._WINDOWS_UI_METRICS
+    panel = ClipPanel(lambda: AppSettings(theme=theme))
+    qtbot.addWidget(panel)
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+
+    assert panel.minimumSize() == QSize(metrics.panel_min_width, metrics.panel_min_height)
+    assert metrics.panel_min_width <= panel.width() <= metrics.panel_max_width
+    assert metrics.panel_min_height <= panel.height() <= metrics.panel_max_height
+    assert panel.search_icon.size() == QSize(metrics.search_icon_size, metrics.search_icon_size)
+    assert panel.search.font().pointSizeF() == metrics.search_font_size_pt
+    assert panel.list.font().pointSizeF() == metrics.content_font_size_pt
+    assert panel.text_preview.font().pointSizeF() == metrics.content_font_size_pt
+    assert panel.version_label.font().pointSizeF() == metrics.muted_font_size_pt
+    assert panel.list.minimumWidth() == metrics.list_min_width
+
+    style = _style_sheet(_ThemeAppearance(dark=theme == "dark", frosted=theme == "frosted"))
+    assert 'font-family: "Segoe UI", "Microsoft YaHei UI";' in style
+    assert f"font-size: {metrics.search_font_size_pt}pt" in style
+    assert f"font-size: {metrics.content_font_size_pt}pt" in style
+
+
+def test_windows_settings_and_popups_use_compact_visual_metrics(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    metrics = ui_module._WINDOWS_UI_METRICS
+    dialog = SettingsDialog(AppSettings(theme="frosted"), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    assert dialog.width() == metrics.settings_window_width
+    title = dialog.findChild(QLabel, "settingsWindowTitle")
+    section_title = dialog.findChildren(QLabel, "settingsSectionTitle")[0]
+    field_label = dialog.findChildren(QLabel, "settingsFieldLabel")[0]
+    assert title.font().pointSizeF() == metrics.settings_title_font_size_pt
+    assert section_title.font().pointSizeF() == metrics.settings_section_font_size_pt
+    assert field_label.font().pointSizeF() == metrics.settings_label_font_size_pt
+    assert dialog.maximum.font().pointSizeF() == metrics.settings_control_font_size_pt
+    assert dialog.capture.height() == metrics.settings_checkbox_row_height
+    assert dialog.custom_hotkey.minimumHeight() == metrics.settings_control_min_height
+    assert f"font-size: {metrics.popup_item_font_size_pt}pt" in dialog.theme.view().styleSheet()
+
+    menu = QMenu()
+    qtbot.addWidget(menu)
+    menu.addAction("删除")
+    _compact_menu(menu, dark=False)
+    assert menu.font().pointSize() == metrics.popup_item_font_size_pt
+    assert 'font-family: "Segoe UI", "Microsoft YaHei UI";' in menu.styleSheet()
+    assert f"font-size: {metrics.popup_item_font_size_pt}pt" in menu.styleSheet()
+
+
 def test_windows_panel_uses_opaque_backing_store_without_drop_shadow(
     qtbot, monkeypatch
 ) -> None:
