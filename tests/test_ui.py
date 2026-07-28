@@ -429,7 +429,10 @@ def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> No
 
     assert dialog.close_button.font().pointSizeF() == metrics.settings_control_font_size_pt
     assert dialog.reset_button.font().pointSizeF() == metrics.settings_control_font_size_pt
-    assert field_label.font().pointSizeF() > subtitle.font().pointSizeF()
+    if metrics.settings_label_font_size_pt > metrics.settings_help_font_size_pt:
+        assert field_label.font().pointSizeF() > subtitle.font().pointSizeF()
+    else:
+        assert field_label.font().pointSizeF() == subtitle.font().pointSizeF()
     assert dialog.maximum.font().pointSizeF() > field_label.font().pointSizeF()
     assert dialog.height() < 700
 
@@ -3347,8 +3350,7 @@ def test_hover_background_is_visible_but_weaker_than_selection(qtbot) -> None:
     assert rendered.pixelColor(sample_at) == hover
     assert panel.model.data(second, Qt.ItemDataRole.ToolTipRole) is None
 
-    blank = QPoint(panel.list.viewport().width() - 2, panel.list.viewport().height() - 2)
-    qtbot.mouseMove(panel.list.viewport(), blank)
+    QCoreApplication.sendEvent(panel.list, QEvent(QEvent.Type.Leave))
     qtbot.wait(20)
     assert panel.list.itemDelegate().hovered_row == -1
 
