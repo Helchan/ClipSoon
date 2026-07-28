@@ -354,6 +354,7 @@ def test_windows_rejects_custom_keys_not_supported_by_register_hotkey(monkeypatc
 
 
 def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
+    metrics = ui_module._ui_metrics()
     dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
     qtbot.addWidget(dialog)
     dialog.show()
@@ -361,7 +362,7 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
 
     sections = dialog.findChildren(QFrame, "settingsSection")
     assert len(sections) == 3
-    assert dialog.width() == 580
+    assert dialog.width() == metrics.settings_window_width
     assert dialog.height() < 720
     controls = [
         dialog.custom_hotkey,
@@ -456,8 +457,8 @@ def test_settings_behavior_checkboxes_have_stable_non_overlapping_rows(qtbot) ->
             dialog.capture,
         )
         assert indicator.size() == QSize(
-            ui_module._SETTINGS_CHECKBOX_INDICATOR_SIZE,
-            ui_module._SETTINGS_CHECKBOX_INDICATOR_SIZE,
+            metrics.settings_checkbox_indicator_size,
+            metrics.settings_checkbox_indicator_size,
         ), theme
         assert dialog.capture.geometry().bottom() < dialog.hide_on_deactivate_checkbox.geometry().top(), theme
         assert dialog.paste.geometry().bottom() < dialog.remember_selection.geometry().top(), theme
@@ -2186,6 +2187,7 @@ def test_outdated_detail_tasks_do_not_fill_cache(qtbot, tmp_path: Path, monkeypa
 
 
 def test_copied_image_file_uses_detail_image_preview(qtbot, tmp_path: Path) -> None:
+    metrics = ui_module._ui_metrics()
     path = tmp_path / "detail.jpg"
     image = QImage(16, 9, QImage.Format.Format_RGB32)
     image.fill(QColor("#3986e8"))
@@ -2206,7 +2208,10 @@ def test_copied_image_file_uses_detail_image_preview(qtbot, tmp_path: Path) -> N
     assert panel.info_type_value.text() == "文件"
     assert panel.info_detail_label.text() == "路径"
     assert panel.info_detail_value.text() == str(path)
-    assert panel.list.itemDelegate().sizeHint(QStyleOptionViewItem(), panel.model.index(0)).height() == 44
+    assert (
+        panel.list.itemDelegate().sizeHint(QStyleOptionViewItem(), panel.model.index(0)).height()
+        == metrics.list_row_height
+    )
 
 
 def test_detail_image_preview_does_not_upscale_small_images(qtbot, tmp_path: Path) -> None:
@@ -3100,6 +3105,7 @@ def test_list_context_menu_routes_favorite_signal(qtbot) -> None:
 
 
 def test_filter_and_list_background_align_with_borderless_search_region(qtbot) -> None:
+    metrics = ui_module._ui_metrics()
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
     panel.set_items([clip("text", "text", 1)])
@@ -3119,7 +3125,7 @@ def test_filter_and_list_background_align_with_borderless_search_region(qtbot) -
     search_right = search_box.mapTo(panel, QPoint(search_box.width(), 0)).x()
     detail_right = panel.detail.mapTo(panel, QPoint(panel.detail.width(), 0)).x()
     assert search_right == detail_right
-    assert search_icon is not None and search_icon.width() == 30
+    assert search_icon is not None and search_icon.width() == metrics.search_icon_size
 
 
 def test_clicking_search_icon_requests_settings(qtbot) -> None:
