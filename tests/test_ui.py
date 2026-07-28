@@ -385,6 +385,7 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
 
 
 def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> None:
+    metrics = ui_module._ui_metrics()
     dialog = SettingsDialog(AppSettings(theme="frosted"), accessibility_granted=True)
     qtbot.addWidget(dialog)
     dialog.show()
@@ -395,10 +396,10 @@ def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> No
     field_label = dialog.findChildren(QLabel, "settingsFieldLabel")[0]
     subtitle = dialog.findChild(QLabel, "settingsSubtitle")
 
-    assert title.font().pointSizeF() == ui_module._SETTINGS_TITLE_FONT_SIZE_PT
-    assert section_title.font().pointSizeF() == ui_module._SETTINGS_SECTION_FONT_SIZE_PT
-    assert field_label.font().pointSizeF() == ui_module._SETTINGS_LABEL_FONT_SIZE_PT
-    assert subtitle.font().pointSizeF() == ui_module._SETTINGS_HELP_FONT_SIZE_PT
+    assert title.font().pointSizeF() == metrics.settings_title_font_size_pt
+    assert section_title.font().pointSizeF() == metrics.settings_section_font_size_pt
+    assert field_label.font().pointSizeF() == metrics.settings_label_font_size_pt
+    assert subtitle.font().pointSizeF() == metrics.settings_help_font_size_pt
 
     controls = (
         dialog.custom_hotkey,
@@ -412,8 +413,8 @@ def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> No
     for control in controls:
         if control.isHidden():
             continue
-        assert control.font().pointSizeF() == ui_module._SETTINGS_CONTROL_FONT_SIZE_PT
-        assert control.height() >= ui_module._SETTINGS_CONTROL_MIN_HEIGHT
+        assert control.font().pointSizeF() == metrics.settings_control_font_size_pt
+        assert control.height() >= metrics.settings_control_min_height
 
     for checkbox in (
         dialog.capture,
@@ -422,30 +423,31 @@ def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> No
         dialog.remember_selection,
         dialog.launch_at_login,
     ):
-        assert checkbox.font().pointSizeF() == ui_module._SETTINGS_CONTROL_FONT_SIZE_PT
-        assert checkbox.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT
+        assert checkbox.font().pointSizeF() == metrics.settings_control_font_size_pt
+        assert checkbox.height() == metrics.settings_checkbox_row_height
 
-    assert dialog.close_button.font().pointSizeF() == ui_module._SETTINGS_CONTROL_FONT_SIZE_PT
-    assert dialog.reset_button.font().pointSizeF() == ui_module._SETTINGS_CONTROL_FONT_SIZE_PT
+    assert dialog.close_button.font().pointSizeF() == metrics.settings_control_font_size_pt
+    assert dialog.reset_button.font().pointSizeF() == metrics.settings_control_font_size_pt
     assert field_label.font().pointSizeF() > subtitle.font().pointSizeF()
     assert dialog.maximum.font().pointSizeF() > field_label.font().pointSizeF()
     assert dialog.height() < 700
 
 
 def test_settings_behavior_checkboxes_have_stable_non_overlapping_rows(qtbot) -> None:
+    metrics = ui_module._ui_metrics()
     for theme in ("light", "dark", "frosted"):
         dialog = SettingsDialog(AppSettings(theme=theme), accessibility_granted=True)
         qtbot.addWidget(dialog)
         dialog.show()
         qtbot.waitExposed(dialog)
 
-        assert dialog.capture.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT, theme
-        assert dialog.paste.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT, theme
+        assert dialog.capture.height() == metrics.settings_checkbox_row_height, theme
+        assert dialog.paste.height() == metrics.settings_checkbox_row_height, theme
         assert (
-            dialog.hide_on_deactivate_checkbox.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT
+            dialog.hide_on_deactivate_checkbox.height() == metrics.settings_checkbox_row_height
         ), theme
-        assert dialog.remember_selection.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT, theme
-        assert dialog.launch_at_login.height() == ui_module._SETTINGS_CHECKBOX_ROW_HEIGHT, theme
+        assert dialog.remember_selection.height() == metrics.settings_checkbox_row_height, theme
+        assert dialog.launch_at_login.height() == metrics.settings_checkbox_row_height, theme
         option = QStyleOptionButton()
         dialog.capture.initStyleOption(option)
         indicator = dialog.capture.style().subElementRect(
@@ -845,6 +847,7 @@ def test_light_settings_combo_popups_keep_dark_text_on_light_background(qtbot) -
 
 
 def test_frosted_material_theme_is_selectable_and_uses_a_readable_popup_palette(qtbot) -> None:
+    metrics = ui_module._ui_metrics()
     dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
     qtbot.addWidget(dialog)
     legacy_dialog = SettingsDialog(AppSettings(theme="not-a-theme"), accessibility_granted=True)
@@ -854,7 +857,7 @@ def test_frosted_material_theme_is_selectable_and_uses_a_readable_popup_palette(
     assert dialog.theme.currentText() == "磨砂"
     assert dialog.theme.itemData(0) == "frosted"
     assert legacy_dialog.theme.currentData() == "frosted"
-    assert f"font-size: {ui_module._POPUP_ITEM_FONT_SIZE_PT}pt" in dialog.theme.view().styleSheet()
+    assert f"font-size: {metrics.popup_item_font_size_pt}pt" in dialog.theme.view().styleSheet()
     assert [dialog.theme.itemText(index) for index in range(dialog.theme.count())] == [
         "磨砂",
         "浅色",
@@ -1027,8 +1030,10 @@ def test_every_panel_theme_uses_one_visible_vertical_divider_without_a_detail_ca
     )
     assert "#detail { background: transparent; border: none; }" in style
     assert f"#contentDivider {{ background: {divider_color};" in panel.styleSheet()
+    metrics = ui_module._ui_metrics()
     assert (
-        "#textPreview, #fileTextPreview { font-size: 13pt; padding: 11px; "
+        f"#textPreview, #fileTextPreview {{ font-size: {metrics.content_font_size_pt}pt; "
+        f"padding: {metrics.text_preview_padding}px; "
         "background: transparent; border: none; }"
     ) in style
 
@@ -1526,20 +1531,21 @@ def test_styles_use_point_fonts_so_windows_styles_never_receive_negative_point_s
 
 
 def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
+    metrics = ui_module._ui_metrics()
     panel = ClipPanel(AppSettings)
     qtbot.addWidget(panel)
     panel.show_panel()
     qtbot.waitExposed(panel)
 
     information_title = panel.information_title
-    assert panel.search.font().pointSizeF() == 16
-    assert all(button.font().pointSizeF() == 13 for button, _kind in panel._filter_buttons)
-    assert panel.list.font().pointSizeF() == 13
-    assert panel.text_preview.font().pointSizeF() == 13
-    assert panel.file_text_preview.font().pointSizeF() == 13
-    assert information_title.font().pointSizeF() == 13
-    assert panel.info_type_label.font().pointSizeF() == 13
-    assert panel.info_type_value.font().pointSizeF() == 13
+    assert panel.search.font().pointSizeF() == metrics.search_font_size_pt
+    assert all(button.font().pointSizeF() == metrics.content_font_size_pt for button, _kind in panel._filter_buttons)
+    assert panel.list.font().pointSizeF() == metrics.content_font_size_pt
+    assert panel.text_preview.font().pointSizeF() == metrics.content_font_size_pt
+    assert panel.file_text_preview.font().pointSizeF() == metrics.content_font_size_pt
+    assert information_title.font().pointSizeF() == metrics.content_font_size_pt
+    assert panel.info_type_label.font().pointSizeF() == metrics.content_font_size_pt
+    assert panel.info_type_value.font().pointSizeF() == metrics.content_font_size_pt
     assert panel.information_divider.frameShape() == QFrame.Shape.NoFrame
     assert panel.info_type_label.font().weight() == panel.info_type_value.font().weight()
     assert panel.info_detail_label.font().weight() == panel.info_detail_value.font().weight()
@@ -1547,15 +1553,18 @@ def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
     assert information_title.geometry().left() == panel.information_divider.geometry().left()
     style = _style_sheet(False)
     assert "#informationLabel, #informationValue" in style
-    assert "color: #62697A; font-size: 13pt; font-weight: 500;" in style
+    assert f"color: #62697A; font-size: {metrics.content_font_size_pt}pt; font-weight: 500;" in style
     assert (
         "#informationDivider {\n            background: rgba(35, 65, 98, 38); "
         "margin: 3px 8px 1px; min-height: 1px; max-height: 1px;\n        }" in style
     )
     assert "#searchFiltersDivider, #contentFooterDivider {" in style
     assert "background: rgba(35, 65, 98, 38); border: none; min-height: 1px; max-height: 1px;" in style
-    assert "#informationTitle { font-size: 13pt; font-weight: 650; padding: 6px 0 0 0; }" in style
-    assert panel.search_icon.size() == QSize(30, 30)
+    assert (
+        f"#informationTitle {{ font-size: {metrics.content_font_size_pt}pt; "
+        "font-weight: 650; padding: 6px 0 0 0; }"
+    ) in style
+    assert panel.search_icon.size() == QSize(metrics.search_icon_size, metrics.search_icon_size)
     text_height = panel.search.fontMetrics().tightBoundingRect("Ag").height()
     assert panel.search_box.height() == text_height * 2
     assert panel.search_box.frameShape() == QFrame.Shape.NoFrame
@@ -1565,7 +1574,7 @@ def test_main_panel_uses_readable_raycast_like_font_hierarchy(qtbot) -> None:
     search_style = _style_sheet(False)
     assert "#searchBox { background: transparent; border: none; }" in search_style
     assert "#search {" in search_style
-    assert "color: #171A24; font-size: 16pt; padding: 0 2px;" in search_style
+    assert f"color: #171A24; font-size: {metrics.search_font_size_pt}pt; padding: 0 2px;" in search_style
     assert "selection-background-color: #5264E8; selection-color: #FFFFFF;" in search_style
 
 
@@ -2312,10 +2321,11 @@ def test_large_image_decode_does_not_block_selection(qtbot, tmp_path: Path, monk
 
 
 def test_list_item_content_has_equal_top_and_bottom_padding() -> None:
+    metrics = ui_module._ui_metrics()
     row = QRect(4, 1, 500, 42)
     content = ClipDelegate._thumbnail_rect(row)
 
-    assert content.size() == QSize(30, 30)
+    assert content.size() == QSize(metrics.list_thumbnail_size, metrics.list_thumbnail_size)
     assert content.top() - row.top() == row.bottom() - content.bottom()
 
 
@@ -2733,6 +2743,7 @@ def test_tray_menu_uses_generic_show_window_label(qtbot) -> None:
 
 
 def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
+    metrics = ui_module._ui_metrics()
     panel = ClipPanel(lambda: AppSettings(theme="light"))
     qtbot.addWidget(panel)
     panel.set_items([clip("selected", "item", 1)])
@@ -2749,7 +2760,7 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     qtbot.addWidget(menu)
 
     font = QFont(menu.font())
-    font.setPointSize(ui_module._POPUP_ITEM_FONT_SIZE_PT)
+    font.setPointSize(metrics.popup_item_font_size_pt)
     expected = (
         QFontMetrics(font).horizontalAdvance("删除")
         + (ui_module._COMPACT_MENU_ICON_SIZE + ui_module._COMPACT_MENU_ICON_GAP)
@@ -2762,7 +2773,7 @@ def test_list_context_menu_uses_compact_content_width(qtbot) -> None:
     )
     assert menu.width() >= expected
     assert menu.style().pixelMetric(QStyle.PixelMetric.PM_SmallIconSize, None, menu) == 14
-    assert f"font-size: {ui_module._POPUP_ITEM_FONT_SIZE_PT}pt" in menu.styleSheet()
+    assert f"font-size: {metrics.popup_item_font_size_pt}pt" in menu.styleSheet()
     assert (
         f"padding: {ui_module._COMPACT_MENU_VERTICAL_INSET}px "
         f"{ui_module._COMPACT_MENU_SHELL_HORIZONTAL_INSET}px"
@@ -2875,6 +2886,7 @@ def test_list_context_menu_actions_use_their_own_semantic_icons(qtbot) -> None:
 
 
 def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
+    metrics = ui_module._ui_metrics()
     menu = QMenu()
     qtbot.addWidget(menu)
     menu.addAction("收藏")
@@ -2891,7 +2903,7 @@ def test_compact_context_menu_uses_explicit_dark_theme_contrast(qtbot) -> None:
     style = menu.styleSheet()
     assert "background: #2A2F3B" in style
     assert "color: #F2F4F8" in style
-    assert f"font-size: {ui_module._POPUP_ITEM_FONT_SIZE_PT}pt" in style
+    assert f"font-size: {metrics.popup_item_font_size_pt}pt" in style
     assert f"border-radius: {ui_module._COMPACT_MENU_CORNER_RADIUS}px" in style
     assert "background: #444B5C" in style
     assert "background: #454C5C" in style
@@ -3172,6 +3184,7 @@ def test_active_panel_keeps_search_focus_after_every_in_panel_interaction(qtbot,
 
 @pytest.mark.parametrize("theme", ("light", "dark", "frosted"))
 def test_search_uses_an_app_owned_themed_blinking_caret(qtbot, theme: str) -> None:
+    metrics = ui_module._ui_metrics()
     panel = ClipPanel(lambda: AppSettings(theme=theme))
     qtbot.addWidget(panel)
     panel.show_panel()
@@ -3181,7 +3194,7 @@ def test_search_uses_an_app_owned_themed_blinking_caret(qtbot, theme: str) -> No
     palette = panel.search.palette()
     assert palette.color(QPalette.ColorRole.Text) == QColor(colors.text)
     assert palette.color(QPalette.ColorRole.WindowText) == QColor(colors.text)
-    assert f"color: {colors.text}; font-size: 16pt" in panel.styleSheet()
+    assert f"color: {colors.text}; font-size: {metrics.search_font_size_pt}pt" in panel.styleSheet()
     assert f"selection-color: {_accent_foreground(panel._appearance)}" in panel.styleSheet()
 
     # The native QLineEdit caret must be absent during the overlay's hidden
