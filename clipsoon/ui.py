@@ -711,6 +711,22 @@ class _ThemedTextCaret(QObject):
 
 
 _FROSTED_RADIUS = 18.0
+_SETTINGS_WINDOW_RADIUS = 16.0
+
+
+def _rounded_widget_path(widget: QWidget, radius: float) -> QPainterPath:
+    path = QPainterPath()
+    if widget.rect().isEmpty():
+        return path
+    rect = QRectF(widget.rect()).adjusted(0.6, 0.6, -0.6, -0.6)
+    path.addRoundedRect(rect, radius, radius)
+    return path
+
+
+def _apply_rounded_widget_mask(widget: QWidget, radius: float) -> None:
+    if widget.rect().isEmpty():
+        return
+    widget.setMask(QRegion(_rounded_widget_path(widget, radius).toFillPolygon().toPolygon()))
 
 
 def _paint_frosted_material(
@@ -852,11 +868,14 @@ def _paint_frosted_material(
 class _FrostedSurface(QFrame):
     """One primary custom-painted material shell for a widget hierarchy."""
 
+    material_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._appearance = _ThemeAppearance(dark=False)
         self._light_position = QPointF()
         self._light_strength = 0.0
+        self._paint_material = True
         self._hover_animation = self._create_hover_animation()
         self.setFrameShape(QFrame.Shape.NoFrame)
 
@@ -893,12 +912,21 @@ class _FrostedSurface(QFrame):
                 self._hover_animation.stop()
             self._light_strength = 0.0
         self.update()
+        self.material_changed.emit()
+
+    def set_paint_material(self, enabled: bool) -> None:
+        if self._paint_material == enabled:
+            return
+        self._paint_material = enabled
+        self.update()
+        self.material_changed.emit()
 
     def set_light_position(self, position: QPointF) -> None:
         if not self._appearance.frosted:
             return
         self._light_position = position
         self.update()
+        self.material_changed.emit()
 
     def set_light_active(self, active: bool) -> None:
         if not self._appearance.frosted:
@@ -919,10 +947,11 @@ class _FrostedSurface(QFrame):
     def _set_light_strength(self, value: object) -> None:
         self._light_strength = float(value)
         self.update()
+        self.material_changed.emit()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if not self._appearance.frosted:
+        if not self._appearance.frosted or not self._paint_material:
             return
         painter = QPainter(self)
         _paint_frosted_material(
@@ -977,15 +1006,10 @@ class _PanelInteractionShield(QWidget):
         self.hide()
 
     def _rounded_path(self) -> QPainterPath:
-        path = QPainterPath()
-        rect = QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6)
-        path.addRoundedRect(rect, _FROSTED_RADIUS, _FROSTED_RADIUS)
-        return path
+        return _rounded_widget_path(self, _FROSTED_RADIUS)
 
     def _apply_rounded_mask(self) -> None:
-        if self.rect().isEmpty():
-            return
-        self.setMask(QRegion(self._rounded_path().toFillPolygon().toPolygon()))
+        _apply_rounded_widget_mask(self, _FROSTED_RADIUS)
 
     def set_appearance(self, appearance: _ThemeAppearance) -> None:
         self._appearance = appearance
@@ -2325,11 +2349,23 @@ class SettingsDialog(QDialog):
             # QSS may reset this property while polishing; restore the
             # non-layered backing-store contract after every theme change.
             self.setAutoFillBackground(True)
+        self._sync_windows_rounded_window_mask()
+
+    def _sync_windows_rounded_window_mask(self) -> None:
+        if sys.platform == "win32":
+            _apply_rounded_widget_mask(self, _SETTINGS_WINDOW_RADIUS)
+        else:
+            self.clearMask()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._sync_windows_rounded_window_mask()
         self._install_external_dismiss_filter()
         QTimer.singleShot(0, self._focus_initial_control)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_windows_rounded_window_mask()
 
     def _focus_initial_control(self) -> None:
         if self.isVisible() and self.focusWidget() in (None, self.close_button):
@@ -2480,6 +2516,7 @@ class ClipPanel(QWidget):
         self._outer_layout = outer
         self.card = _FrostedSurface()
         self.card.setObjectName("card")
+        self.card.material_changed.connect(self.update)
         self._card_shadow: QGraphicsDropShadowEffect | None = None
         if sys.platform != "win32":
             shadow = QGraphicsDropShadowEffect(self)
@@ -2901,9 +2938,27 @@ class ClipPanel(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._sync_windows_rounded_window_mask()
         self._sync_settings_interaction_shield_geometry()
         if self._settings_interaction_blocked:
             QTimer.singleShot(0, self._refresh_settings_interaction_shield)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if sys.platform != "win32" or not self._appearance.frosted:
+            return
+        painter = QPainter(self)
+        light_position = None
+        light_strength = self.card._light_strength
+        if light_strength > 0:
+            light_position = QPointF(self.card.mapTo(self, self.card._light_position.toPoint()))
+        _paint_frosted_material(
+            painter,
+            QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6),
+            self._appearance,
+            light_position=light_position,
+            light_strength=light_strength,
+        )
 
     def _can_start_drag(self, position: QPoint) -> bool:
         if self._settings_interaction_blocked:
@@ -2927,6 +2982,10 @@ class ClipPanel(QWidget):
     def hideEvent(self, event) -> None:
         self._prepare_selection_for_hide()
         super().hideEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_windows_rounded_window_mask()
 
     def hide_panel(self) -> None:
         if not self.isVisible():
@@ -3038,6 +3097,7 @@ class ClipPanel(QWidget):
         self._appearance = _theme_appearance(self._settings())
         self._dark_theme = self._appearance.dark
         self.card.set_appearance(self._appearance)
+        self.card.set_paint_material(sys.platform != "win32")
         # A theme must not change the panel's visible card geometry.  On macOS
         # the frosted custom shell uses the same 14-point gutter as ordinary
         # themes, so the visible card size stays stable across switches.
@@ -3068,7 +3128,14 @@ class ClipPanel(QWidget):
             # QSS may reset this property while polishing; restore the
             # non-layered backing-store contract after every theme change.
             self.setAutoFillBackground(True)
+        self._sync_windows_rounded_window_mask()
         self._sync_search_box_height()
+
+    def _sync_windows_rounded_window_mask(self) -> None:
+        if sys.platform == "win32":
+            _apply_rounded_widget_mask(self, _FROSTED_RADIUS)
+        else:
+            self.clearMask()
 
     def _sync_search_box_height(self) -> None:
         """Keep each search-region gap at half the visible search-text height."""

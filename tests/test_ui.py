@@ -1451,6 +1451,31 @@ def test_windows_frosted_keeps_qt_non_layered_with_app_owned_material(
     assert "rgba(232, 244, 255, 54)" in panel.styleSheet()
 
 
+def test_windows_panel_and_settings_windows_clip_top_level_corners(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    panel = ClipPanel(lambda: AppSettings(theme="frosted"))
+    dialog = SettingsDialog(AppSettings(theme="frosted"), accessibility_granted=True)
+    qtbot.addWidget(panel)
+    qtbot.addWidget(dialog)
+
+    panel.show_panel()
+    dialog.show()
+    qtbot.waitExposed(panel)
+    qtbot.waitExposed(dialog)
+
+    for widget in (panel, dialog):
+        mask = widget.mask()
+        assert not mask.isEmpty()
+        assert not mask.contains(QPoint(0, 0))
+        assert not mask.contains(QPoint(widget.width() - 1, 0))
+        assert mask.contains(widget.rect().center())
+
+    assert not panel.card._paint_material
+    assert panel.palette().color(QPalette.ColorRole.Window) == QColor(
+        _theme_colors(panel._appearance).window
+    )
+
+
 def test_windows_dialogs_keep_non_layered_backing_without_qt_drop_shadows(qtbot, monkeypatch) -> None:
     monkeypatch.setattr(ui_module.sys, "platform", "win32")
     dialog = SettingsDialog(AppSettings(theme="frosted"), accessibility_granted=True)
