@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import locale
 import logging
+import math
 import sys
 import time
 from collections import OrderedDict
@@ -55,6 +56,7 @@ from PySide6.QtGui import (
     QPixmap,
     QRadialGradient,
     QRegion,
+    QScreen,
     QShortcut,
 )
 from PySide6.QtWidgets import (
@@ -172,6 +174,15 @@ _LIST_ROW_HEIGHT = 44
 _LIST_THUMBNAIL_SIZE = 30
 _DETAIL_CACHE_BYTES = 64 * 1024 * 1024
 _DETAIL_CACHE_ENTRIES = 12
+_IMAGE_VIEWER_CACHE_BYTES = 128 * 1024 * 1024
+_IMAGE_VIEWER_CACHE_ENTRIES = 3
+_IMAGE_VIEWER_MAX_DECODE_BYTES = 128 * 1024 * 1024
+_IMAGE_VIEWER_MIN_ZOOM = 0.05
+_IMAGE_VIEWER_MAX_ZOOM = 8.0
+_IMAGE_VIEWER_MINIMUM_SIZE = QSize(180, 140)
+_IMAGE_VIEWER_WINDOW_MARGIN = 96
+_IMAGE_VIEWER_FRAME_MARGIN = 0
+_IMAGE_VIEWER_RESIZE_MARGIN = 8
 _PREVIEW_SIZE_BUCKET = 64
 _FILE_REVISION_TTL_SECONDS = 1.0
 
@@ -1803,6 +1814,8 @@ class ClipDelegate(QStyledItemDelegate):
 
 
 class ImagePreview(QLabel):
+    activated = Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self._path = ""
@@ -1817,6 +1830,7 @@ class ImagePreview(QLabel):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._render)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setMinimumSize(220, 240)
         self.setText("图片预览")
 
@@ -1825,6 +1839,7 @@ class ImagePreview(QLabel):
         self._path = path
         self._image_loader.retain_only(path)
         self.clear()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         if not path:
             self.setText("图片预览")
             return
@@ -1869,6 +1884,477 @@ class ImagePreview(QLabel):
 
     def invalidate_paths(self, paths: set[str]) -> None:
         self._image_loader.invalidate_paths(paths)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._path:
+            self.activated.emit(self._path)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class _ZoomableImageCanvas(QWidget):
+    background_clicked = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._path = ""
+        self._image = QImage()
+        self._status = ""
+        self._zoom = 1.0
+        self._fit_mode = True
+        self._offset = QPointF()
+        self._drag_origin: QPointF | None = None
+        self._dragging = False
+        self._drag_offset = QPointF()
+        self._image_loader = _ScaledImageLoader(
+            self,
+            max_cache_bytes=_IMAGE_VIEWER_CACHE_BYTES,
+            max_cache_entries=_IMAGE_VIEWER_CACHE_ENTRIES,
+            priority=2,
+        )
+        self._image_loader.image_ready.connect(self._image_loaded)
+        self.setObjectName("imageViewerCanvas")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setMouseTracking(True)
+        self.setMinimumSize(1, 1)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def set_path(self, path: str) -> None:
+        self._path = path
+        self._image = QImage()
+        self._status = ""
+        self._fit_mode = True
+        self._zoom = 1.0
+        self._offset = QPointF()
+        self._drag_origin = None
+        self._dragging = False
+        self._image_loader.retain_only(path)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+        if path:
+            self._request_image()
+        else:
+            self._status = ""
+
+    def fit_to_window(self) -> None:
+        if self._image.isNull():
+            return
+        self._fit_mode = True
+        self._zoom = self._fit_zoom()
+        self._offset = QPointF()
+        self.update()
+
+    def actual_size(self, anchor: QPointF | None = None) -> None:
+        if self._image.isNull():
+            return
+        self._fit_mode = False
+        self._set_zoom(1.0, anchor or QRectF(self.rect()).center())
+
+    @property
+    def zoom(self) -> float:
+        return self._zoom
+
+    @property
+    def image(self) -> QImage:
+        return self._image
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._image.isNull():
+            return
+        if self._fit_mode:
+            self.fit_to_window()
+        else:
+            self._constrain_offset()
+
+    def wheelEvent(self, event) -> None:
+        if self._image.isNull():
+            super().wheelEvent(event)
+            return
+        if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            event.accept()
+            return
+        steps = event.angleDelta().y() / 120.0
+        if steps == 0:
+            event.accept()
+            return
+        self._fit_mode = False
+        self._set_zoom(self._zoom * (1.16**steps), event.position())
+        event.accept()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or self._image.isNull():
+            super().mousePressEvent(event)
+            return
+        if not self._image_rect().contains(event.position()):
+            self.background_clicked.emit()
+            event.accept()
+            return
+        self._drag_origin = event.position()
+        self._dragging = False
+        self._drag_offset = QPointF(self._offset)
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_origin is None or self._image.isNull():
+            super().mouseMoveEvent(event)
+            return
+        delta = event.position() - self._drag_origin
+        if not self._dragging:
+            if math.isclose(delta.x(), 0.0, abs_tol=0.1) and math.isclose(delta.y(), 0.0, abs_tol=0.1):
+                event.accept()
+                return
+            self._dragging = True
+        self._offset = self._drag_offset + delta
+        self._constrain_offset()
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_origin is not None:
+            close_requested = not self._dragging
+            self._drag_origin = None
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            if close_requested:
+                self.background_clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        super().mouseDoubleClickEvent(event)
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#101318"))
+        if self._image.isNull():
+            painter.setPen(QColor("#C5CEDA"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status)
+            return
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, not math.isclose(self._zoom, 1.0))
+        painter.drawImage(self._image_rect(), self._image, QRectF(self._image.rect()))
+
+    def _request_image(self) -> None:
+        if not self._path:
+            return
+        image = self._image_loader.request(
+            self._path,
+            _viewer_decode_bounds(self._path),
+            keep_aspect=True,
+        )
+        if image is not None:
+            self._apply_image(image)
+
+    def _image_loaded(self, key: ImageLoadKey, image: QImage) -> None:
+        if key[0] == self._path:
+            self._apply_image(image)
+
+    def _apply_image(self, image: QImage) -> None:
+        if image.isNull():
+            self._image = QImage()
+            self._status = "无法预览图片"
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+            return
+        self._image = image
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.fit_to_window()
+
+    def _set_zoom(self, zoom: float, anchor: QPointF) -> None:
+        old_rect = self._image_rect()
+        self._zoom = min(max(zoom, _IMAGE_VIEWER_MIN_ZOOM), _IMAGE_VIEWER_MAX_ZOOM)
+        if old_rect.isValid() and not old_rect.isEmpty() and old_rect.contains(anchor):
+            relative_x = (anchor.x() - old_rect.left()) / old_rect.width()
+            relative_y = (anchor.y() - old_rect.top()) / old_rect.height()
+            width, height = self._display_size()
+            top_left = QPointF(anchor.x() - width * relative_x, anchor.y() - height * relative_y)
+            center = top_left + QPointF(width / 2.0, height / 2.0)
+            self._offset = center - QRectF(self.rect()).center()
+        self._constrain_offset()
+
+    def _fit_zoom(self) -> float:
+        width, height = self._image_logical_size()
+        if width <= 0 or height <= 0 or self.width() <= 0 or self.height() <= 0:
+            return 1.0
+        fit = min(self.width() / width, self.height() / height)
+        return min(1.0, max(_IMAGE_VIEWER_MIN_ZOOM, fit))
+
+    def _image_rect(self) -> QRectF:
+        width, height = self._display_size()
+        center = QRectF(self.rect()).center() + self._offset
+        return QRectF(center.x() - width / 2.0, center.y() - height / 2.0, width, height)
+
+    def _display_size(self) -> tuple[float, float]:
+        width, height = self._image_logical_size()
+        return width * self._zoom, height * self._zoom
+
+    def _image_logical_size(self) -> tuple[float, float]:
+        if self._image.isNull():
+            return 0.0, 0.0
+        device_scale = max(1.0, float(self.devicePixelRatioF()))
+        return self._image.width() / device_scale, self._image.height() / device_scale
+
+    def _constrain_offset(self) -> None:
+        width, height = self._display_size()
+        max_x = self._axis_drag_limit(width, self.width())
+        max_y = self._axis_drag_limit(height, self.height())
+        self._offset = QPointF(
+            min(max(self._offset.x(), -max_x), max_x) if max_x else 0.0,
+            min(max(self._offset.y(), -max_y), max_y) if max_y else 0.0,
+        )
+        self.update()
+
+    @staticmethod
+    def _axis_drag_limit(display_length: float, viewport_length: int) -> float:
+        if display_length <= 0 or viewport_length <= 0:
+            return 0.0
+        limit = abs(display_length - viewport_length) / 2.0
+        if limit < 1.0:
+            return min(display_length, float(viewport_length)) / 2.0
+        return limit
+
+
+class ImageViewerDialog(QDialog):
+    def __init__(self, path: str, appearance: _ThemeAppearance, parent: QWidget | None = None) -> None:
+        super().__init__(None)
+        self._appearance = appearance
+        self._external_dismiss_filter_installed = False
+        self._resize_edges: set[str] = set()
+        self._resize_origin_geometry = QRect()
+        self._resize_origin_global = QPoint()
+        self.setObjectName("imageViewerDialog")
+        self.setWindowTitle("")
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.setMinimumSize(_IMAGE_VIEWER_MINIMUM_SIZE)
+        self._apply_screen_size_limits(parent)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(
+            _IMAGE_VIEWER_FRAME_MARGIN,
+            _IMAGE_VIEWER_FRAME_MARGIN,
+            _IMAGE_VIEWER_FRAME_MARGIN,
+            _IMAGE_VIEWER_FRAME_MARGIN,
+        )
+        root.setSpacing(0)
+
+        self.canvas = _ZoomableImageCanvas()
+        root.addWidget(self.canvas, 1)
+
+        self.canvas.background_clicked.connect(self.reject)
+        self.canvas.installEventFilter(self)
+        self.set_appearance(appearance)
+        self.resize(_image_viewer_default_size(path, parent))
+        self.canvas.set_path(path)
+
+    def set_appearance(self, appearance: _ThemeAppearance) -> None:
+        self._appearance = appearance
+        self.setStyleSheet(_image_viewer_style_sheet(appearance))
+
+    def center_on_widget(self, anchor: QWidget | None) -> None:
+        self._apply_screen_size_limits(anchor)
+        own_size = self.size()
+        if anchor is not None and anchor.isVisible():
+            anchor_geometry = anchor.frameGeometry()
+            target = anchor_geometry.center() - QPoint(own_size.width() // 2, own_size.height() // 2)
+            screen = QApplication.screenAt(anchor_geometry.center()) or anchor.screen()
+        else:
+            screen = QApplication.primaryScreen()
+            available = screen.availableGeometry() if screen is not None else QRect(0, 0, 960, 720)
+            target = available.center() - QPoint(own_size.width() // 2, own_size.height() // 2)
+        if screen is not None:
+            available = screen.availableGeometry()
+            target.setX(min(max(target.x(), available.left()), available.right() - own_size.width() + 1))
+            target.setY(min(max(target.y(), available.top()), available.bottom() - own_size.height() + 1))
+        self.move(target)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._install_external_dismiss_filter()
+        _apply_rounded_widget_mask(self, 16)
+
+    def hideEvent(self, event) -> None:
+        self._remove_external_dismiss_filter()
+        super().hideEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        _apply_rounded_widget_mask(self, 16)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        edges = self._resize_edges_at(event.position())
+        if event.button() == Qt.MouseButton.LeftButton and edges:
+            self._resize_edges = edges
+            self._resize_origin_geometry = self.geometry()
+            self._resize_origin_global = event.globalPosition().toPoint()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._resize_edges:
+            self._resize_to(event.globalPosition().toPoint())
+            event.accept()
+            return
+        self._set_resize_cursor(self._resize_edges_at(event.position()))
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._resize_edges:
+            self._resize_edges = set()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if not self._resize_edges:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if not self.isVisible():
+            return super().eventFilter(watched, event)
+        if watched is self.canvas and isinstance(event, QMouseEvent) and self._handle_canvas_resize_event(event):
+            return True
+        event_type = event.type()
+        if event_type == QEvent.Type.ApplicationDeactivate:
+            self.reject()
+            return super().eventFilter(watched, event)
+        if event_type in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.NonClientAreaMouseButtonPress,
+        ) and isinstance(event, QMouseEvent):
+            global_pos = self._mouse_global_position(event)
+            if global_pos is not None and not self.frameGeometry().contains(global_pos):
+                self.reject()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _handle_canvas_resize_event(self, event: QMouseEvent) -> bool:
+        local_position = QPointF(self.canvas.mapTo(self, event.position().toPoint()))
+        event_type = event.type()
+        if event_type == QEvent.Type.MouseButtonPress:
+            edges = self._resize_edges_at(local_position)
+            if event.button() == Qt.MouseButton.LeftButton and edges:
+                self._resize_edges = edges
+                self._resize_origin_geometry = self.geometry()
+                self._resize_origin_global = event.globalPosition().toPoint()
+                event.accept()
+                return True
+        if event_type == QEvent.Type.MouseMove:
+            if self._resize_edges:
+                self._resize_to(event.globalPosition().toPoint())
+                event.accept()
+                return True
+            if not event.buttons():
+                self._set_resize_cursor(self._resize_edges_at(local_position))
+        if event_type == QEvent.Type.MouseButtonRelease and self._resize_edges:
+            self._resize_edges = set()
+            self._set_resize_cursor(set())
+            event.accept()
+            return True
+        return False
+
+    def _install_external_dismiss_filter(self) -> None:
+        if self._external_dismiss_filter_installed:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.installEventFilter(self)
+        self._external_dismiss_filter_installed = True
+
+    def _remove_external_dismiss_filter(self) -> None:
+        if not self._external_dismiss_filter_installed:
+            return
+        app = QApplication.instance()
+        if app is not None:
+            with suppress(RuntimeError):
+                app.removeEventFilter(self)
+        self._external_dismiss_filter_installed = False
+
+    def _apply_screen_size_limits(self, anchor: QWidget | None) -> None:
+        screen = _image_viewer_screen(anchor)
+        if screen is None:
+            return
+        maximum = _image_viewer_maximum_size(screen)
+        self.setMaximumSize(maximum)
+        if self.width() > maximum.width() or self.height() > maximum.height():
+            self.resize(
+                min(self.width(), maximum.width()),
+                min(self.height(), maximum.height()),
+            )
+
+    def _resize_edges_at(self, position: QPointF) -> set[str]:
+        edges: set[str] = set()
+        margin = _IMAGE_VIEWER_RESIZE_MARGIN
+        if position.x() <= margin:
+            edges.add("left")
+        elif position.x() >= self.width() - margin:
+            edges.add("right")
+        if position.y() <= margin:
+            edges.add("top")
+        elif position.y() >= self.height() - margin:
+            edges.add("bottom")
+        return edges
+
+    def _set_resize_cursor(self, edges: set[str]) -> None:
+        if edges in ({"top", "left"}, {"bottom", "right"}):
+            cursor = Qt.CursorShape.SizeFDiagCursor
+        elif edges in ({"top", "right"}, {"bottom", "left"}):
+            cursor = Qt.CursorShape.SizeBDiagCursor
+        elif edges & {"left", "right"}:
+            cursor = Qt.CursorShape.SizeHorCursor
+        elif edges & {"top", "bottom"}:
+            cursor = Qt.CursorShape.SizeVerCursor
+        else:
+            cursor = Qt.CursorShape.ArrowCursor
+        self.setCursor(cursor)
+        self.canvas.setCursor(cursor)
+
+    def _resize_to(self, global_position: QPoint) -> None:
+        delta = global_position - self._resize_origin_global
+        origin = self._resize_origin_geometry
+        maximum = self.maximumSize()
+        width = origin.width()
+        height = origin.height()
+        x = origin.x()
+        y = origin.y()
+        if "left" in self._resize_edges:
+            width = origin.width() - delta.x()
+            width = min(max(width, self.minimumWidth()), maximum.width())
+            x = origin.x() + origin.width() - width
+        elif "right" in self._resize_edges:
+            width = min(max(origin.width() + delta.x(), self.minimumWidth()), maximum.width())
+        if "top" in self._resize_edges:
+            height = origin.height() - delta.y()
+            height = min(max(height, self.minimumHeight()), maximum.height())
+            y = origin.y() + origin.height() - height
+        elif "bottom" in self._resize_edges:
+            height = min(max(origin.height() + delta.y(), self.minimumHeight()), maximum.height())
+        self.setGeometry(QRect(x, y, width, height))
+
+    @staticmethod
+    def _mouse_global_position(event: QMouseEvent) -> QPoint | None:
+        with suppress(RuntimeError, AttributeError):
+            return event.globalPosition().toPoint()
+        return None
 
 
 class TextFilePreview(QPlainTextEdit):
@@ -2616,6 +3102,7 @@ class ClipPanel(QWidget):
         self._drag_offset: QPoint | None = None
         self._drag_origin: QPoint | None = None
         self._settings_interaction_shield: _PanelInteractionShield | None = None
+        self._image_viewer_dialog: ImageViewerDialog | None = None
         self._panel_shortcuts: list[QShortcut] = []
         self.setObjectName("panelWindow")
         self.setWindowFlags(
@@ -2808,6 +3295,7 @@ class ClipPanel(QWidget):
             lambda: self._clear_search_selection_for_preview(self.text_preview)
         )
         self.image_preview = ImagePreview()
+        self.image_preview.activated.connect(self._open_image_viewer)
         self.file_preview = QLabel()
         self.file_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.file_text_preview = TextFilePreview()
@@ -3259,6 +3747,8 @@ class ClipPanel(QWidget):
             self._settings_interaction_shield.set_appearance(self._appearance)
             if self._settings_interaction_blocked:
                 QTimer.singleShot(0, self._refresh_settings_interaction_shield)
+        if self._image_viewer_dialog is not None:
+            self._image_viewer_dialog.set_appearance(self._appearance)
         if sys.platform == "win32":
             # QSS may reset this property while polishing; restore the
             # non-layered backing-store contract after every theme change.
@@ -3347,6 +3837,36 @@ class ClipPanel(QWidget):
         ):
             return
         self.search.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _open_image_viewer(self, path: str) -> None:
+        if not path or self._settings_interaction_blocked:
+            return
+        if self._image_viewer_dialog is not None and self._image_viewer_dialog.isVisible():
+            self._image_viewer_dialog.canvas.set_path(path)
+            self._image_viewer_dialog.center_on_widget(self)
+            self._image_viewer_dialog.raise_()
+            self._image_viewer_dialog.activateWindow()
+            return
+        self.keep_open(True)
+        dialog = ImageViewerDialog(path, self._appearance, self)
+        self._image_viewer_dialog = dialog
+
+        def viewer_finished() -> None:
+            if self._image_viewer_dialog is not dialog:
+                return
+            self._image_viewer_dialog = None
+            if not self._settings_interaction_blocked:
+                self.keep_open(False)
+            self._schedule_search_focus_restore()
+            dialog.deleteLater()
+
+        dialog.finished.connect(viewer_finished)
+        dialog.center_on_widget(self)
+        dialog.show()
+        dialog.center_on_widget(self)
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if self._settings_interaction_blocked and self._is_blocked_panel_input_event(event):
@@ -4287,6 +4807,24 @@ def _confirmation_style_sheet(
     """
 
 
+def _image_viewer_style_sheet(theme: bool | _ThemeAppearance) -> str:
+    appearance = _as_theme_appearance(theme)
+    colors = _theme_colors(appearance)
+    metrics = _ui_metrics()
+    font_family_rule = _platform_font_family_rule()
+    root_background = colors.window if appearance.frosted else colors.card
+    return f"""
+        QDialog#imageViewerDialog {{
+            background: {root_background}; border: none;
+            border-radius: 16px; color: {colors.text};
+            {font_family_rule}font-size: {metrics.root_font_size_pt}pt;
+        }}
+        #imageViewerCanvas {{
+            background: #101318; border: none; border-radius: 0px;
+        }}
+    """
+
+
 def _single_image_file_path(files: Sequence[str]) -> str:
     if len(files) != 1:
         return ""
@@ -4316,6 +4854,61 @@ def _fit_image_size(source: QSize, bounds: QSize, *, allow_upscale: bool) -> QSi
     if allow_upscale or fitted.width() < source.width() or fitted.height() < source.height():
         return fitted
     return QSize(source)
+
+
+def _viewer_decode_bounds(path: str) -> QSize:
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    natural = reader.size()
+    if not natural.isValid() or natural.isEmpty():
+        return QSize(4096, 4096)
+    return _bounded_image_bytes(natural, _IMAGE_VIEWER_MAX_DECODE_BYTES)
+
+
+def _bounded_image_bytes(size: QSize, max_bytes: int) -> QSize:
+    if not size.isValid() or size.isEmpty():
+        return QSize(max(1, size.width()), max(1, size.height()))
+    max_pixels = max(1, max_bytes // 4)
+    pixels = max(1, size.width()) * max(1, size.height())
+    if pixels <= max_pixels:
+        return QSize(size)
+    ratio = math.sqrt(max_pixels / pixels)
+    return QSize(max(1, int(size.width() * ratio)), max(1, int(size.height() * ratio)))
+
+
+def _image_viewer_default_size(path: str, anchor: QWidget | None) -> QSize:
+    screen = _image_viewer_screen(anchor)
+    maximum = _image_viewer_maximum_size(screen) if screen is not None else QSize(720, 520)
+    natural = _image_natural_size(path)
+    frame = _IMAGE_VIEWER_FRAME_MARGIN * 2
+    if not natural.isValid() or natural.isEmpty():
+        desired = QSize(720, 520)
+    else:
+        desired = QSize(natural.width() + frame, natural.height() + frame)
+    return QSize(
+        min(max(desired.width(), _IMAGE_VIEWER_MINIMUM_SIZE.width()), maximum.width()),
+        min(max(desired.height(), _IMAGE_VIEWER_MINIMUM_SIZE.height()), maximum.height()),
+    )
+
+
+def _image_natural_size(path: str) -> QSize:
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    return reader.size()
+
+
+def _image_viewer_screen(anchor: QWidget | None) -> QScreen | None:
+    if anchor is not None and anchor.screen() is not None:
+        return anchor.screen()
+    return QApplication.primaryScreen()
+
+
+def _image_viewer_maximum_size(screen: QScreen) -> QSize:
+    available = screen.availableGeometry()
+    return QSize(
+        max(_IMAGE_VIEWER_MINIMUM_SIZE.width(), available.width() - _IMAGE_VIEWER_WINDOW_MARGIN),
+        max(_IMAGE_VIEWER_MINIMUM_SIZE.height(), available.height() - _IMAGE_VIEWER_WINDOW_MARGIN),
+    )
 
 
 def _scaled_size(size: QSize, scale: float) -> QSize:

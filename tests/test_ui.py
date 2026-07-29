@@ -31,6 +31,7 @@ from PySide6.QtGui import (
     QPainter,
     QPalette,
     QPixmap,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,6 +42,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QPushButton,
     QStyle,
     QStyleOptionButton,
     QStyleOptionViewItem,
@@ -54,6 +56,7 @@ from clipsoon.ui import (
     ClipDelegate,
     ClipPanel,
     ImagePreview,
+    ImageViewerDialog,
     SearchIcon,
     SettingsDialog,
     _accent_foreground,
@@ -2279,6 +2282,154 @@ def test_detail_image_preview_scales_large_images_down_to_fit(qtbot, tmp_path: P
         timeout=1_000,
     )
     assert preview.pixmap().size() == QSize(340, 170)
+
+
+def test_clicking_detail_image_preview_opens_plain_image_viewer(qtbot, tmp_path: Path) -> None:
+    path = tmp_path / "viewer-source.png"
+    image = QImage(120, 80, QImage.Format.Format_RGB32)
+    image.fill(QColor("#3986e8"))
+    assert image.save(str(path), "PNG")
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items(
+        [
+            ClipItem(
+                "image",
+                ClipKind.IMAGE,
+                "image",
+                1,
+                1,
+                image_path=str(path),
+                byte_size=path.stat().st_size,
+            )
+        ]
+    )
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    qtbot.waitUntil(
+        lambda: panel.image_preview.pixmap() is not None and not panel.image_preview.pixmap().isNull(),
+        timeout=1_000,
+    )
+
+    qtbot.mouseClick(panel.image_preview, Qt.MouseButton.LeftButton)
+
+    qtbot.waitUntil(
+        lambda: panel._image_viewer_dialog is not None and panel._image_viewer_dialog.isVisible(),
+        timeout=1_000,
+    )
+    dialog = panel._image_viewer_dialog
+    assert isinstance(dialog, ImageViewerDialog)
+    assert panel._keep_open
+    assert not dialog.findChildren(QPushButton)
+    assert not dialog.findChildren(QLabel)
+    qtbot.waitUntil(lambda: not dialog.canvas.image.isNull(), timeout=1_000)
+    assert not dialog.canvas.image.isNull()
+
+    qtbot.mouseClick(dialog.canvas, Qt.MouseButton.LeftButton, pos=dialog.canvas.rect().center())
+    qtbot.waitUntil(lambda: panel._image_viewer_dialog is None, timeout=1_000)
+    assert not panel._keep_open
+
+
+def test_image_viewer_defaults_to_image_size_and_requires_control_wheel_to_zoom(
+    qtbot, tmp_path: Path
+) -> None:
+    path = tmp_path / "viewer-zoom.png"
+    image = QImage(800, 400, QImage.Format.Format_RGB32)
+    image.fill(QColor("#3986e8"))
+    assert image.save(str(path), "PNG")
+    dialog = ImageViewerDialog(str(path), _ThemeAppearance(dark=False))
+    qtbot.addWidget(dialog)
+    expected_width = min(
+        max(800 + ui_module._IMAGE_VIEWER_FRAME_MARGIN * 2, ui_module._IMAGE_VIEWER_MINIMUM_SIZE.width()),
+        dialog.maximumWidth(),
+    )
+    expected_height = min(
+        max(400 + ui_module._IMAGE_VIEWER_FRAME_MARGIN * 2, ui_module._IMAGE_VIEWER_MINIMUM_SIZE.height()),
+        dialog.maximumHeight(),
+    )
+    assert dialog.size() == QSize(expected_width, expected_height)
+    dialog.center_on_widget(None)
+    assert dialog.size() == QSize(expected_width, expected_height)
+    dialog.resize(400, 300)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    qtbot.waitUntil(lambda: not dialog.canvas.image.isNull(), timeout=1_000)
+
+    assert dialog.canvas.zoom < 1.0
+    before = dialog.canvas.zoom
+
+    def wheel(modifiers: Qt.KeyboardModifier) -> None:
+        position = QPointF(dialog.canvas.rect().center())
+        global_position = QPointF(dialog.canvas.mapToGlobal(dialog.canvas.rect().center()))
+        event = QWheelEvent(
+            position,
+            global_position,
+            QPoint(0, 0),
+            QPoint(0, 120),
+            Qt.MouseButton.NoButton,
+            modifiers,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        QCoreApplication.sendEvent(dialog.canvas, event)
+
+    wheel(Qt.KeyboardModifier.NoModifier)
+    assert dialog.canvas.zoom == before
+    wheel(Qt.KeyboardModifier.ControlModifier)
+    assert dialog.canvas.zoom > before
+
+
+def test_image_viewer_drag_moves_equal_height_image_with_default_cursor(qtbot, tmp_path: Path) -> None:
+    path = tmp_path / "viewer-drag.png"
+    image = QImage(80, 140, QImage.Format.Format_RGB32)
+    image.fill(QColor("#3986e8"))
+    assert image.save(str(path), "PNG")
+    dialog = ImageViewerDialog(str(path), _ThemeAppearance(dark=False))
+    qtbot.addWidget(dialog)
+    dialog.resize(220, 140)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    qtbot.waitUntil(lambda: not dialog.canvas.image.isNull(), timeout=1_000)
+    start = dialog.canvas.rect().center()
+    start_global = dialog.canvas.mapToGlobal(start)
+
+    press = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPointF(start),
+        QPointF(start_global),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(dialog.canvas, press)
+    assert dialog.canvas.cursor().shape() == Qt.CursorShape.ArrowCursor
+
+    before = QPointF(dialog.canvas._offset)
+    target = start + QPoint(28, 18)
+    move = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(target),
+        QPointF(dialog.canvas.mapToGlobal(target)),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(dialog.canvas, move)
+
+    assert dialog.canvas._offset.x() > before.x()
+    assert dialog.canvas._offset.y() > before.y()
+    assert dialog.canvas.cursor().shape() == Qt.CursorShape.ArrowCursor
+    release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        QPointF(target),
+        QPointF(dialog.canvas.mapToGlobal(target)),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(dialog.canvas, release)
+    assert dialog.canvas.cursor().shape() == Qt.CursorShape.ArrowCursor
 
 
 def test_large_image_decode_does_not_block_selection(qtbot, tmp_path: Path, monkeypatch) -> None:
