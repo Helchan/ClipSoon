@@ -89,6 +89,40 @@ def test_windows_panel_guard_keeps_inside_click_and_can_sync_ignored_input() -> 
     assert guard.should_hide(foreground=101, primary_button_down=True, cursor_inside=False)
 
 
+def test_windows_panel_watch_keeps_main_panel_during_internal_preview(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.panel.show()
+    application.panel.keep_open(True)
+    hidden: list[bool] = []
+    monkeypatch.setattr(application.panel, "hide_panel", lambda: hidden.append(True))
+    monkeypatch.setattr(PlatformBridge, "primary_button_down", lambda: False)
+    monkeypatch.setattr(PlatformBridge, "foreground_window_id", lambda: 909)
+
+    try:
+        application._watch_windows_panel()
+
+        assert not hidden
+        assert application.panel.isVisible()
+
+        application.panel.keep_open(False)
+        application._panel_guard.arm(
+            initial_foreground=101,
+            panel_window=int(application.panel.winId()),
+            primary_button_down=False,
+        )
+        application._panel_guard.saw_panel_foreground = True
+        application._watch_windows_panel()
+
+        assert hidden == [True]
+    finally:
+        application.shutdown()
+
+
 def test_settings_dialog_applies_changes_and_reset_without_a_save_step(qtbot, tmp_path) -> None:
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)

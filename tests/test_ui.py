@@ -2325,9 +2325,35 @@ def test_clicking_detail_image_preview_opens_plain_image_viewer(qtbot, tmp_path:
     qtbot.waitUntil(lambda: not dialog.canvas.image.isNull(), timeout=1_000)
     assert not dialog.canvas.image.isNull()
 
+    panel.hide()
+    assert not panel.isVisible()
     qtbot.mouseClick(dialog.canvas, Qt.MouseButton.LeftButton, pos=dialog.canvas.rect().center())
     qtbot.waitUntil(lambda: panel._image_viewer_dialog is None, timeout=1_000)
+    qtbot.waitUntil(panel.isVisible, timeout=1_000)
     assert not panel._keep_open
+
+
+def test_windows_image_viewer_is_owned_by_panel_without_global_topmost(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    path = tmp_path / "viewer-owner.png"
+    image = QImage(120, 80, QImage.Format.Format_RGB32)
+    image.fill(QColor("#3986e8"))
+    assert image.save(str(path), "PNG")
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+
+    dialog = ImageViewerDialog(str(path), _ThemeAppearance(dark=False), panel)
+    qtbot.addWidget(dialog)
+    flags = dialog.windowFlags()
+
+    assert dialog.parent() is panel
+    assert flags & Qt.WindowType.Tool
+    assert flags & Qt.WindowType.FramelessWindowHint
+    assert not flags & Qt.WindowType.WindowStaysOnTopHint
 
 
 def test_image_viewer_defaults_to_image_size_and_requires_control_wheel_to_zoom(

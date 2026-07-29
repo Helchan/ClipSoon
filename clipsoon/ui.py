@@ -2118,7 +2118,7 @@ class _ZoomableImageCanvas(QWidget):
 
 class ImageViewerDialog(QDialog):
     def __init__(self, path: str, appearance: _ThemeAppearance, parent: QWidget | None = None) -> None:
-        super().__init__(None)
+        super().__init__(parent if sys.platform == "win32" else None)
         self._appearance = appearance
         self._external_dismiss_filter_installed = False
         self._resize_edges: set[str] = set()
@@ -2126,11 +2126,13 @@ class ImageViewerDialog(QDialog):
         self._resize_origin_global = QPoint()
         self.setObjectName("imageViewerDialog")
         self.setWindowTitle("")
-        self.setWindowFlags(
+        window_flags = (
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
         )
+        if sys.platform != "win32":
+            window_flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(window_flags)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setMinimumSize(_IMAGE_VIEWER_MINIMUM_SIZE)
@@ -3856,8 +3858,8 @@ class ClipPanel(QWidget):
                 return
             self._image_viewer_dialog = None
             if not self._settings_interaction_blocked:
+                self._restore_after_image_viewer()
                 self.keep_open(False)
-            self._schedule_search_focus_restore()
             dialog.deleteLater()
 
         dialog.finished.connect(viewer_finished)
@@ -3867,6 +3869,14 @@ class ClipPanel(QWidget):
         dialog.raise_()
         dialog.activateWindow()
         dialog.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
+    def _restore_after_image_viewer(self) -> None:
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        self.search.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        self._schedule_search_focus_restore()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if self._settings_interaction_blocked and self._is_blocked_panel_input_event(event):
@@ -3980,6 +3990,9 @@ class ClipPanel(QWidget):
 
     def keep_open(self, value: bool) -> None:
         self._keep_open = value
+
+    def is_kept_open(self) -> bool:
+        return self._keep_open
 
     def _is_blocked_panel_input_event(self, event: QEvent) -> bool:
         blocked_events = {

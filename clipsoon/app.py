@@ -337,6 +337,7 @@ class ClipSoonApplication(QObject):
             not self.settings.value.hide_on_deactivate
             or QApplication.activeModalWidget() is not None
             or QApplication.activePopupWidget() is not None
+            or self.panel.is_kept_open()
         ):
             self._panel_guard.sync_primary_button(primary_down)
             return
