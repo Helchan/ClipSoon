@@ -14,6 +14,7 @@ from clipsoon.windows_clipboard_host import (
     CF_DIB,
     CF_DIBV5,
     CF_HDROP,
+    CF_TEXT,
     CF_UNICODETEXT,
     GHND,
     CapturePhaseTracker,
@@ -39,6 +40,8 @@ class FakeClipboardApi:
         self.png_format = 49_001
         self.internal_write_format = 49_002
         self.preferred_drop_effect_format = 49_003
+        self.html_format = 49_004
+        self.csv_format = 49_005
         self.formats: list[int] = []
         self.names: dict[int, str] = {}
         self.payloads: dict[int, bytes] = {}
@@ -131,6 +134,8 @@ class FakeClipboardApi:
             "PNG": self.png_format,
             "ClipSoon.InternalWrite": self.internal_write_format,
             "Preferred DropEffect": self.preferred_drop_effect_format,
+            "HTML Format": self.html_format,
+            "Csv": self.csv_format,
         }[name]
 
     def is_format_available(self, format_id: int) -> bool:
@@ -303,6 +308,80 @@ def test_hdrop_has_precedence_over_image_and_text(tmp_path: Path) -> None:
     assert snapshot.payload["files"] == api.files
     assert "files" in api.calls
     assert not any(call.startswith("data:") for call in api.calls)
+
+
+def test_spreadsheet_unicode_text_precedes_excel_dib_preview(tmp_path: Path) -> None:
+    api = FakeClipboardApi(sequence=14)
+    biff_format = 50_100
+    api.formats = [CF_DIB, CF_UNICODETEXT, biff_format]
+    api.names[biff_format] = "Biff12"
+    api.payloads[CF_DIB] = (
+        struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0)
+        + b"\x00\x00\xff\x00"
+    )
+    api.payloads[CF_UNICODETEXT] = "A\tB\r\nC\tD\r\n\0".encode("utf-16-le")
+
+    snapshot = make_reader(tmp_path, api).read(14)
+
+    assert snapshot.kind == "text"
+    assert snapshot.payload == {"text": "A\tB\r\nC\tD\r\n"}
+    assert f"data:{CF_UNICODETEXT}" in api.calls
+    assert f"data:{CF_DIB}" not in api.calls
+
+
+def test_image_keeps_precedence_without_spreadsheet_marker(tmp_path: Path) -> None:
+    api = FakeClipboardApi(sequence=15)
+    api.formats = [CF_DIB, CF_UNICODETEXT]
+    dib = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0) + b"\x00\x00\xff\x00"
+    api.payloads[CF_DIB] = dib
+    api.payloads[CF_UNICODETEXT] = "caption\0".encode("utf-16-le")
+
+    snapshot = make_reader(tmp_path, api).read(15)
+
+    assert snapshot.kind == "image"
+    assert f"data:{CF_DIB}" in api.calls
+    assert f"data:{CF_UNICODETEXT}" not in api.calls
+
+
+def test_html_table_fallback_preserves_multiple_cells(tmp_path: Path) -> None:
+    api = FakeClipboardApi(sequence=16)
+    api.formats = [api.html_format]
+    api.payloads[api.html_format] = (
+        b"Version:1.0\r\n"
+        b"StartHTML:00000000\r\n"
+        b"EndHTML:00000000\r\n"
+        b"StartFragment:00000000\r\n"
+        b"EndFragment:00000000\r\n"
+        b"<html><body><table><tr><td>A</td><td>B</td></tr>"
+        b"<tr><td>C</td><td>D</td></tr></table></body></html>"
+    )
+
+    snapshot = make_reader(tmp_path, api).read(16)
+
+    assert snapshot.kind == "text"
+    assert snapshot.payload == {"text": "A\tB\nC\tD"}
+
+
+def test_csv_fallback_converts_rows_to_tab_separated_text(tmp_path: Path) -> None:
+    api = FakeClipboardApi(sequence=17)
+    api.formats = [api.csv_format]
+    api.payloads[api.csv_format] = b'"A,1",B\r\nC,D\r\n\0'
+
+    snapshot = make_reader(tmp_path, api).read(17)
+
+    assert snapshot.kind == "text"
+    assert snapshot.payload == {"text": "A,1\tB\nC\tD"}
+
+
+def test_legacy_cf_text_fallback_records_plain_text(tmp_path: Path) -> None:
+    api = FakeClipboardApi(sequence=18)
+    api.formats = [CF_TEXT]
+    api.payloads[CF_TEXT] = b"legacy\ttext\r\n\0ignored"
+
+    snapshot = make_reader(tmp_path, api).read(18)
+
+    assert snapshot.kind == "text"
+    assert snapshot.payload == {"text": "legacy\ttext\r\n"}
 
 
 def test_png_payload_is_private_file_and_manifest_is_atomic(tmp_path: Path) -> None:

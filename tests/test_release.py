@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def test_release_version_is_consistent() -> None:
     project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert __version__ == "1.1.0"
+    assert __version__ == "1.1.1"
     assert project["project"]["version"] == __version__
 
 
@@ -42,6 +42,17 @@ def test_windows_helper_smoke_uses_only_registered_combo_hotkeys() -> None:
 
     assert "combo:ctrl+shift+space" in smoke
     assert "double:" not in smoke
+
+
+def test_windows_build_script_keeps_portable_runtime_contract_clear() -> None:
+    launcher = (PROJECT_ROOT / "build_windows.bat").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "scripts/build_windows.bat").read_text(encoding="utf-8")
+
+    assert 'scripts\\build_windows.bat" %*' in launcher
+    assert "--onedir" in script
+    assert "--onefile" in script
+    assert "dist\\ClipSoon\\_internal\\python312.dll" in script
+    assert "Do not move only ClipSoon.exe" in script
 
 
 def test_windows_helper_smoke_exercises_eager_native_clipboard_formats() -> None:

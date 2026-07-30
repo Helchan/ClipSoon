@@ -9,8 +9,11 @@ stop.
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
+import io
 import json
+import locale
 import os
 import queue
 import struct
@@ -23,6 +26,7 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from ctypes import wintypes
 from dataclasses import dataclass, replace
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 
@@ -101,6 +105,17 @@ _STANDARD_FORMAT_NAMES = {
     CF_HDROP: "CF_HDROP",
     CF_LOCALE: "CF_LOCALE",
     CF_DIBV5: "CF_DIBV5",
+}
+_SPREADSHEET_FORMAT_MARKERS = (
+    "biff",
+    "excel",
+    "spreadsheet",
+    "csv",
+)
+_CSV_FORMAT_NAMES = {
+    "csv",
+    "comma separated values",
+    "comma-separated values",
 }
 
 
@@ -360,6 +375,8 @@ class WindowsClipboardReader:
         self.capture_started = capture_started
         self.capture_materializing = capture_materializing
         self.png_format = api.register_format("PNG")
+        self.html_format = _register_optional_format(api, "HTML Format")
+        self.csv_format = _register_optional_format(api, "Csv")
         self.internal_write_format = api.register_format("ClipSoon.InternalWrite")
 
     def is_internal_write(self) -> bool:
@@ -397,13 +414,16 @@ class WindowsClipboardReader:
             files = self.api.hdrop_files(CF_HDROP)
             if files:
                 return ClipboardSnapshot(sequence, "files", {"files": files})
+        if self._has_spreadsheet_format(formats, names):
+            text = self._read_text(formats, names)
+            if text:
+                return ClipboardSnapshot(sequence, "text", {"text": text})
         image = self._read_image(formats)
         if image is not None:
             return image
-        if CF_UNICODETEXT in formats:
-            text = _decode_unicode_text(self.api.global_bytes(CF_UNICODETEXT))
-            if text:
-                return ClipboardSnapshot(sequence, "text", {"text": text})
+        text = self._read_text(formats, names)
+        if text:
+            return ClipboardSnapshot(sequence, "text", {"text": text})
         return ClipboardSnapshot(sequence, "unsupported", {"formats": names})
 
     def _is_private(self, formats: list[int], names: list[str]) -> bool:
@@ -433,6 +453,53 @@ class WindowsClipboardReader:
         if not dib_format:
             return None
         return _ImageClipboardData(self.api.global_bytes(dib_format), "dib")
+
+    def _read_text(self, formats: list[int], names: list[str]) -> str:
+        if CF_UNICODETEXT in formats:
+            text = _decode_unicode_text(self.api.global_bytes(CF_UNICODETEXT))
+            if text:
+                return text
+        csv_format = self._named_format(formats, names, _CSV_FORMAT_NAMES, self.csv_format)
+        if csv_format:
+            text = _csv_to_tabular_text(_decode_text_payload(self.api.global_bytes(csv_format)))
+            if text:
+                return text
+        html_format = self._named_format(formats, names, {"html format"}, self.html_format)
+        if html_format:
+            text = _html_to_tabular_text(_decode_cf_html(self.api.global_bytes(html_format)))
+            if text:
+                return text
+        if CF_TEXT in formats:
+            text = _decode_legacy_text(self.api.global_bytes(CF_TEXT))
+            if text:
+                return text
+        if CF_OEMTEXT in formats:
+            text = _decode_legacy_text(self.api.global_bytes(CF_OEMTEXT))
+            if text:
+                return text
+        return ""
+
+    def _has_spreadsheet_format(self, formats: list[int], names: list[str]) -> bool:
+        if self.csv_format and self.csv_format in formats:
+            return True
+        return any(
+            any(marker in name.casefold() for marker in _SPREADSHEET_FORMAT_MARKERS)
+            for name in names
+        )
+
+    @staticmethod
+    def _named_format(
+        formats: list[int],
+        names: list[str],
+        candidates: set[str],
+        registered_format: int,
+    ) -> int:
+        if registered_format and registered_format in formats:
+            return registered_format
+        for format_id, name in zip(formats, names, strict=True):
+            if name.casefold() in candidates:
+                return format_id
+        return 0
 
     def _materialize_image(self, sequence: int, image: _ImageClipboardData) -> ClipboardSnapshot:
         if image.encoding == "png":
@@ -467,6 +534,163 @@ def _decode_unicode_text(data: bytes) -> str:
         return data[:terminator].decode("utf-16-le")
     except UnicodeDecodeError as exc:
         raise ClipboardDataError("invalid CF_UNICODETEXT payload") from exc
+
+
+def _register_optional_format(api: NativeClipboardApi, name: str) -> int:
+    try:
+        return api.register_format(name)
+    except Exception:
+        return 0
+
+
+def _decode_text_payload(data: bytes) -> str:
+    if data.startswith(b"\xff\xfe") or _looks_like_utf16le(data):
+        return _decode_unicode_text(data[2:] if data.startswith(b"\xff\xfe") else data)
+    if data.startswith(b"\xfe\xff"):
+        trimmed = data[2:]
+        terminator = trimmed.find(b"\0\0")
+        if terminator >= 0:
+            trimmed = trimmed[:terminator]
+        try:
+            return trimmed.decode("utf-16-be")
+        except UnicodeDecodeError as exc:
+            raise ClipboardDataError("invalid UTF-16 text payload") from exc
+    return _decode_legacy_text(data)
+
+
+def _looks_like_utf16le(data: bytes) -> bool:
+    if len(data) < 4:
+        return False
+    sample = data[: min(len(data), 256)]
+    odd_nuls = sample[1::2].count(0)
+    even_nuls = sample[0::2].count(0)
+    return odd_nuls > max(1, len(sample) // 8) and even_nuls < odd_nuls // 2
+
+
+def _decode_legacy_text(data: bytes) -> str:
+    trimmed = data.split(b"\0", 1)[0]
+    if not trimmed:
+        return ""
+    encodings = ("utf-8", locale.getpreferredencoding(False), "mbcs", "cp1252", "latin-1")
+    for encoding in dict.fromkeys(encodings):
+        try:
+            return trimmed.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    raise ClipboardDataError("invalid legacy text payload")
+
+
+def _decode_cf_html(data: bytes) -> str:
+    trimmed = data.split(b"\0", 1)[0]
+    header = trimmed[: min(len(trimmed), 2048)].decode("ascii", errors="ignore")
+    start = _cf_html_offset(header, "StartFragment")
+    end = _cf_html_offset(header, "EndFragment")
+    if start is None or end is None or not (0 <= start < end <= len(trimmed)):
+        start = _cf_html_offset(header, "StartHTML")
+        end = _cf_html_offset(header, "EndHTML")
+    if start is not None and end is not None and 0 <= start < end <= len(trimmed):
+        fragment = trimmed[start:end]
+    else:
+        fragment = trimmed
+    return _decode_text_payload(fragment)
+
+
+def _cf_html_offset(header: str, key: str) -> int | None:
+    prefix = f"{key}:"
+    for line in header.splitlines():
+        if not line.startswith(prefix):
+            continue
+        try:
+            return int(line.removeprefix(prefix).strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _csv_to_tabular_text(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        rows = list(csv.reader(io.StringIO(normalized)))
+    except csv.Error as exc:
+        raise ClipboardDataError("invalid CSV clipboard payload") from exc
+    return "\n".join("\t".join(cell for cell in row) for row in rows)
+
+
+class _HtmlTableTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self.fallback: list[str] = []
+        self._table_depth = 0
+        self._current_row: list[str] | None = None
+        self._current_cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        name = tag.casefold()
+        if name == "table":
+            self._table_depth += 1
+            return
+        if not self._table_depth:
+            if name == "br":
+                self.fallback.append("\n")
+            return
+        if name == "tr":
+            self._finish_row()
+            self._current_row = []
+        elif name in {"td", "th"}:
+            if self._current_row is None:
+                self._current_row = []
+            self._current_cell = []
+        elif name == "br" and self._current_cell is not None:
+            self._current_cell.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        name = tag.casefold()
+        if name in {"td", "th"}:
+            self._finish_cell()
+        elif name == "tr":
+            self._finish_row()
+        elif name == "table" and self._table_depth:
+            self._finish_row()
+            self._table_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._current_cell is not None:
+            self._current_cell.append(data)
+        elif not self._table_depth:
+            self.fallback.append(data)
+
+    def close(self) -> None:
+        self._finish_cell()
+        self._finish_row()
+        super().close()
+
+    def _finish_cell(self) -> None:
+        if self._current_cell is None:
+            return
+        if self._current_row is None:
+            self._current_row = []
+        self._current_row.append(_normalize_html_cell("".join(self._current_cell)))
+        self._current_cell = None
+
+    def _finish_row(self) -> None:
+        if self._current_row:
+            self.rows.append(self._current_row)
+        self._current_row = None
+
+
+def _html_to_tabular_text(value: str) -> str:
+    parser = _HtmlTableTextParser()
+    parser.feed(value)
+    parser.close()
+    if parser.rows:
+        return "\n".join("\t".join(row) for row in parser.rows)
+    return _normalize_html_cell("".join(parser.fallback))
+
+
+def _normalize_html_cell(value: str) -> str:
+    return " ".join(value.replace("\xa0", " ").split())
 
 
 def _png_dimensions(data: bytes) -> tuple[int, int]:

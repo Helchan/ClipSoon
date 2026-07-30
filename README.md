@@ -2,7 +2,7 @@
 
 ClipSoon 是一款面向 macOS 和 Windows 的本地剪贴板历史工具。它像 Spotlight / Raycast 一样按需出现：复制内容后，通过全局快捷键呼出面板，搜索、预览并快速粘贴过去复制过的文本、图片或文件。
 
-当前发布版本：`v1.1.0`。
+当前发布版本：`v1.1.1`。
 
 > 本地优先：历史数据仅保存在本机 SQLite 数据库和图片目录中，不上传网络。
 
@@ -249,9 +249,17 @@ $env:QT_QPA_PLATFORM = "offscreen"
 需要生成可分发产物时，使用仓库根目录下的平台脚本：
 
 - macOS：双击 `build_macos.command`，产物为 `dist/ClipSoon.app`。
-- Windows：双击 `build_windows.bat`，产物为 `dist\ClipSoon\ClipSoon.exe`。
+- Windows：双击 `build_windows.bat`，产物为 `dist\ClipSoon\ClipSoon.exe` 所在的完整便携目录。
 
-Windows 包需要在 Windows 10 / 11 主机上生成。两个脚本都使用 PyInstaller one-dir，避免 one-file 每次启动时的临时解包开销。macOS 脚本会执行 ad-hoc 签名和严格签名校验；正式对外分发仍需要 Developer ID 签名与公证。
+Windows 包需要在 Windows 10 / 11 主机上生成。默认 Windows 包使用 PyInstaller one-dir，避免 one-file 每次启动时的临时解包开销。它不是一个可以单独拷走的裸 exe：运行时必须保留整个 `dist\ClipSoon` 目录，因为 `ClipSoon.exe` 依赖旁边的 `_internal\python312.dll`、Qt DLL 和其他运行库。发布页下载的 `ClipSoon-vX.Y.Z-windows-x64.zip` 也需要先完整解压，再运行解压后目录里的 `ClipSoon\ClipSoon.exe`；不要直接在 zip 预览窗口里双击 exe，也不要只把 exe 拖到桌面。需要放到桌面时，应创建快捷方式。
+
+如果确实需要单文件 exe，可在 Windows 上运行：
+
+```bat
+build_windows.bat onefile
+```
+
+该模式产物为 `dist\ClipSoon.exe`，但启动会因为临时解包更慢，且当前正式发布工作流仍使用默认 one-dir 便携目录包。macOS 脚本会执行 ad-hoc 签名和严格签名校验；正式对外分发仍需要 Developer ID 签名与公证。
 
 ## 自动发布
 
@@ -264,8 +272,8 @@ Windows 包需要在 Windows 10 / 11 主机上生成。两个脚本都使用 PyI
 发布前先将 `pyproject.toml` 和 `clipsoon/__init__.py` 中的版本保持一致，提交并推送到 `main`，然后执行：
 
 ```bash
-git tag -a v1.1.0 -m "ClipSoon 1.1.0"
-git push origin v1.1.0
+git tag -a v1.1.1 -m "ClipSoon 1.1.1"
+git push origin v1.1.1
 ```
 
 Release 会使用标签名生成说明并附加两个平台包。工作流使用 Windows x64 runner 和 macOS 15 ARM64 runner，并在发布前校验 Git 标签、运行时版本与项目版本一致。macOS 产物当前为 ad-hoc 签名，未使用 Developer ID 且未执行 Apple 公证。
