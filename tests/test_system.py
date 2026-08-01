@@ -2212,7 +2212,8 @@ def test_selection_sender_serializes_items_with_line_breaks_in_a_batch(qtbot) ->
 
     sender.send_many(clips, target)  # type: ignore[arg-type]
 
-    expected = (clips[0], "\n", clips[1], "\n", clips[2])
+    line_break = "\r\n" if sys.platform == "win32" else "\n"
+    expected = (clips[0], line_break, clips[1], line_break, clips[2])
     for index, entry in enumerate(expected):
         qtbot.waitUntil(lambda index=index: len(writer.writes) == index + 1, timeout=1_000)
         written = writer.writes[index]
@@ -2243,9 +2244,9 @@ def test_selection_sender_serializes_items_with_line_breaks_in_a_batch(qtbot) ->
     qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
     assert [item.text for item in writer.writes] == [
         "item 0",
-        "\n",
+        line_break,
         "item 1",
-        "\n",
+        line_break,
         "item 2",
     ]
     assert repository.used == ["0", "1", "2"]
@@ -2284,7 +2285,7 @@ def test_selection_sender_stops_batch_after_first_failure(qtbot) -> None:
     writer.write_callbacks[2](None, "write failed")
 
     assert writer.writes[0] == clips[0]
-    assert writer.writes[1].text == "\n"
+    assert writer.writes[1].text == ("\r\n" if sys.platform == "win32" else "\n")
     assert writer.writes[2] == clips[1]
     assert repository.used == ["first"]
     assert paste.count == 2
@@ -2316,7 +2317,8 @@ def test_selection_sender_stops_batch_when_line_break_write_fails(qtbot) -> None
     qtbot.waitUntil(lambda: len(writer.writes) == 2, timeout=1_000)
     writer.write_callbacks[1](None, "write failed")
 
-    assert [item.text for item in writer.writes] == ["first", "\n"]
+    line_break = "\r\n" if sys.platform == "win32" else "\n"
+    assert [item.text for item in writer.writes] == ["first", line_break]
     assert repository.used == ["first"]
     assert paste.count == 1
     assert finished == [
@@ -2401,7 +2403,7 @@ def test_selection_sender_inserts_line_break_between_mixed_item_kinds(qtbot) -> 
     qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
     assert writer.writes[0] == clips[0]
     assert writer.writes[1].kind is ClipKind.TEXT
-    assert writer.writes[1].text == "\n"
+    assert writer.writes[1].text == ("\r\n" if sys.platform == "win32" else "\n")
     assert writer.writes[2] == clips[1]
     assert repository.used == ["text", "image"]
     assert paste.count == 3

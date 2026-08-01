@@ -2,7 +2,7 @@
 
 ClipSoon 是一款面向 macOS 和 Windows 的本地剪贴板历史工具。它像 Spotlight / Raycast 一样按需出现：复制内容后，通过全局快捷键呼出面板，搜索、预览并快速粘贴过去复制过的文本、图片或文件。
 
-当前发布版本：`v1.1.4`。
+当前发布版本：`v1.1.5`。
 
 > 本地优先：历史数据仅保存在本机 SQLite 数据库和图片目录中，不上传网络。
 
@@ -272,8 +272,8 @@ build_windows.bat onefile
 发布前先将 `pyproject.toml` 和 `clipsoon/__init__.py` 中的版本保持一致，提交并推送到 `main`，然后执行：
 
 ```bash
-git tag -a v1.1.4 -m "ClipSoon 1.1.4"
-git push origin v1.1.4
+git tag -a v1.1.5 -m "ClipSoon 1.1.5"
+git push origin v1.1.5
 ```
 
 Release 会使用标签名生成说明并附加两个平台包。工作流使用 Windows x64 runner 和 macOS 15 ARM64 runner，并在发布前校验 Git 标签、运行时版本与项目版本一致。macOS 产物当前为 ad-hoc 签名，未使用 Developer ID 且未执行 Apple 公证。
