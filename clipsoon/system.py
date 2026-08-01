@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +59,7 @@ _WINDOWS_FOCUS_HELPER_TIMEOUT_SECONDS = FOCUS_HELPER_TIMEOUT_SECONDS
 _WINDOWS_FOCUS_RETRY_DELAYS_MS = (40, 80, 120)
 _FILE_VALIDATION_TIMEOUT_MS = 3_000
 _MAX_CONCURRENT_FILE_VALIDATIONS = 2
+_BATCH_PASTE_SETTLE_MS = 250
 _GA_ROOT = 2
 
 _WIN_BOOL = ctypes.c_int32
@@ -2580,6 +2581,7 @@ class PynputPasteAdapter:
 
 class SelectionSender(QObject):
     finished = Signal(str, bool)
+    rejected = Signal(str)
 
     def __init__(
         self,
@@ -2590,6 +2592,7 @@ class SelectionSender(QObject):
         hide_panel: Callable[[], None],
         *,
         file_validation_timeout_ms: int = _FILE_VALIDATION_TIMEOUT_MS,
+        batch_paste_settle_ms: int = _BATCH_PASTE_SETTLE_MS,
     ) -> None:
         super().__init__()
         self.clipboard, self.repository = clipboard, repository
@@ -2600,11 +2603,51 @@ class SelectionSender(QObject):
         self._validation_generation = 0
         self._send_generation = 0
         self._file_validation_timeout_ms = max(50, int(file_validation_timeout_ms))
+        self._batch_paste_settle_ms = max(0, int(batch_paste_settle_ms))
+        self._batch_items: deque[ClipItem] = deque()
+        self._batch_target: ForegroundTargetHandle | None = None
+        self._batch_total = 0
+        self._batch_completed = 0
+        self._batch_panel_hidden = False
+        self._batch_settings: AppSettings | None = None
 
     def send(self, item: ClipItem, target: ForegroundTargetHandle | None) -> None:
+        self.send_many((item,), target)
+
+    def send_many(
+        self,
+        items: Sequence[ClipItem],
+        target: ForegroundTargetHandle | None,
+    ) -> None:
         if self._busy:
             return
+        batch = tuple(items)
+        if not batch:
+            return
+        settings = self._settings()
+        if len(batch) > 1:
+            if target is None:
+                self.rejected.emit("未找到原应用，无法发送多项")
+                return
+            if not settings.paste_after_selection:
+                self.rejected.emit("多选发送需要开启“选择后自动粘贴”")
+                return
         self._busy = True
+        self._batch_items = deque(batch)
+        self._batch_target = target
+        self._batch_total = len(batch)
+        self._batch_completed = 0
+        self._batch_panel_hidden = False
+        # An in-flight batch is one user transaction. Settings changed while
+        # it is running apply to the next request instead of turning later
+        # items into copy-only operations that would be falsely counted sent.
+        self._batch_settings = settings if len(batch) > 1 else None
+        self._send_next_batch_item()
+
+    def _send_next_batch_item(self) -> None:
+        if not self._busy or not self._batch_items:
+            return
+        item = self._batch_items.popleft()
         self._send_generation += 1
         send_generation = self._send_generation
         if item.kind is ClipKind.FILES:
@@ -2618,7 +2661,7 @@ class SelectionSender(QObject):
             validation_generation = self._validation_generation
             self._start_file_item_validation(
                 item.id,
-                target,
+                self._batch_target,
                 validation_generation,
                 send_generation,
             )
@@ -2630,7 +2673,7 @@ class SelectionSender(QObject):
                 ),
             )
             return
-        self._request_item_write(item, target, send_generation)
+        self._request_item_write(item, self._batch_target, send_generation)
 
     def _start_file_item_validation(
         self,
@@ -2771,8 +2814,10 @@ class SelectionSender(QObject):
         send_generation: int,
     ) -> None:
         self.repository.mark_used(item.id)
-        self._hide_panel()
-        settings = self._settings()
+        if not self._batch_panel_hidden:
+            self._hide_panel()
+            self._batch_panel_hidden = True
+        settings = self._batch_settings or self._settings()
         if not settings.paste_after_selection or target is None:
             self._finish_send(send_generation, "已复制到剪贴板", True)
             return
@@ -2933,7 +2978,45 @@ class SelectionSender(QObject):
     def _finish_send(self, send_generation: int, message: str, success: bool) -> None:
         if send_generation != self._send_generation:
             return
+        # Invalidate duplicate or late callbacks from the completed item before
+        # the next queued item begins. The batch remains busy across the
+        # inter-item settle interval, so a second user request cannot interleave.
+        self._send_generation += 1
+        if success:
+            self._batch_completed += 1
+            if self._batch_items:
+                QTimer.singleShot(
+                    self._batch_paste_settle_ms,
+                    self._send_next_batch_item,
+                )
+                return
+
+        total = self._batch_total
+        completed = self._batch_completed
+        target_kind = getattr(self._batch_target, "kind", "")
+        self._batch_items.clear()
+        self._batch_target = None
+        self._batch_total = 0
+        self._batch_completed = 0
+        self._batch_panel_hidden = False
+        self._batch_settings = None
         self._busy = False
+        if total > 1:
+            if success:
+                message = (
+                    f"已触发 {total} 项粘贴"
+                    if target_kind == "windows"
+                    else f"已发送 {total} 项"
+                )
+            elif completed:
+                prefix = (
+                    f"已触发 {completed}/{total} 项粘贴"
+                    if target_kind == "windows"
+                    else f"已发送 {completed}/{total} 项"
+                )
+                message = f"{prefix}；{message}"
+            else:
+                message = f"第 1/{total} 项发送失败：{message}"
         self.finished.emit(message, success)
 
 

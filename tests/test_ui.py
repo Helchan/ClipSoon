@@ -95,10 +95,10 @@ def test_panel_search_keyboard_send_and_escape(qtbot) -> None:
     qtbot.waitExposed(panel)
     panel.search.setText("invoice 2026")
     assert panel.model.item_at(0).id == "old-exact"
-    sent: list[ClipItem] = []
+    sent: list[tuple[ClipItem, ...]] = []
     panel.send_requested.connect(sent.append)
     qtbot.keyPress(panel.search, Qt.Key.Key_Return)
-    assert sent and sent[0].id == "old-exact"
+    assert sent and sent[0][0].id == "old-exact"
     qtbot.keyPress(panel.search, Qt.Key.Key_Escape)
     assert not panel.isVisible()
 
@@ -109,14 +109,14 @@ def test_panel_search_return_sends_when_input_method_ui_is_visible(qtbot, monkey
     qtbot.addWidget(panel)
     panel.show_panel()
     qtbot.waitExposed(panel)
-    sent: list[ClipItem] = []
+    sent: list[tuple[ClipItem, ...]] = []
     panel.send_requested.connect(sent.append)
     monkeypatch.setattr(QApplication.inputMethod(), "isVisible", lambda: True)
 
     qtbot.keyPress(panel.search, Qt.Key.Key_Return)
     qtbot.keyPress(panel.search, Qt.Key.Key_Enter)
 
-    assert [item.id for item in sent] == ["item", "item"]
+    assert [[item.id for item in batch] for batch in sent] == [["item"], ["item"]]
 
 
 def test_panel_search_return_waits_for_active_input_method_composition(qtbot) -> None:
@@ -125,7 +125,7 @@ def test_panel_search_return_waits_for_active_input_method_composition(qtbot) ->
     qtbot.addWidget(panel)
     panel.show_panel()
     qtbot.waitExposed(panel)
-    sent: list[ClipItem] = []
+    sent: list[tuple[ClipItem, ...]] = []
     panel.send_requested.connect(sent.append)
 
     QApplication.sendEvent(panel.search, QInputMethodEvent("pin", []))
@@ -136,7 +136,82 @@ def test_panel_search_return_waits_for_active_input_method_composition(qtbot) ->
     QApplication.sendEvent(panel.search, QInputMethodEvent("", []))
     assert not panel._search_caret._ime_composing
     qtbot.keyPress(panel.search, Qt.Key.Key_Return)
-    assert [item.id for item in sent] == ["item"]
+    assert [[item.id for item in batch] for batch in sent] == [["item"]]
+
+
+def test_panel_return_sends_all_selected_items_in_visible_order(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip(str(index), f"item {index}", index) for index in range(4)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    selection = panel.list.selectionModel()
+    selection.clearSelection()
+    for row in (0, 2, 3):
+        selection.select(
+            panel.model.index(row),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+    selection.setCurrentIndex(
+        panel.model.index(3),
+        QItemSelectionModel.SelectionFlag.NoUpdate,
+    )
+    sent: list[tuple[ClipItem, ...]] = []
+    panel.send_requested.connect(sent.append)
+
+    qtbot.keyPress(panel.search, Qt.Key.Key_Return)
+
+    assert [[item.id for item in batch] for batch in sent] == [["0", "2", "3"]]
+
+
+def test_panel_return_uses_selection_when_current_row_was_deselected(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip(str(index), f"item {index}", index) for index in range(3)])
+    panel.show_panel()
+    qtbot.waitExposed(panel)
+    selection = panel.list.selectionModel()
+    selection.clearSelection()
+    for row in (0, 1):
+        selection.select(
+            panel.model.index(row),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+    selection.setCurrentIndex(
+        panel.model.index(2),
+        QItemSelectionModel.SelectionFlag.NoUpdate,
+    )
+    sent: list[tuple[ClipItem, ...]] = []
+    panel.send_requested.connect(sent.append)
+
+    qtbot.keyPress(panel.search, Qt.Key.Key_Return)
+
+    assert [[item.id for item in batch] for batch in sent] == [["0", "1"]]
+
+
+def test_panel_double_click_signal_sends_only_the_clicked_row(qtbot) -> None:
+    panel = ClipPanel(AppSettings)
+    qtbot.addWidget(panel)
+    panel.set_items([clip(str(index), f"item {index}", index) for index in range(3)])
+    selection = panel.list.selectionModel()
+    selection.select(
+        panel.model.index(0),
+        QItemSelectionModel.SelectionFlag.Select
+        | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    selection.select(
+        panel.model.index(1),
+        QItemSelectionModel.SelectionFlag.Select
+        | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    sent: list[tuple[ClipItem, ...]] = []
+    panel.send_requested.connect(sent.append)
+
+    panel.list.doubleClicked.emit(panel.model.index(2))
+
+    assert [[item.id for item in batch] for batch in sent] == [["2"]]
 
 
 def test_status_is_empty_when_idle_and_transient_messages_clear(qtbot) -> None:

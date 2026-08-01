@@ -58,6 +58,67 @@ def _add_three_ordered_texts(application: ClipSoonApplication):
     return newest, middle, oldest
 
 
+def test_application_routes_the_complete_panel_selection_to_sender(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    newest, middle, oldest = _add_three_ordered_texts(application)
+    target = object()
+    application.target = target  # type: ignore[assignment]
+    sent: list[tuple[tuple[object, ...], object]] = []
+    application.sender.send_many = (  # type: ignore[method-assign]
+        lambda items, selected_target: sent.append((tuple(items), selected_target))
+    )
+    selection = application.panel.list.selectionModel()
+    selection.clearSelection()
+    for row in (0, 2):
+        selection.select(
+            application.panel.model.index(row),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+    selection.setCurrentIndex(
+        application.panel.model.index(2),
+        QItemSelectionModel.SelectionFlag.NoUpdate,
+    )
+
+    application.panel._send_selected()
+
+    assert len(sent) == 1
+    assert [item.id for item in sent[0][0]] == [newest.id, oldest.id]
+    assert sent[0][1] is target
+    assert middle.id not in [item.id for item in sent[0][0]]
+    application.shutdown()
+
+
+def test_multi_send_preflight_rejection_preserves_visible_selection(qtbot, tmp_path) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    application.settings.update(paste_after_selection=False)
+    newest, _middle, oldest = _add_three_ordered_texts(application)
+    application.target = object()  # type: ignore[assignment]
+    selection = application.panel.list.selectionModel()
+    selection.clearSelection()
+    for row in (0, 2):
+        selection.select(
+            application.panel.model.index(row),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+    selection.setCurrentIndex(
+        application.panel.model.index(2),
+        QItemSelectionModel.SelectionFlag.NoUpdate,
+    )
+
+    application.panel._send_selected()
+
+    assert [item.id for item in application.panel._selected_items()] == [
+        newest.id,
+        oldest.id,
+    ]
+    assert application.panel.status.text() == "多选发送需要开启“选择后自动粘贴”"
+    application.shutdown()
+
+
 def test_windows_panel_guard_hides_on_first_outside_click_without_prior_activation() -> None:
     guard = _WindowsPanelGuard()
     guard.arm(initial_foreground=101, panel_window=202, primary_button_down=False)

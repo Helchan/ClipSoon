@@ -230,7 +230,9 @@ class ClipSoonApplication(QObject):
         self.signals.file_history_sweep_finished.connect(self._file_history_sweep_finished)
         self.clipboard.captured.connect(self._captured)
         self.clipboard.failed.connect(self._notify_error)
-        self.panel.send_requested.connect(lambda item: self.sender.send(item, self.target))
+        self.panel.send_requested.connect(
+            lambda items: self.sender.send_many(items, self.target)
+        )
         self.panel.settings_requested.connect(self.show_settings)
         self.panel.delete_requested.connect(self._delete_many)
         self.panel.favorite_requested.connect(self._favorite_many)
@@ -239,6 +241,7 @@ class ClipSoonApplication(QObject):
         self.panel.accessibility_requested.connect(self.open_accessibility_settings)
         self.panel.position_changed.connect(self._save_panel_position)
         self.sender.finished.connect(self._send_finished)
+        self.sender.rejected.connect(self._send_rejected)
         self.tray_actions["show"].triggered.connect(lambda _checked=False: self.show_panel())
         self.tray_actions["pause"].toggled.connect(self._toggle_capture)
         self.tray_actions["settings"].triggered.connect(self.show_settings)
@@ -593,6 +596,14 @@ class ClipSoonApplication(QObject):
         self._reload_history()
         self.panel.set_status(message)
         if not success and self.tray.isVisible():
+            self.tray.showMessage("ClipSoon", message, QSystemTrayIcon.MessageIcon.Warning, 3_000)
+
+    def _send_rejected(self, message: str) -> None:
+        # Preflight rejection has not touched the repository or clipboard.
+        # Keep the visible multi-selection intact so the user can change the
+        # setting or reopen from the intended target and retry the same batch.
+        self.panel.set_status(message)
+        if self.tray.isVisible():
             self.tray.showMessage("ClipSoon", message, QSystemTrayIcon.MessageIcon.Warning, 3_000)
 
     def _hotkey_failed(self, message: str) -> None:

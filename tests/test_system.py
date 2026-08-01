@@ -2190,6 +2190,140 @@ def test_selection_sender_waits_for_write_ack_and_verify_before_paste(qtbot) -> 
     assert finished == [("已发送", True)]
 
 
+def test_selection_sender_serializes_every_item_in_a_batch(qtbot) -> None:
+    clips = tuple(
+        ClipItem(str(index), ClipKind.TEXT, str(index), index, index, text=f"item {index}")
+        for index in range(3)
+    )
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    target = FakeTarget()
+    finished: list[tuple[str, bool]] = []
+    hidden: list[bool] = []
+    settings = [AppSettings(paste_delay_ms=0)]
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: settings[0],
+        lambda: hidden.append(True),
+        batch_paste_settle_ms=0,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(clips, target)  # type: ignore[arg-type]
+
+    assert writer.writes == [clips[0]]
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.TEXT, 1), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    assert writer.writes == [clips[0]]
+    first_verify = writer.verify_callbacks[0][1]
+    first_verify(True, "")
+    settings[0] = AppSettings(
+        paste_after_selection=False,
+        paste_delay_ms=999,
+    )
+    first_verify(True, "")  # a duplicate ACK must not paste or advance twice
+    qtbot.waitUntil(lambda: len(writer.writes) == 2, timeout=1_000)
+    assert paste.count == 1
+
+    writer.write_callbacks[1](ClipboardWriteReceipt("b" * 32, ClipKind.TEXT, 2), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 2, timeout=1_000)
+    writer.verify_callbacks[1][1](True, "")
+    qtbot.waitUntil(lambda: len(writer.writes) == 3, timeout=1_000)
+
+    writer.write_callbacks[2](ClipboardWriteReceipt("c" * 32, ClipKind.TEXT, 3), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 3, timeout=1_000)
+    writer.verify_callbacks[2][1](True, "")
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert writer.writes == list(clips)
+    assert repository.used == ["0", "1", "2"]
+    assert hidden == [True]
+    assert paste.count == 3
+    assert finished == [("已发送 3 项", True)]
+
+
+def test_selection_sender_stops_batch_after_first_failure(qtbot) -> None:
+    clips = (
+        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
+        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
+        ClipItem("third", ClipKind.TEXT, "third", 3, 3, text="third"),
+    )
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: None,
+        batch_paste_settle_ms=0,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.TEXT, 1), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    writer.verify_callbacks[0][1](True, "")
+    qtbot.waitUntil(lambda: len(writer.writes) == 2, timeout=1_000)
+    writer.write_callbacks[1](None, "write failed")
+
+    assert writer.writes == [clips[0], clips[1]]
+    assert repository.used == ["first"]
+    assert paste.count == 1
+    assert finished == [("已发送 1/3 项；无法写入系统剪贴板：write failed", False)]
+
+
+def test_selection_sender_rejects_multi_item_copy_only_mode() -> None:
+    clips = (
+        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
+        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
+    )
+    writer = FakeWriter()
+    finished: list[tuple[str, bool]] = []
+    rejected: list[str] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        FakeRepository(),  # type: ignore[arg-type]
+        FakePaste(),
+        lambda: AppSettings(paste_after_selection=False),
+        lambda: None,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+    sender.rejected.connect(rejected.append)
+
+    sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
+
+    assert writer.writes == []
+    assert finished == []
+    assert rejected == ["多选发送需要开启“选择后自动粘贴”"]
+
+
+def test_selection_sender_rejects_multi_item_send_without_a_target() -> None:
+    clips = (
+        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
+        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
+    )
+    writer = FakeWriter()
+    finished: list[tuple[str, bool]] = []
+    rejected: list[str] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        FakeRepository(),  # type: ignore[arg-type]
+        FakePaste(),
+        AppSettings,
+        lambda: None,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+    sender.rejected.connect(rejected.append)
+
+    sender.send_many(clips, None)
+
+    assert writer.writes == []
+    assert finished == []
+    assert rejected == ["未找到原应用，无法发送多项"]
+
+
 def test_selection_sender_waits_for_async_windows_focus_recreation(
     qtbot,
     monkeypatch,

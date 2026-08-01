@@ -10,9 +10,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def test_release_version_is_consistent() -> None:
     project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
+    acceptance = (PROJECT_ROOT / "docs/验收报告.md").read_text(encoding="utf-8")
 
-    assert __version__ == "1.1.2"
+    assert __version__ == "1.1.3"
     assert project["project"]["version"] == __version__
+    assert f"当前发布版本：`v{__version__}`" in readme
+    assert f'git tag -a v{__version__} -m "ClipSoon {__version__}"' in readme
+    assert f"↵ 发送 | Esc 隐藏 | v{__version__}" in product_spec
+    assert f"## 0. v{__version__} 追加记录" in acceptance
 
 
 def test_tag_release_workflow_builds_requested_platforms() -> None:

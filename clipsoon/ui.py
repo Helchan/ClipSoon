@@ -3236,7 +3236,7 @@ class ClipPanel(QWidget):
         self.list.setMinimumWidth(_ui_metrics().list_min_width)
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._open_list_menu)
-        self.list.doubleClicked.connect(lambda index: self._send(index.row()))
+        self.list.doubleClicked.connect(lambda index: self._send_row(index.row()))
         self.list.selectionModel().currentChanged.connect(lambda current, _previous: self._show_detail(current.row()))
         self.history_content = QStackedWidget()
         self.history_content.setObjectName("historyContent")
@@ -3950,7 +3950,7 @@ class ClipPanel(QWidget):
                 # this event; accepting the residual event prevents it from
                 # bubbling into the panel on minimal/offscreen backends.
                 return True
-            self._send(self.list.currentIndex().row())
+            self._send_selected()
             return True
         if watched is self.search and key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
             self._move_selection(1 if key == Qt.Key.Key_Down else -1, key_event.modifiers())
@@ -4141,10 +4141,17 @@ class ClipPanel(QWidget):
             self.info_detail_label.setText("字数")
             self.info_detail_value.setText(f"{len(item.text)} 字")
 
-    def _send(self, row: int) -> None:
+    def _send_selected(self) -> None:
+        items = self._selected_items()
+        if items:
+            self.send_requested.emit(items)
+            return
+        self._send_row(self.list.currentIndex().row())
+
+    def _send_row(self, row: int) -> None:
         item = self.model.item_at(row)
         if item is not None:
-            self.send_requested.emit(item)
+            self.send_requested.emit((item,))
 
     def _move_selection(self, step: int, modifiers: Qt.KeyboardModifier) -> None:
         count = self.model.rowCount()
