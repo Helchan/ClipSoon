@@ -2609,6 +2609,7 @@ class SelectionSender(QObject):
         self._batch_total = 0
         self._batch_completed = 0
         self._batch_panel_hidden = False
+        self._batch_sending_line_break = False
         self._batch_settings: AppSettings | None = None
 
     def send(self, item: ClipItem, target: ForegroundTargetHandle | None) -> None:
@@ -2638,6 +2639,7 @@ class SelectionSender(QObject):
         self._batch_total = len(batch)
         self._batch_completed = 0
         self._batch_panel_hidden = False
+        self._batch_sending_line_break = False
         # An in-flight batch is one user transaction. Settings changed while
         # it is running apply to the next request instead of turning later
         # items into copy-only operations that would be falsely counted sent.
@@ -2647,6 +2649,7 @@ class SelectionSender(QObject):
     def _send_next_batch_item(self) -> None:
         if not self._busy or not self._batch_items:
             return
+        self._batch_sending_line_break = False
         item = self._batch_items.popleft()
         self._send_generation += 1
         send_generation = self._send_generation
@@ -2674,6 +2677,23 @@ class SelectionSender(QObject):
             )
             return
         self._request_item_write(item, self._batch_target, send_generation)
+
+    def _send_batch_line_break(self) -> None:
+        if not self._busy or not self._batch_items:
+            return
+        self._batch_sending_line_break = True
+        self._send_generation += 1
+        send_generation = self._send_generation
+        line_break = "\r\n" if sys.platform == "win32" else "\n"
+        separator = ClipItem(
+            id="__clipsoon_batch_line_break__",
+            kind=ClipKind.TEXT,
+            content_hash="batch-line-break",
+            created_at=0,
+            updated_at=0,
+            text=line_break,
+        )
+        self._request_item_write(separator, self._batch_target, send_generation)
 
     def _start_file_item_validation(
         self,
@@ -2813,7 +2833,8 @@ class SelectionSender(QObject):
         receipt: ClipboardWriteReceipt,
         send_generation: int,
     ) -> None:
-        self.repository.mark_used(item.id)
+        if not self._batch_sending_line_break:
+            self.repository.mark_used(item.id)
         if not self._batch_panel_hidden:
             self._hide_panel()
             self._batch_panel_hidden = True
@@ -2923,12 +2944,17 @@ class SelectionSender(QObject):
                 )
                 self._finish_send(send_generation, message, False)
                 return
+            # Enter the one permitted rewrite phase before issuing the async
+            # request. Duplicate failure callbacks from the previous verify
+            # phase must not start parallel rewrites of the same item.
+            self._send_generation += 1
+            rewrite_generation = self._send_generation
             self.clipboard.request_write(
                 item,
                 lambda receipt, write_error: self._rewrite_finished(
                     item,
                     target,
-                    send_generation,
+                    rewrite_generation,
                     receipt,
                     write_error,
                 ),
@@ -2981,15 +3007,26 @@ class SelectionSender(QObject):
         # Invalidate duplicate or late callbacks from the completed item before
         # the next queued item begins. The batch remains busy across the
         # inter-item settle interval, so a second user request cannot interleave.
+        sending_line_break = self._batch_sending_line_break
         self._send_generation += 1
         if success:
-            self._batch_completed += 1
-            if self._batch_items:
+            if sending_line_break:
+                self._batch_sending_line_break = False
                 QTimer.singleShot(
                     self._batch_paste_settle_ms,
                     self._send_next_batch_item,
                 )
                 return
+            self._batch_completed += 1
+            if self._batch_items:
+                QTimer.singleShot(
+                    self._batch_paste_settle_ms,
+                    self._send_batch_line_break,
+                )
+                return
+
+        if sending_line_break:
+            message = f"无法插入分隔换行：{message}"
 
         total = self._batch_total
         completed = self._batch_completed
@@ -2999,6 +3036,7 @@ class SelectionSender(QObject):
         self._batch_total = 0
         self._batch_completed = 0
         self._batch_panel_hidden = False
+        self._batch_sending_line_break = False
         self._batch_settings = None
         self._busy = False
         if total > 1:

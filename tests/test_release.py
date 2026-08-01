@@ -14,12 +14,23 @@ def test_release_version_is_consistent() -> None:
     product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
     acceptance = (PROJECT_ROOT / "docs/验收报告.md").read_text(encoding="utf-8")
 
-    assert __version__ == "1.1.3"
+    assert __version__ == "1.1.4"
     assert project["project"]["version"] == __version__
     assert f"当前发布版本：`v{__version__}`" in readme
     assert f'git tag -a v{__version__} -m "ClipSoon {__version__}"' in readme
     assert f"↵ 发送 | Esc 隐藏 | v{__version__}" in product_spec
     assert f"## 0. v{__version__} 追加记录" in acceptance
+
+
+def test_multi_send_line_break_contract_is_documented() -> None:
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
+    architecture = (PROJECT_ROOT / "docs/架构设计.md").read_text(encoding="utf-8")
+
+    assert "各项之间自动插入一个换行" in readme
+    assert "末尾不追加换行" in readme
+    assert "内部换行步骤" in product_spec
+    assert "不模拟 Enter" in architecture
 
 
 def test_tag_release_workflow_builds_requested_platforms() -> None:
