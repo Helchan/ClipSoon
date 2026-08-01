@@ -90,15 +90,20 @@ def test_application_routes_the_complete_panel_selection_to_sender(qtbot, tmp_pa
     application.shutdown()
 
 
-def test_multi_send_preflight_rejection_preserves_visible_selection(qtbot, tmp_path) -> None:
+def test_unsupported_multi_send_rejection_preserves_visible_selection(qtbot, tmp_path) -> None:
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)
-    application.settings.update(paste_after_selection=False)
-    newest, _middle, oldest = _add_three_ordered_texts(application)
+    source = tmp_path / "selected.txt"
+    source.write_text("selected", encoding="utf-8")
+    text = application.repository.add_text("text")
+    time.sleep(0.002)
+    files = application.repository.add_files((str(source),))
+    application._reload_history()
+    assert _panel_visible_ids(application) == [files.id, text.id]
     application.target = object()  # type: ignore[assignment]
     selection = application.panel.list.selectionModel()
     selection.clearSelection()
-    for row in (0, 2):
+    for row in (0, 1):
         selection.select(
             application.panel.model.index(row),
             QItemSelectionModel.SelectionFlag.Select
@@ -112,10 +117,10 @@ def test_multi_send_preflight_rejection_preserves_visible_selection(qtbot, tmp_p
     application.panel._send_selected()
 
     assert [item.id for item in application.panel._selected_items()] == [
-        newest.id,
-        oldest.id,
+        files.id,
+        text.id,
     ]
-    assert application.panel.status.text() == "多选发送需要开启“选择后自动粘贴”"
+    assert application.panel.status.text() == "一次发送多项目前仅支持文本；图片或文件请单项发送"
     application.shutdown()
 
 

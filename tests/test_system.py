@@ -11,6 +11,7 @@ import time
 import types
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QMimeData, QObject, QRunnable, QThreadPool, QUrl, Signal
 from PySide6.QtGui import QClipboard, QColor, QImage
 
@@ -2190,10 +2191,11 @@ def test_selection_sender_waits_for_write_ack_and_verify_before_paste(qtbot) -> 
     assert finished == [("已发送", True)]
 
 
-def test_selection_sender_serializes_items_with_line_breaks_in_a_batch(qtbot) -> None:
-    clips = tuple(
-        ClipItem(str(index), ClipKind.TEXT, str(index), index, index, text=f"item {index}")
-        for index in range(3)
+def test_selection_sender_combines_text_items_into_one_paste(qtbot) -> None:
+    clips = (
+        ClipItem("0", ClipKind.TEXT, "0", 0, 0, text=" item 0\n"),
+        ClipItem("1", ClipKind.TEXT, "1", 1, 1, text=""),
+        ClipItem("2", ClipKind.TEXT, "2", 2, 2, text="item 2"),
     )
     writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
     target = FakeTarget()
@@ -2206,131 +2208,70 @@ def test_selection_sender_serializes_items_with_line_breaks_in_a_batch(qtbot) ->
         paste,  # type: ignore[arg-type]
         lambda: settings[0],
         lambda: hidden.append(True),
-        batch_paste_settle_ms=0,
     )
     sender.finished.connect(lambda message, success: finished.append((message, success)))
 
     sender.send_many(clips, target)  # type: ignore[arg-type]
 
     line_break = "\r\n" if sys.platform == "win32" else "\n"
-    expected = (clips[0], line_break, clips[1], line_break, clips[2])
-    for index, entry in enumerate(expected):
-        qtbot.waitUntil(lambda index=index: len(writer.writes) == index + 1, timeout=1_000)
-        written = writer.writes[index]
-        if isinstance(entry, ClipItem):
-            assert written == entry
-        else:
-            assert written.kind is ClipKind.TEXT
-            assert written.text == entry
-            assert written.id == "__clipsoon_batch_line_break__"
+    assert len(writer.writes) == 1
+    combined = writer.writes[0]
+    assert combined.kind is ClipKind.TEXT
+    assert combined.id == "__clipsoon_combined_text__"
+    assert combined.text == line_break.join(item.text for item in clips)
+    assert not combined.text.endswith(line_break)
+    assert repository.used == []
+    assert hidden == []
+    assert target.activations == 0
+    assert paste.count == 0
 
-        writer.write_callbacks[index](
-            ClipboardWriteReceipt(chr(97 + index) * 32, written.kind, index + 1),
-            "",
-        )
-        qtbot.waitUntil(
-            lambda index=index: len(writer.verify_callbacks) == index + 1,
-            timeout=1_000,
-        )
-        verify_callback = writer.verify_callbacks[index][1]
-        verify_callback(True, "")
-        if index == 0:
-            settings[0] = AppSettings(
-                paste_after_selection=False,
-                paste_delay_ms=999,
-            )
-        verify_callback(True, "")  # duplicate/late ACK must not paste or advance twice
-
-    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
-    assert [item.text for item in writer.writes] == [
-        "item 0",
-        line_break,
-        "item 1",
-        line_break,
-        "item 2",
-    ]
+    settings[0] = AppSettings(paste_after_selection=False, paste_delay_ms=999)
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.TEXT, 1), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
     assert repository.used == ["0", "1", "2"]
     assert hidden == [True]
-    assert paste.count == 5
-    assert finished == [("已发送 3 项", True)]
+    assert target.activations == 1
 
+    verify_callback = writer.verify_callbacks[0][1]
+    verify_callback(True, "")
+    verify_callback(True, "")  # duplicate/late ACK must not paste twice
 
-def test_selection_sender_stops_batch_after_first_failure(qtbot) -> None:
-    clips = (
-        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
-        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
-        ClipItem("third", ClipKind.TEXT, "third", 3, 3, text="third"),
-    )
-    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
-    finished: list[tuple[str, bool]] = []
-    sender = SelectionSender(
-        writer,  # type: ignore[arg-type]
-        repository,  # type: ignore[arg-type]
-        paste,  # type: ignore[arg-type]
-        lambda: AppSettings(paste_delay_ms=0),
-        lambda: None,
-        batch_paste_settle_ms=0,
-    )
-    sender.finished.connect(lambda message, success: finished.append((message, success)))
-
-    sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
-    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.TEXT, 1), "")
-    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
-    writer.verify_callbacks[0][1](True, "")
-    qtbot.waitUntil(lambda: len(writer.writes) == 2, timeout=1_000)
-    writer.write_callbacks[1](ClipboardWriteReceipt("b" * 32, ClipKind.TEXT, 2), "")
-    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 2, timeout=1_000)
-    writer.verify_callbacks[1][1](True, "")
-    qtbot.waitUntil(lambda: len(writer.writes) == 3, timeout=1_000)
-    writer.write_callbacks[2](None, "write failed")
-
-    assert writer.writes[0] == clips[0]
-    assert writer.writes[1].text == ("\r\n" if sys.platform == "win32" else "\n")
-    assert writer.writes[2] == clips[1]
-    assert repository.used == ["first"]
-    assert paste.count == 2
-    assert finished == [("已发送 1/3 项；无法写入系统剪贴板：write failed", False)]
-
-
-def test_selection_sender_stops_batch_when_line_break_write_fails(qtbot) -> None:
-    clips = (
-        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
-        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
-        ClipItem("third", ClipKind.TEXT, "third", 3, 3, text="third"),
-    )
-    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
-    finished: list[tuple[str, bool]] = []
-    sender = SelectionSender(
-        writer,  # type: ignore[arg-type]
-        repository,  # type: ignore[arg-type]
-        paste,  # type: ignore[arg-type]
-        lambda: AppSettings(paste_delay_ms=0),
-        lambda: None,
-        batch_paste_settle_ms=0,
-    )
-    sender.finished.connect(lambda message, success: finished.append((message, success)))
-
-    sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
-    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.TEXT, 1), "")
-    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
-    writer.verify_callbacks[0][1](True, "")
-    qtbot.waitUntil(lambda: len(writer.writes) == 2, timeout=1_000)
-    writer.write_callbacks[1](None, "write failed")
-
-    line_break = "\r\n" if sys.platform == "win32" else "\n"
-    assert [item.text for item in writer.writes] == ["first", line_break]
-    assert repository.used == ["first"]
+    assert repository.used == ["0", "1", "2"]
+    assert hidden == [True]
     assert paste.count == 1
-    assert finished == [
-        (
-            "已发送 1/3 项；无法插入分隔换行："
-            "无法写入系统剪贴板：write failed",
-            False,
-        )
-    ]
+    assert len(writer.writes) == 1
+    assert finished == [("已合并发送 3 项", True)]
 
 
-def test_selection_sender_uses_crlf_between_items_on_windows(qtbot, monkeypatch) -> None:
+def test_selection_sender_combined_write_failure_has_no_partial_side_effects() -> None:
+    clips = (
+        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
+        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
+        ClipItem("third", ClipKind.TEXT, "third", 3, 3, text="third"),
+    )
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    finished: list[tuple[str, bool]] = []
+    hidden: list[bool] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: hidden.append(True),
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
+    assert len(writer.writes) == 1
+    writer.write_callbacks[0](None, "write failed")
+
+    assert repository.used == []
+    assert hidden == []
+    assert paste.count == 0
+    assert finished == [("3 项合并发送失败：无法写入系统剪贴板：write failed", False)]
+
+
+def test_selection_sender_uses_crlf_in_one_combined_windows_paste(qtbot, monkeypatch) -> None:
     clips = (
         ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
         ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
@@ -2344,120 +2285,158 @@ def test_selection_sender_uses_crlf_between_items_on_windows(qtbot, monkeypatch)
         paste,  # type: ignore[arg-type]
         lambda: AppSettings(paste_delay_ms=0),
         lambda: None,
-        batch_paste_settle_ms=0,
     )
     sender.finished.connect(lambda message, success: finished.append((message, success)))
 
     sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
-    for index in range(3):
-        qtbot.waitUntil(lambda index=index: len(writer.writes) == index + 1, timeout=1_000)
-        written = writer.writes[index]
-        writer.write_callbacks[index](
-            ClipboardWriteReceipt(chr(97 + index) * 32, written.kind, index + 1),
-            "",
-        )
-        qtbot.waitUntil(
-            lambda index=index: len(writer.verify_callbacks) == index + 1,
-            timeout=1_000,
-        )
-        writer.verify_callbacks[index][1](True, "")
+    assert [item.text for item in writer.writes] == ["first\r\nsecond"]
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.TEXT, 1), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    writer.verify_callbacks[0][1](True, "")
 
     qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
-    assert [item.text for item in writer.writes] == ["first", "\r\n", "second"]
     assert repository.used == ["first", "second"]
-    assert paste.count == 3
-    assert finished == [("已发送 2 项", True)]
+    assert paste.count == 1
+    assert finished == [("已合并发送 2 项", True)]
 
 
-def test_selection_sender_inserts_line_break_between_mixed_item_kinds(qtbot) -> None:
+@pytest.mark.parametrize(
+    "clips",
+    (
+        (
+            ClipItem("text", ClipKind.TEXT, "text", 1, 1, text="first"),
+            ClipItem("image", ClipKind.IMAGE, "image", 2, 2, image_path="image.png"),
+        ),
+        (
+            ClipItem("image-1", ClipKind.IMAGE, "image-1", 1, 1, image_path="one.png"),
+            ClipItem("image-2", ClipKind.IMAGE, "image-2", 2, 2, image_path="two.png"),
+        ),
+        (
+            ClipItem("text", ClipKind.TEXT, "text", 1, 1, text="first"),
+            ClipItem("files", ClipKind.FILES, "files", 2, 2, files=("file.txt",)),
+        ),
+        (
+            ClipItem("files-1", ClipKind.FILES, "files-1", 1, 1, files=("one.txt",)),
+            ClipItem("files-2", ClipKind.FILES, "files-2", 2, 2, files=("two.txt",)),
+        ),
+    ),
+)
+def test_selection_sender_rejects_multi_item_payloads_that_cannot_be_losslessly_combined(
+    clips: tuple[ClipItem, ClipItem],
+) -> None:
+    writer, repository, paste = FakeWriter(), FakeRepository(), FakePaste()
+    rejected: list[str] = []
+    hidden: list[bool] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: hidden.append(True),
+    )
+    sender.rejected.connect(rejected.append)
+
+    sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
+
+    assert writer.writes == []
+    assert repository.used == []
+    assert paste.count == 0
+    assert hidden == []
+    assert rejected == ["一次发送多项目前仅支持文本；图片或文件请单项发送"]
+
+
+def test_selection_sender_combines_multi_item_copy_only_mode() -> None:
     clips = (
-        ClipItem("text", ClipKind.TEXT, "text", 1, 1, text="first"),
-        ClipItem("image", ClipKind.IMAGE, "image", 2, 2, image_path="image.png"),
+        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
+        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
+    )
+    writer = FakeWriter()
+    repository, paste = FakeRepository(), FakePaste()
+    finished: list[tuple[str, bool]] = []
+    hidden: list[bool] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_after_selection=False),
+        lambda: hidden.append(True),
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
+
+    line_break = "\r\n" if sys.platform == "win32" else "\n"
+    assert [item.text for item in writer.writes] == [f"first{line_break}second"]
+    assert repository.used == ["first", "second"]
+    assert paste.count == 0
+    assert hidden == [True]
+    assert finished == [("已合并复制 2 项", True)]
+
+
+def test_selection_sender_combines_multi_item_send_without_a_target() -> None:
+    clips = (
+        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
+        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
+    )
+    writer = FakeWriter()
+    repository, paste = FakeRepository(), FakePaste()
+    finished: list[tuple[str, bool]] = []
+    hidden: list[bool] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: hidden.append(True),
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(clips, None)
+
+    line_break = "\r\n" if sys.platform == "win32" else "\n"
+    assert [item.text for item in writer.writes] == [f"first{line_break}second"]
+    assert repository.used == ["first", "second"]
+    assert paste.count == 0
+    assert hidden == [True]
+    assert finished == [("已合并复制 2 项", True)]
+
+
+def test_selection_sender_rewrites_the_same_combined_payload_once(qtbot) -> None:
+    clips = (
+        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
+        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
     )
     writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    hidden: list[bool] = []
     finished: list[tuple[str, bool]] = []
     sender = SelectionSender(
         writer,  # type: ignore[arg-type]
         repository,  # type: ignore[arg-type]
         paste,  # type: ignore[arg-type]
         lambda: AppSettings(paste_delay_ms=0),
-        lambda: None,
-        batch_paste_settle_ms=0,
+        lambda: hidden.append(True),
     )
     sender.finished.connect(lambda message, success: finished.append((message, success)))
 
     sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
-    for index in range(3):
-        qtbot.waitUntil(lambda index=index: len(writer.writes) == index + 1, timeout=1_000)
-        written = writer.writes[index]
-        writer.write_callbacks[index](
-            ClipboardWriteReceipt(chr(97 + index) * 32, written.kind, index + 1),
-            "",
-        )
-        qtbot.waitUntil(
-            lambda index=index: len(writer.verify_callbacks) == index + 1,
-            timeout=1_000,
-        )
-        writer.verify_callbacks[index][1](True, "")
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.TEXT, 1), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    first_verify = writer.verify_callbacks[0][1]
+    first_verify(False, "changed")
+    first_verify(False, "changed")
 
-    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
-    assert writer.writes[0] == clips[0]
-    assert writer.writes[1].kind is ClipKind.TEXT
-    assert writer.writes[1].text == ("\r\n" if sys.platform == "win32" else "\n")
-    assert writer.writes[2] == clips[1]
-    assert repository.used == ["text", "image"]
-    assert paste.count == 3
-    assert finished == [("已发送 2 项", True)]
+    assert len(writer.writes) == 2
+    assert writer.writes[1] == writer.writes[0]
+    writer.write_callbacks[1](ClipboardWriteReceipt("b" * 32, ClipKind.TEXT, 2), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 2, timeout=1_000)
+    final_verify = writer.verify_callbacks[1][1]
+    final_verify(True, "")
+    final_verify(True, "")
 
-
-def test_selection_sender_rejects_multi_item_copy_only_mode() -> None:
-    clips = (
-        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
-        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
-    )
-    writer = FakeWriter()
-    finished: list[tuple[str, bool]] = []
-    rejected: list[str] = []
-    sender = SelectionSender(
-        writer,  # type: ignore[arg-type]
-        FakeRepository(),  # type: ignore[arg-type]
-        FakePaste(),
-        lambda: AppSettings(paste_after_selection=False),
-        lambda: None,
-    )
-    sender.finished.connect(lambda message, success: finished.append((message, success)))
-    sender.rejected.connect(rejected.append)
-
-    sender.send_many(clips, FakeTarget())  # type: ignore[arg-type]
-
-    assert writer.writes == []
-    assert finished == []
-    assert rejected == ["多选发送需要开启“选择后自动粘贴”"]
-
-
-def test_selection_sender_rejects_multi_item_send_without_a_target() -> None:
-    clips = (
-        ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first"),
-        ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second"),
-    )
-    writer = FakeWriter()
-    finished: list[tuple[str, bool]] = []
-    rejected: list[str] = []
-    sender = SelectionSender(
-        writer,  # type: ignore[arg-type]
-        FakeRepository(),  # type: ignore[arg-type]
-        FakePaste(),
-        AppSettings,
-        lambda: None,
-    )
-    sender.finished.connect(lambda message, success: finished.append((message, success)))
-    sender.rejected.connect(rejected.append)
-
-    sender.send_many(clips, None)
-
-    assert writer.writes == []
-    assert finished == []
-    assert rejected == ["未找到原应用，无法发送多项"]
+    assert repository.used == ["first", "second"]
+    assert hidden == [True]
+    assert paste.count == 1
+    assert finished == [("已合并发送 2 项", True)]
 
 
 def test_selection_sender_waits_for_async_windows_focus_recreation(
