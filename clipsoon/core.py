@@ -212,6 +212,7 @@ class AppSettings:
     panel_x: int | None = None
     panel_y: int | None = None
     theme: str = "frosted"
+    neon_border_enabled: bool = True
 
     def validated(self) -> AppSettings:
         return AppSettings(
@@ -229,6 +230,7 @@ class AppSettings:
             panel_x=_optional_coordinate(self.panel_x),
             panel_y=_optional_coordinate(self.panel_y),
             theme=self.theme if self.theme in {"light", "dark", "frosted"} else "frosted",
+            neon_border_enabled=bool(self.neon_border_enabled),
         )
 
 

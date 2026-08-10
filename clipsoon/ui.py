@@ -849,6 +849,21 @@ class _ThemedTextCaret(QObject):
 
 _FROSTED_RADIUS = 18.0
 _SETTINGS_WINDOW_RADIUS = 16.0
+_NEON_FRAME_INTERVAL_MS = 42
+_NEON_CYCLE_SECONDS = 5.2
+_NEON_SAMPLE_COUNT = 240
+_NEON_CORE_SEGMENTS = 28
+_NEON_DIRTY_INSET = 12
+_NEON_PATH_INSET = 2.4
+
+
+@dataclass(frozen=True)
+class _NeonPerimeterGeometry:
+    points: tuple[QPointF, ...]
+    path_length: float
+    width: float
+    height: float
+    target_trail_length: float
 
 
 def _rounded_widget_path(widget: QWidget, radius: float) -> QPainterPath:
@@ -864,6 +879,173 @@ def _apply_rounded_widget_mask(widget: QWidget, radius: float) -> None:
     if widget.rect().isEmpty():
         return
     widget.setMask(QRegion(_rounded_widget_path(widget, radius).toFillPolygon().toPolygon()))
+
+
+def _interpolate_color(start: QColor, end: QColor, amount: float) -> QColor:
+    amount = min(1.0, max(0.0, amount))
+    return QColor(
+        round(start.red() + (end.red() - start.red()) * amount),
+        round(start.green() + (end.green() - start.green()) * amount),
+        round(start.blue() + (end.blue() - start.blue()) * amount),
+    )
+
+
+def _neon_color(position: float, appearance: _ThemeAppearance) -> QColor:
+    """Return the authored magenta-to-cyan energy colour along the trail."""
+
+    if appearance.dark or appearance.frosted:
+        tail, middle, head = QColor("#FF54D8"), QColor("#8A6DFF"), QColor("#55E8FF")
+    else:
+        # Slightly deeper pigments retain contrast on the opaque light card.
+        tail, middle, head = QColor("#C72BB8"), QColor("#6557E7"), QColor("#009FC8")
+    if position < 0.56:
+        return _interpolate_color(tail, middle, position / 0.56)
+    return _interpolate_color(middle, head, (position - 0.56) / 0.44)
+
+
+def _sample_rounded_perimeter_geometry(rect: QRectF) -> _NeonPerimeterGeometry:
+    """Describe the rounded rim using APIs available since Qt 6.7."""
+
+    if rect.width() <= 24 or rect.height() <= 24:
+        return _NeonPerimeterGeometry((), 0.0, 0.0, 0.0, 0.0)
+    border_rect = rect.adjusted(
+        _NEON_PATH_INSET,
+        _NEON_PATH_INSET,
+        -_NEON_PATH_INSET,
+        -_NEON_PATH_INSET,
+    )
+    width = border_rect.width()
+    height = border_rect.height()
+    if width <= 0 or height <= 0:
+        return _NeonPerimeterGeometry((), 0.0, 0.0, 0.0, 0.0)
+    perimeter = QPainterPath()
+    radius = min(
+        max(4.0, _FROSTED_RADIUS - _NEON_PATH_INSET),
+        width / 2.0,
+        height / 2.0,
+    )
+    perimeter.addRoundedRect(border_rect, radius, radius)
+    length = perimeter.length()
+    if length <= 0:
+        return _NeonPerimeterGeometry((), 0.0, width, height, 0.0)
+    points = tuple(
+        perimeter.pointAtPercent(perimeter.percentAtLength(length * index / _NEON_SAMPLE_COUNT))
+        for index in range(_NEON_SAMPLE_COUNT)
+    )
+    # Product geometry, not a fixed percentage: the ribbon occupies the arc
+    # distance of two horizontal spans plus one vertical span.  The rounded
+    # QPainterPath remains the distance domain, so resizing and DPI changes do
+    # not alter the requested physical relationship.
+    target_trail_length = min(length, 2.0 * width + height)
+    return _NeonPerimeterGeometry(points, length, width, height, target_trail_length)
+
+
+def _sample_rounded_perimeter(rect: QRectF) -> tuple[QPointF, ...]:
+    """Return equal-distance points for compatibility and focused tests."""
+
+    return _sample_rounded_perimeter_geometry(rect).points
+
+
+def _point_on_closed_perimeter(points: Sequence[QPointF], position: float) -> QPointF:
+    count = len(points)
+    lower_index = math.floor(position)
+    amount = position - lower_index
+    start = points[lower_index % count]
+    end = points[(lower_index + 1) % count]
+    return QPointF(
+        start.x() + (end.x() - start.x()) * amount,
+        start.y() + (end.y() - start.y()) * amount,
+    )
+
+
+def _neon_trail_points(
+    geometry: _NeonPerimeterGeometry,
+    phase: float,
+) -> tuple[QPointF, ...]:
+    points = geometry.points
+    if not points or geometry.path_length <= 0 or geometry.target_trail_length <= 0:
+        return ()
+    trail_span = min(
+        float(len(points)),
+        max(2.0, len(points) * geometry.target_trail_length / geometry.path_length),
+    )
+    segment_count = max(2, math.ceil(trail_span))
+    head_position = (phase % 1.0) * len(points)
+    tail_position = head_position - trail_span
+    return tuple(
+        _point_on_closed_perimeter(
+            points,
+            tail_position + trail_span * index / segment_count,
+        )
+        for index in range(segment_count + 1)
+    )
+
+
+def _path_through_points(points: Sequence[QPointF]) -> QPainterPath:
+    path = QPainterPath()
+    if not points:
+        return path
+    path.moveTo(points[0])
+    for point in points[1:]:
+        path.lineTo(point)
+    return path
+
+
+def _paint_flowing_neon_border(
+    painter: QPainter,
+    rect: QRectF,
+    appearance: _ThemeAppearance,
+    phase: float,
+    *,
+    perimeter_geometry: _NeonPerimeterGeometry | None = None,
+) -> None:
+    """Paint one restrained energy ribbon inside the main card perimeter.
+
+    The glow is deliberately clipped inward. It never expands the top-level
+    dirty region, changes card geometry, or relies on a translucent Windows
+    window. A fixed phase makes the painter deterministic for pixel tests.
+    """
+
+    geometry = perimeter_geometry if perimeter_geometry is not None else _sample_rounded_perimeter_geometry(rect)
+    trail = _neon_trail_points(geometry, phase)
+    if len(trail) < 2:
+        return
+    trail_path = _path_through_points(trail)
+
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setClipRect(rect)
+    glow = _neon_color(0.56, appearance)
+    glow.setAlpha(16 if appearance.dark or appearance.frosted else 10)
+    outer_pen = QPen(glow, 7.2)
+    outer_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    outer_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(outer_pen)
+    painter.drawPath(trail_path)
+
+    bloom = _neon_color(0.56, appearance)
+    bloom.setAlpha(46 if appearance.dark or appearance.frosted else 32)
+    bloom_pen = QPen(bloom, 3.8)
+    bloom_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    bloom_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(bloom_pen)
+    painter.drawPath(trail_path)
+
+    last_point = len(trail) - 1
+    for index in range(_NEON_CORE_SEGMENTS):
+        start_index = round(last_point * index / _NEON_CORE_SEGMENTS)
+        end_index = round(last_point * (index + 1) / _NEON_CORE_SEGMENTS)
+        core_path = _path_through_points(trail[start_index : end_index + 1])
+        progress = (index + 0.5) / _NEON_CORE_SEGMENTS
+        core = _neon_color(progress, appearance)
+        maximum_alpha = 204 if appearance.dark or appearance.frosted else 184
+        core.setAlpha(round(maximum_alpha * progress**1.3))
+        core_pen = QPen(core, 1.35)
+        core_pen.setCapStyle(Qt.PenCapStyle.RoundCap if index == _NEON_CORE_SEGMENTS - 1 else Qt.PenCapStyle.FlatCap)
+        core_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(core_pen)
+        painter.drawPath(core_path)
+    painter.restore()
 
 
 def _paint_frosted_material(
@@ -1098,6 +1280,112 @@ class _FrostedSurface(QFrame):
             light_position=self._light_position,
             light_strength=self._light_strength,
         )
+
+
+class _FlowingNeonBorder(QWidget):
+    """Mouse-transparent animated rim isolated from the card's drop shadow."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._appearance = _ThemeAppearance(dark=False)
+        self._enabled = False
+        self._suspended = False
+        self._phase = 0.0
+        self._started_at = time.monotonic()
+        self._perimeter_geometry = _NeonPerimeterGeometry((), 0.0, 0.0, 0.0, 0.0)
+        self._timer = QTimer(self)
+        self._timer.setInterval(_NEON_FRAME_INTERVAL_MS)
+        self._timer.setTimerType(Qt.TimerType.CoarseTimer)
+        self._timer.timeout.connect(self._advance)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAutoFillBackground(False)
+        self.hide()
+
+    def set_appearance(self, appearance: _ThemeAppearance) -> None:
+        if self._appearance == appearance:
+            return
+        self._appearance = appearance
+        self._update_border()
+
+    def set_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._enabled == enabled:
+            self._sync_state()
+            return
+        self._enabled = enabled
+        self._sync_state()
+
+    def set_suspended(self, suspended: bool) -> None:
+        suspended = bool(suspended)
+        if self._suspended == suspended:
+            return
+        self._suspended = suspended
+        self._sync_state()
+
+    def _should_show(self) -> bool:
+        return self._enabled and not self._suspended
+
+    def _should_run(self) -> bool:
+        return self._should_show() and self.isVisible() and self.window().isVisible()
+
+    def _sync_state(self) -> None:
+        if self._should_show():
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
+        if not self._should_run():
+            self._timer.stop()
+            return
+        if self._timer.isActive():
+            return
+        self._started_at = time.monotonic() - self._phase * _NEON_CYCLE_SECONDS
+        self._timer.start()
+
+    def _advance(self) -> None:
+        if not self._should_run():
+            self._timer.stop()
+            return
+        self._phase = ((time.monotonic() - self._started_at) / _NEON_CYCLE_SECONDS) % 1.0
+        self._update_border()
+
+    def _update_border(self) -> None:
+        if self.rect().isEmpty():
+            return
+        inner_rect = self.rect().adjusted(
+            _NEON_DIRTY_INSET,
+            _NEON_DIRTY_INSET,
+            -_NEON_DIRTY_INSET,
+            -_NEON_DIRTY_INSET,
+        )
+        self.update(QRegion(self.rect()).subtracted(QRegion(inner_rect)))
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self._should_show():
+            return
+        painter = QPainter(self)
+        _paint_flowing_neon_border(
+            painter,
+            QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6),
+            self._appearance,
+            self._phase,
+            perimeter_geometry=self._perimeter_geometry,
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        rect = QRectF(self.rect()).adjusted(0.6, 0.6, -0.6, -0.6)
+        self._perimeter_geometry = _sample_rounded_perimeter_geometry(rect)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_state()
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
 
 
 def _soft_blurred_snapshot(pixmap: QPixmap) -> QPixmap:
@@ -2556,8 +2844,12 @@ class SettingsDialog(QDialog):
         # dialog.hide() call into a TypeError.
         self.hide_on_deactivate_checkbox = _SettingsCheckBox("面板失去焦点时自动隐藏")
         self.hide_on_deactivate_checkbox.setChecked(settings.hide_on_deactivate)
-        self.launch_at_login = _SettingsCheckBox("开机时自动启动 ClipSoon")
+        self.launch_at_login = _SettingsCheckBox("登录时自动启动")
+        self.launch_at_login.setAccessibleName("登录时自动启动 ClipSoon")
+        self.launch_at_login.setToolTip("登录系统时自动启动 ClipSoon")
         self.launch_at_login.setChecked(settings.launch_at_login)
+        self.neon_border = _SettingsCheckBox("流动霓虹边框")
+        self.neon_border.setChecked(settings.neon_border_enabled)
         # Keep the persisted ``remember_selection`` key for upgrade compatibility,
         # while the user-facing feature now restores the complete panel state.
         self.remember_selection = _SettingsCheckBox("记住上次状态")
@@ -2569,6 +2861,7 @@ class SettingsDialog(QDialog):
             self.hide_on_deactivate_checkbox,
             self.remember_selection,
             self.launch_at_login,
+            self.neon_border,
         )
         # Native QCheckBox metrics differ enough across macOS scales that a
         # content-driven grid can place consecutive labels on top of one
@@ -2595,7 +2888,8 @@ class SettingsDialog(QDialog):
         behavior_options.addWidget(self.paste, 0, 1)
         behavior_options.addWidget(self.hide_on_deactivate_checkbox, 1, 0)
         behavior_options.addWidget(self.remember_selection, 1, 1)
-        behavior_options.addWidget(self.launch_at_login, 2, 0, 1, 2)
+        behavior_options.addWidget(self.launch_at_login, 2, 0)
+        behavior_options.addWidget(self.neon_border, 2, 1)
         history_layout.addLayout(behavior_options)
         layout.addWidget(history_section)
         self._settings_checkboxes = behavior_checkboxes
@@ -2713,6 +3007,7 @@ class SettingsDialog(QDialog):
             "remember_selection": self.remember_selection.isChecked(),
             "selection_memory_seconds": self.selection_memory.value(),
             "launch_at_login": self.launch_at_login.isChecked(),
+            "neon_border_enabled": self.neon_border.isChecked(),
         }
 
     def _connect_immediate_changes(self) -> None:
@@ -2734,6 +3029,7 @@ class SettingsDialog(QDialog):
             self.hide_on_deactivate_checkbox,
             self.remember_selection,
             self.launch_at_login,
+            self.neon_border,
         ):
             checkbox.toggled.connect(self._emit_settings_changed)
 
@@ -2922,6 +3218,7 @@ class SettingsDialog(QDialog):
             self.selection_memory.setValue(settings.selection_memory_seconds)
             self.selection_memory.setEnabled(settings.remember_selection)
             self.launch_at_login.setChecked(settings.launch_at_login)
+            self.neon_border.setChecked(settings.neon_border_enabled)
         finally:
             self._updating_controls = False
 
@@ -3384,6 +3681,8 @@ class ClipPanel(QWidget):
         self._install_frosted_tracking()
         self._settings_interaction_shield = _PanelInteractionShield(self.card)
         self._sync_settings_interaction_shield_geometry()
+        self.neon_border = _FlowingNeonBorder(self)
+        self._sync_neon_border_geometry()
 
     def _install_frosted_tracking(self) -> None:
         """Let one material shell react to pointer movement above its content."""
@@ -3565,6 +3864,7 @@ class ClipPanel(QWidget):
         super().resizeEvent(event)
         self._sync_windows_rounded_window_mask()
         self._sync_settings_interaction_shield_geometry()
+        self._sync_neon_border_geometry()
         if self._settings_interaction_blocked:
             QTimer.singleShot(0, self._refresh_settings_interaction_shield)
 
@@ -3611,6 +3911,8 @@ class ClipPanel(QWidget):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._sync_windows_rounded_window_mask()
+        self._sync_neon_border_geometry()
+        self.neon_border._sync_state()
 
     def hide_panel(self) -> None:
         if not self.isVisible():
@@ -3719,10 +4021,13 @@ class ClipPanel(QWidget):
             self._select_for_show(restore=False)
 
     def apply_theme(self) -> None:
-        self._appearance = _theme_appearance(self._settings())
+        settings = self._settings()
+        self._appearance = _theme_appearance(settings)
         self._dark_theme = self._appearance.dark
         self.card.set_appearance(self._appearance)
         self.card.set_paint_material(sys.platform != "win32")
+        self.neon_border.set_appearance(self._appearance)
+        self.neon_border.set_enabled(settings.neon_border_enabled)
         # A theme must not change the panel's visible card geometry.  On macOS
         # the frosted custom shell uses the same 14-point gutter as ordinary
         # themes, so the visible card size stays stable across switches.
@@ -3779,12 +4084,15 @@ class ClipPanel(QWidget):
             return
         self._settings_interaction_shield.setGeometry(self.card.rect())
 
+    def _sync_neon_border_geometry(self) -> None:
+        if not hasattr(self, "neon_border"):
+            return
+        top_left = self.card.mapTo(self, QPoint(0, 0))
+        self.neon_border.setGeometry(QRect(top_left, self.card.size()))
+        self.neon_border.raise_()
+
     def _refresh_settings_interaction_shield(self) -> None:
-        if (
-            self._settings_interaction_shield is None
-            or not self._settings_interaction_blocked
-            or not self.isVisible()
-        ):
+        if self._settings_interaction_shield is None or not self._settings_interaction_blocked or not self.isVisible():
             return
         self._sync_settings_interaction_shield_geometry()
         self._settings_interaction_shield.set_appearance(self._appearance)
@@ -3795,6 +4103,7 @@ class ClipPanel(QWidget):
     def set_settings_interaction_blocked(self, blocked: bool) -> None:
         blocked = bool(blocked)
         self._settings_interaction_blocked = blocked
+        self._sync_neon_suspension()
         if blocked:
             self._drag_offset = None
             self._drag_origin = None
@@ -3811,6 +4120,10 @@ class ClipPanel(QWidget):
             self._settings_interaction_shield.hide()
         self.card.update()
         self.update()
+
+    def _sync_neon_suspension(self) -> None:
+        viewer_open = self._image_viewer_dialog is not None
+        self.neon_border.set_suspended(self._settings_interaction_blocked or viewer_open)
 
     def _apply_search_input_palette(self, colors: _ThemeColors) -> None:
         """Keep the search text and themed blinking caret readable per theme."""
@@ -3852,11 +4165,13 @@ class ClipPanel(QWidget):
         self.keep_open(True)
         dialog = ImageViewerDialog(path, self._appearance, self)
         self._image_viewer_dialog = dialog
+        self._sync_neon_suspension()
 
         def viewer_finished() -> None:
             if self._image_viewer_dialog is not dialog:
                 return
             self._image_viewer_dialog = None
+            self._sync_neon_suspension()
             if not self._settings_interaction_blocked:
                 self._restore_after_image_viewer()
                 self.keep_open(False)

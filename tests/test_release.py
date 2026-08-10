@@ -14,7 +14,7 @@ def test_release_version_is_consistent() -> None:
     product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
     acceptance = (PROJECT_ROOT / "docs/验收报告.md").read_text(encoding="utf-8")
 
-    assert __version__ == "1.1.6"
+    assert __version__ == "1.1.7"
     assert project["project"]["version"] == __version__
     assert f"当前发布版本：`v{__version__}`" in readme
     assert f'git tag -a v{__version__} -m "ClipSoon {__version__}"' in readme
@@ -32,6 +32,21 @@ def test_multi_send_single_paste_contract_is_documented() -> None:
     assert "不额外追加末尾换行" in product_spec
     assert "图片或文件请单项发送" in product_spec
     assert "不模拟 Enter" in architecture
+
+
+def test_flowing_neon_border_contract_is_documented() -> None:
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
+    architecture = (PROJECT_ROOT / "docs/架构设计.md").read_text(encoding="utf-8")
+
+    for document in (readme, product_spec, architecture):
+        assert "流动霓虹边框" in document
+    assert "neon_border_enabled" in architecture
+    assert "2 × 水平边长 + 1 × 高度" in product_spec
+    assert "2 × 水平边长 + 1 × 高度" in architecture
+    assert "不得使用固定像素长度或固定周长百分比" in product_spec
+    assert "图片查看器占用时停止刷新" in product_spec
+    assert "隐藏、关闭效果、打开设置或查看图片时必须停止计时器" in product_spec
 
 
 def test_tag_release_workflow_builds_requested_platforms() -> None:

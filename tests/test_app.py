@@ -204,9 +204,16 @@ def test_settings_dialog_applies_changes_and_reset_without_a_save_step(qtbot, tm
     dialog.maximum.setValue(800)
     assert application.settings.value.max_history_items == 800
 
+    dialog.neon_border.setChecked(False)
+    assert not application.settings.value.neon_border_enabled
+    assert not JsonSettingsStore(tmp_path / "settings.json").load().neon_border_enabled
+    assert not application.panel.neon_border._enabled
+
     dialog.reset_button.click()
     assert application.settings.value.theme == "frosted"
     assert application.settings.value.max_history_items == 500
+    assert application.settings.value.neon_border_enabled
+    assert application.panel.neon_border._enabled
     application.shutdown()
 
 
