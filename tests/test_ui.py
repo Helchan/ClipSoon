@@ -1142,10 +1142,16 @@ def test_main_panel_uses_static_thin_border_without_shadow_or_neon(qtbot, theme:
     panel.show_panel()
     qtbot.waitExposed(panel)
     margins = panel._outer_layout.contentsMargins()
+    expected_margin = ui_module._panel_outer_margin()
 
     assert panel.card.graphicsEffect() is None
     assert not hasattr(panel, "neon_border")
-    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (1, 1, 1, 1)
+    assert (
+        margins.left(),
+        margins.top(),
+        margins.right(),
+        margins.bottom(),
+    ) == (expected_margin, expected_margin, expected_margin, expected_margin)
     assert re.search(
         r"#card \{ background: [^;]+; border: 1px solid [^;]+; border-radius: 18px; \}",
         panel.styleSheet(),
@@ -1412,17 +1418,18 @@ def test_frosted_panel_uses_one_custom_painted_primary_shell(qtbot) -> None:
     panel = ClipPanel(lambda: current["settings"])
     qtbot.addWidget(panel)
 
+    expected_margin = ui_module._panel_outer_margin()
     light_margins = panel.layout().contentsMargins()
-    assert light_margins.left() == 1
-    assert light_margins.top() == 1
+    assert light_margins.left() == expected_margin
+    assert light_margins.top() == expected_margin
 
     current["settings"] = AppSettings(theme="frosted")
     panel.apply_theme()
 
     assert panel.card.__class__.__name__ == "_FrostedSurface"
     frosted_margins = panel.layout().contentsMargins()
-    assert frosted_margins.left() == 1
-    assert frosted_margins.top() == 1
+    assert frosted_margins.left() == expected_margin
+    assert frosted_margins.top() == expected_margin
     assert "#card { background: transparent; border: 1px solid rgba(58, 87, 134, 72);" in panel.styleSheet()
     assert "#detail { background: transparent; border: none;" in panel.styleSheet()
     assert panel.card.graphicsEffect() is None
@@ -1637,6 +1644,8 @@ def test_windows_frosted_keeps_qt_non_layered_with_app_owned_material(
     assert not panel.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     assert panel.autoFillBackground()
     assert not hasattr(panel, "neon_border")
+    margins = panel._outer_layout.contentsMargins()
+    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (2, 2, 2, 2)
     assert "#panelWindow { background: transparent; }" not in panel.styleSheet()
     assert "#card { background: transparent; border: 1px solid rgba(58, 87, 134, 72);" in panel.styleSheet()
     assert "rgba(232, 244, 255, 54)" in panel.styleSheet()

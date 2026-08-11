@@ -850,6 +850,11 @@ class _ThemedTextCaret(QObject):
 
 _FROSTED_RADIUS = 18.0
 _SETTINGS_WINDOW_RADIUS = 16.0
+_WINDOWS_PANEL_EDGE_GUARD = 2
+
+
+def _panel_outer_margin() -> int:
+    return _WINDOWS_PANEL_EDGE_GUARD if sys.platform == "win32" else 1
 
 
 def _rounded_widget_path(widget: QWidget, radius: float) -> QPainterPath:
@@ -3259,7 +3264,8 @@ class ClipPanel(QWidget):
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(1, 1, 1, 1)
+        margin = _panel_outer_margin()
+        outer.setContentsMargins(margin, margin, margin, margin)
         self._outer_layout = outer
         self.card = _FrostedSurface()
         self.card.setObjectName("card")
@@ -3847,7 +3853,8 @@ class ClipPanel(QWidget):
         self.card.set_appearance(self._appearance)
         self.card.set_paint_material(sys.platform != "win32")
         # A theme must not change the panel's visible card geometry.
-        self._outer_layout.setContentsMargins(1, 1, 1, 1)
+        margin = _panel_outer_margin()
+        self._outer_layout.setContentsMargins(margin, margin, margin, margin)
         colors = _theme_colors(self._appearance)
         if sys.platform == "win32":
             palette = self.palette()
@@ -3878,7 +3885,7 @@ class ClipPanel(QWidget):
 
     def _sync_windows_rounded_window_mask(self) -> None:
         if sys.platform == "win32":
-            _apply_rounded_widget_mask(self, _FROSTED_RADIUS)
+            _apply_rounded_widget_mask(self, _FROSTED_RADIUS + _WINDOWS_PANEL_EDGE_GUARD)
         else:
             self.clearMask()
 
