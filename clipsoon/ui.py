@@ -850,11 +850,6 @@ class _ThemedTextCaret(QObject):
 
 _FROSTED_RADIUS = 18.0
 _SETTINGS_WINDOW_RADIUS = 16.0
-_WINDOWS_PANEL_EDGE_GUARD = 2
-
-
-def _panel_outer_margin() -> int:
-    return _WINDOWS_PANEL_EDGE_GUARD if sys.platform == "win32" else 1
 
 
 def _rounded_widget_path(widget: QWidget, radius: float) -> QPainterPath:
@@ -880,6 +875,7 @@ def _paint_frosted_material(
     light_position: QPointF | None = None,
     light_strength: float = 0.0,
     radius: float = _FROSTED_RADIUS,
+    draw_border: bool = True,
 ) -> None:
     """Paint a self-contained, lens-inspired material without screen capture.
 
@@ -971,6 +967,9 @@ def _paint_frosted_material(
     lower_edge.setColorAt(1.0, bottom_shade)
     painter.fillPath(shell, QBrush(lower_edge))
     painter.restore()
+
+    if not draw_border:
+        return
 
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -3264,8 +3263,7 @@ class ClipPanel(QWidget):
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
-        margin = _panel_outer_margin()
-        outer.setContentsMargins(margin, margin, margin, margin)
+        outer.setContentsMargins(1, 1, 1, 1)
         self._outer_layout = outer
         self.card = _FrostedSurface()
         self.card.setObjectName("card")
@@ -3711,6 +3709,7 @@ class ClipPanel(QWidget):
             self._appearance,
             light_position=light_position,
             light_strength=light_strength,
+            draw_border=False,
         )
 
     def _can_start_drag(self, position: QPoint) -> bool:
@@ -3853,8 +3852,7 @@ class ClipPanel(QWidget):
         self.card.set_appearance(self._appearance)
         self.card.set_paint_material(sys.platform != "win32")
         # A theme must not change the panel's visible card geometry.
-        margin = _panel_outer_margin()
-        self._outer_layout.setContentsMargins(margin, margin, margin, margin)
+        self._outer_layout.setContentsMargins(1, 1, 1, 1)
         colors = _theme_colors(self._appearance)
         if sys.platform == "win32":
             palette = self.palette()
@@ -3885,7 +3883,7 @@ class ClipPanel(QWidget):
 
     def _sync_windows_rounded_window_mask(self) -> None:
         if sys.platform == "win32":
-            _apply_rounded_widget_mask(self, _FROSTED_RADIUS + _WINDOWS_PANEL_EDGE_GUARD)
+            _apply_rounded_widget_mask(self, _FROSTED_RADIUS)
         else:
             self.clearMask()
 

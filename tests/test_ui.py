@@ -1142,7 +1142,6 @@ def test_main_panel_uses_static_thin_border_without_shadow_or_neon(qtbot, theme:
     panel.show_panel()
     qtbot.waitExposed(panel)
     margins = panel._outer_layout.contentsMargins()
-    expected_margin = ui_module._panel_outer_margin()
 
     assert panel.card.graphicsEffect() is None
     assert not hasattr(panel, "neon_border")
@@ -1151,7 +1150,7 @@ def test_main_panel_uses_static_thin_border_without_shadow_or_neon(qtbot, theme:
         margins.top(),
         margins.right(),
         margins.bottom(),
-    ) == (expected_margin, expected_margin, expected_margin, expected_margin)
+    ) == (1, 1, 1, 1)
     assert re.search(
         r"#card \{ background: [^;]+; border: 1px solid [^;]+; border-radius: 18px; \}",
         panel.styleSheet(),
@@ -1418,18 +1417,17 @@ def test_frosted_panel_uses_one_custom_painted_primary_shell(qtbot) -> None:
     panel = ClipPanel(lambda: current["settings"])
     qtbot.addWidget(panel)
 
-    expected_margin = ui_module._panel_outer_margin()
     light_margins = panel.layout().contentsMargins()
-    assert light_margins.left() == expected_margin
-    assert light_margins.top() == expected_margin
+    assert light_margins.left() == 1
+    assert light_margins.top() == 1
 
     current["settings"] = AppSettings(theme="frosted")
     panel.apply_theme()
 
     assert panel.card.__class__.__name__ == "_FrostedSurface"
     frosted_margins = panel.layout().contentsMargins()
-    assert frosted_margins.left() == expected_margin
-    assert frosted_margins.top() == expected_margin
+    assert frosted_margins.left() == 1
+    assert frosted_margins.top() == 1
     assert "#card { background: transparent; border: 1px solid rgba(58, 87, 134, 72);" in panel.styleSheet()
     assert "#detail { background: transparent; border: none;" in panel.styleSheet()
     assert panel.card.graphicsEffect() is None
@@ -1637,6 +1635,14 @@ def test_windows_frosted_keeps_qt_non_layered_with_app_owned_material(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    paint_border_flags: list[bool] = []
+    original_paint_frosted_material = ui_module._paint_frosted_material
+
+    def record_paint_frosted_material(*args, **kwargs):
+        paint_border_flags.append(bool(kwargs.get("draw_border", True)))
+        return original_paint_frosted_material(*args, **kwargs)
+
+    monkeypatch.setattr(ui_module, "_paint_frosted_material", record_paint_frosted_material)
     panel = ClipPanel(lambda: AppSettings(theme="frosted"))
     qtbot.addWidget(panel)
 
@@ -1645,10 +1651,15 @@ def test_windows_frosted_keeps_qt_non_layered_with_app_owned_material(
     assert panel.autoFillBackground()
     assert not hasattr(panel, "neon_border")
     margins = panel._outer_layout.contentsMargins()
-    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (2, 2, 2, 2)
+    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (1, 1, 1, 1)
     assert "#panelWindow { background: transparent; }" not in panel.styleSheet()
     assert "#card { background: transparent; border: 1px solid rgba(58, 87, 134, 72);" in panel.styleSheet()
     assert "rgba(232, 244, 255, 54)" in panel.styleSheet()
+    pixmap = QPixmap(panel.size())
+    pixmap.fill(Qt.GlobalColor.transparent)
+    panel.render(pixmap)
+    assert paint_border_flags
+    assert all(flag is False for flag in paint_border_flags)
 
 
 def test_windows_panel_and_settings_windows_clip_top_level_corners(qtbot, monkeypatch) -> None:
