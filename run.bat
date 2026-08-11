@@ -5,9 +5,17 @@ set "PROJECT_DIR=%~dp0"
 set "PYTHON_BIN=%PROJECT_DIR%.venv\Scripts\python.exe"
 
 if not exist "%PYTHON_BIN%" (
-  echo ClipSoon 的 Python 3.12 开发环境不存在。
-  echo 请先执行：py -3.12 -m venv .venv
+  echo ClipSoon 的标准 CPython 3.11-3.14 开发环境不存在。
+  echo 请先使用任一受支持版本创建环境，例如：py -3.12 -m venv .venv
   echo 然后执行：.venv\Scripts\python.exe -m pip install -e ".[dev,package]"
+  pause
+  exit /b 1
+)
+
+"%PYTHON_BIN%" -c "import sys, sysconfig; supported = sys.implementation.name == 'cpython' and sys.version_info[:2] in {(3, 11), (3, 12), (3, 13), (3, 14)} and not sysconfig.get_config_var('Py_GIL_DISABLED'); raise SystemExit(0 if supported else 1)"
+if errorlevel 1 (
+  echo 当前 .venv 不是受支持的标准 CPython 3.11-3.14 环境。
+  echo 请删除并使用 CPython 3.11、3.12、3.13 或 3.14 重新创建 .venv。
   pause
   exit /b 1
 )

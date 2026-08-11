@@ -14,12 +14,35 @@ def test_release_version_is_consistent() -> None:
     product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
     acceptance = (PROJECT_ROOT / "docs/验收报告.md").read_text(encoding="utf-8")
 
-    assert __version__ == "1.1.8"
+    assert __version__ == "1.1.9"
     assert project["project"]["version"] == __version__
     assert f"当前发布版本：`v{__version__}`" in readme
     assert f'git tag -a v{__version__} -m "ClipSoon {__version__}"' in readme
     assert f"↵ 发送 | Esc 隐藏 | v{__version__}" in product_spec
     assert f"## 0. v{__version__} 追加记录" in acceptance
+
+
+def test_supported_python_versions_and_dependency_floors_are_declared() -> None:
+    project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = set(project["project"]["dependencies"])
+    optional_dependencies = project["project"]["optional-dependencies"]
+    classifiers = set(project["project"]["classifiers"])
+
+    assert project["project"]["requires-python"] == ">=3.11,<3.15"
+    assert project["tool"]["ruff"]["target-version"] == "py311"
+    for version in ("3.11", "3.12", "3.13", "3.14"):
+        assert f"Programming Language :: Python :: {version}" in classifiers
+    assert "Programming Language :: Python :: Implementation :: CPython" in classifiers
+    assert "pynput>=1.8.2,<2" in dependencies
+    assert "PySide6-Essentials>=6.10.1,<7" in dependencies
+    assert "pyobjc-framework-ApplicationServices>=11.1,<13; sys_platform == 'darwin'" in dependencies
+    assert "pyobjc-framework-Cocoa>=11.1,<13; sys_platform == 'darwin'" in dependencies
+    assert "coverage[toml]>=7.10,<8" in optional_dependencies["dev"]
+    assert "pytest>=8.4.2,<9" in optional_dependencies["dev"]
+    assert "pytest-qt>=4.5,<5" in optional_dependencies["dev"]
+    assert "pytest-timeout>=2.4,<3" in optional_dependencies["dev"]
+    assert "ruff>=0.15,<1" in optional_dependencies["dev"]
+    assert "pyinstaller>=6.15,<7" in optional_dependencies["package"]
 
 
 def test_multi_send_single_paste_contract_is_documented() -> None:
@@ -67,7 +90,26 @@ def test_tag_release_workflow_builds_requested_platforms() -> None:
     assert "scripts\\smoke_windows_helpers.py dist\\ClipSoon\\ClipSoon.exe" in workflow
     assert "- name: Lint Windows source" in workflow
     assert "pytest -vv --durations=20 --timeout=90 --timeout-method=thread" in workflow
-    assert "pytest-timeout>=2.3,<3" in project["project"]["optional-dependencies"]["dev"]
+    assert "pytest-timeout>=2.4,<3" in project["project"]["optional-dependencies"]["dev"]
+    assert workflow.count('python-version: "3.12"') == 3
+
+
+def test_python_compatibility_workflow_covers_supported_platform_matrix() -> None:
+    workflow = (PROJECT_ROOT / ".github/workflows/compatibility.yml").read_text(encoding="utf-8")
+    supported_versions = 'python-version: ["3.11", "3.12", "3.13", "3.14"]'
+
+    assert workflow.count(supported_versions) == 2
+    assert "runs-on: windows-latest" in workflow
+    assert "architecture: x64" in workflow
+    assert "runs-on: macos-15" in workflow
+    assert "architecture: arm64" in workflow
+    assert workflow.count("timeout-minutes: 30") == 2
+    assert 'python -m pip install -e ".[dev]"' in workflow
+    assert "python -m pip install -e '.[dev]'" in workflow
+    assert workflow.count("python -m ruff check .") == 2
+    assert workflow.count("python -m pytest -vv --durations=20 --timeout=90 --timeout-method=thread") == 2
+    assert '$env:QT_QPA_PLATFORM = "offscreen"' in workflow
+    assert "QT_QPA_PLATFORM: offscreen" in workflow
 
 
 def test_windows_helper_smoke_uses_only_registered_combo_hotkeys() -> None:
@@ -84,8 +126,27 @@ def test_windows_build_script_keeps_portable_runtime_contract_clear() -> None:
     assert 'scripts\\build_windows.bat" %*' in launcher
     assert "--onedir" in script
     assert "--onefile" in script
-    assert "dist\\ClipSoon\\_internal\\python312.dll" in script
+    assert "sys.implementation.name == 'cpython'" in script
+    assert "print(f'python{sys.version_info.major}{sys.version_info.minor}.dll')" in script
+    assert 'set "PYTHON_DLL=' in script
+    assert "dist\\ClipSoon\\_internal\\%PYTHON_DLL%" in script
+    assert "dist\\ClipSoon\\%PYTHON_DLL%" in script
+    assert "python312.dll" not in script
     assert "Do not move only ClipSoon.exe" in script
+
+
+def test_source_launch_and_build_prompts_name_the_supported_cpython_range() -> None:
+    paths = (
+        "run.bat",
+        "run.command",
+        "scripts/build_windows.bat",
+        "scripts/build_macos.command",
+    )
+
+    for path in paths:
+        content = (PROJECT_ROOT / path).read_text(encoding="utf-8")
+        assert "CPython 3.11-3.14" in content
+        assert "Py_GIL_DISABLED" in content
 
 
 def test_windows_helper_smoke_exercises_eager_native_clipboard_formats() -> None:

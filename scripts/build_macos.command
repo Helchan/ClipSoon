@@ -4,7 +4,11 @@ SCRIPT_DIR="${0:A:h}"
 PROJECT_DIR="${SCRIPT_DIR:h}"
 PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
-  echo "Create .venv with Python 3.12 and install '.[package]' first."
+  echo "Create .venv with standard CPython 3.11-3.14 and install '.[package]' first."
+  exit 1
+fi
+if ! "${PYTHON_BIN}" -c 'import sys, sysconfig; supported = sys.implementation.name == "cpython" and (3, 11) <= sys.version_info[:2] <= (3, 14) and not sysconfig.get_config_var("Py_GIL_DISABLED"); raise SystemExit(0 if supported else 1)'; then
+  echo "ClipSoon packaging requires standard CPython 3.11-3.14."
   exit 1
 fi
 APP_VERSION="${CLIPSOON_VERSION:-$("${PYTHON_BIN}" -c 'import clipsoon; print(clipsoon.__version__)')}"

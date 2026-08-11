@@ -2,7 +2,7 @@
 
 ClipSoon 是一款面向 macOS 和 Windows 的本地剪贴板历史工具。它像 Spotlight / Raycast 一样按需出现：复制内容后，通过全局快捷键呼出面板，搜索、预览并快速粘贴过去复制过的文本、图片或文件。
 
-当前发布版本：`v1.1.8`。
+当前发布版本：`v1.1.9`。
 
 > 本地优先：历史数据仅保存在本机 SQLite 数据库和图片目录中，不上传网络。
 
@@ -64,7 +64,8 @@ ClipSoon 是一款面向 macOS 和 Windows 的本地剪贴板历史工具。它�
 
 ## 系统要求
 
-- Python `3.12`（开发和打包环境统一，当前不支持 Python 3.13）。
+- 标准版 CPython `3.11.x`、`3.12.x`、`3.13.x` 或 `3.14.x`；不支持 `3.13t`、`3.14t` 等
+  free-threaded（无 GIL）构建。
 - macOS 13 或更高版本。
 - Windows 10 / 11。
 
@@ -80,12 +81,15 @@ Windows 不需要开启 macOS 式的辅助功能权限。如果目标应用以�
 
 ## 使用源码启动
 
-日常开发和功能验收应直接从当前源码启动，不需要先打包。项目要求使用 Python 3.12，建议在仓库根目录创建项目专用的 `.venv`。
+日常开发和功能验收应直接从当前源码启动，不需要先打包。项目支持标准版 CPython 3.11–3.14，
+建议在仓库根目录创建项目专用的 `.venv`。以下命令以 canonical 开发/发布解释器 Python 3.12 为例；
+创建源码环境时可把命令中的 `3.12` 替换为 `3.11`、`3.13` 或 `3.14`，但不要使用 free-threaded 构建。
 
 下面出现的 Python 命令不能跨平台混用：
 
-- `python3.12` 是 macOS 安装 Python 3.12 后常见的命令名。
-- `py -3.12` 是 Windows 的 Python Launcher 命令，用来明确选择已安装的 Python 3.12；如果系统中只有 `py` 而没有 `python` 或 `python3.12`，这是正常情况。
+- `python3.12` 是 macOS 安装 Python 3.12 后常见的命令名；使用其他受支持版本时替换版本号。
+- `py -3.12` 是 Windows 的 Python Launcher 命令，用来明确选择已安装的 Python 3.12；使用其他受支持版本时可改为
+  `py -3.11`、`py -3.13` 或 `py -3.14`。如果系统中只有 `py` 而没有 `python` 或 `python3.12`，这是正常情况。
 - 创建 `.venv` 后，安装依赖和启动源码都使用该虚拟环境里的 Python：macOS 为 `.venv/bin/python`，Windows 为 `.venv\Scripts\python.exe`。两者是平台相关路径，不可互换。
 
 ### macOS
@@ -154,7 +158,7 @@ PowerShell 对应命令为：
 .\.venv\Scripts\python.exe -m clipsoon --show
 ```
 
-如果 Windows 找不到 `py`，可将第一条创建环境的命令改为 Python 3.12 的实际安装路径，例如：
+如果 Windows 找不到 `py`，可将第一条创建环境的命令改为所选 Python 的实际安装路径。以下仍以 3.12 为例：
 
 ```bat
 "C:\Program Files\Python312\python.exe" -m venv .venv
@@ -255,7 +259,7 @@ $env:QT_QPA_PLATFORM = "offscreen"
 - macOS：双击 `build_macos.command`，产物为 `dist/ClipSoon.app`。
 - Windows：双击 `build_windows.bat`，产物为 `dist\ClipSoon\ClipSoon.exe` 所在的完整便携目录。
 
-Windows 包需要在 Windows 10 / 11 主机上生成。默认 Windows 包使用 PyInstaller one-dir，避免 one-file 每次启动时的临时解包开销。它不是一个可以单独拷走的裸 exe：运行时必须保留整个 `dist\ClipSoon` 目录，因为 `ClipSoon.exe` 依赖旁边的 `_internal\python312.dll`、Qt DLL 和其他运行库。发布页下载的 `ClipSoon-vX.Y.Z-windows-x64.zip` 也需要先完整解压，再运行解压后目录里的 `ClipSoon\ClipSoon.exe`；不要直接在 zip 预览窗口里双击 exe，也不要只把 exe 拖到桌面。需要放到桌面时，应创建快捷方式。
+Windows 包需要在 Windows 10 / 11 主机上生成。默认 Windows 包使用 PyInstaller one-dir，避免 one-file 每次启动时的临时解包开销。它不是一个可以单独拷走的裸 exe：运行时必须保留整个 `dist\ClipSoon` 目录，因为 `ClipSoon.exe` 依赖旁边的 `_internal\pythonXY.dll`、Qt DLL 和其他运行库；其中 `XY` 是构建解释器的主/次版本，例如 Python 3.11–3.14 分别对应 `python311.dll`–`python314.dll`。正式 Release 使用 canonical CPython 3.12 构建，因此官方 Windows 包中对应文件为 `_internal\python312.dll`。发布页下载的 `ClipSoon-vX.Y.Z-windows-x64.zip` 也需要先完整解压，再运行解压后目录里的 `ClipSoon\ClipSoon.exe`；不要直接在 zip 预览窗口里双击 exe，也不要只把 exe 拖到桌面。需要放到桌面时，应创建快捷方式。
 
 如果确实需要单文件 exe，可在 Windows 上运行：
 
@@ -267,7 +271,9 @@ build_windows.bat onefile
 
 ## 自动发布
 
-推送 `v*` 版本标签后，[GitHub Actions](.github/workflows/release.yml) 会自动构建并发布：
+日常[兼容性 CI](.github/workflows/compatibility.yml) 会在 Windows x64 和 macOS 15 arm64 上分别使用标准 CPython 3.11、3.12、3.13、3.14
+运行 Ruff 与离屏 pytest；该矩阵验证源码兼容性，不生成四套发布包。推送 `v*` 版本标签后，
+[GitHub Actions](.github/workflows/release.yml) 仍统一使用 canonical CPython 3.12 自动构建并发布：
 
 - Windows x64：`ClipSoon-vX.Y.Z-windows-x64.zip`。
 - macOS Apple Silicon（M1 / M2 / M3 / M4）：`ClipSoon-vX.Y.Z-macOS-arm64.zip`。
@@ -276,11 +282,13 @@ build_windows.bat onefile
 发布前先将 `pyproject.toml` 和 `clipsoon/__init__.py` 中的版本保持一致，提交并推送到 `main`，然后执行：
 
 ```bash
-git tag -a v1.1.8 -m "ClipSoon 1.1.8"
-git push origin v1.1.8
+git tag -a v1.1.9 -m "ClipSoon 1.1.9"
+git push origin v1.1.9
 ```
 
-Release 会使用标签名生成说明并附加两个平台包。工作流使用 Windows x64 runner 和 macOS 15 ARM64 runner，并在发布前校验 Git 标签、运行时版本与项目版本一致。macOS 产物当前为 ad-hoc 签名，未使用 Developer ID 且未执行 Apple 公证。
+Release 会使用标签名生成说明并附加两个平台包。工作流使用 Windows x64 runner 和 macOS 15 ARM64 runner，
+两个平台都固定使用 CPython 3.12，并在发布前校验 Git 标签、运行时版本与项目版本一致。发布包自带
+Python 运行时，最终用户无需安装 Python。macOS 产物当前为 ad-hoc 签名，未使用 Developer ID 且未执行 Apple 公证。
 
 ## 项目结构
 

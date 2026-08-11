@@ -4,28 +4,36 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clipsoon"
-version = "1.1.8"
+version = "1.1.9"
 description = "A fast, private, Spotlight-style clipboard history for macOS and Windows"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.11,<3.15"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
 dependencies = [
   "platformdirs>=4.2,<5",
-  "pynput>=1.7.7,<2",
-  "PySide6-Essentials>=6.7,<7",
-  "pyobjc-framework-ApplicationServices>=10.3,<13; sys_platform == 'darwin'",
-  "pyobjc-framework-Cocoa>=10.3,<13; sys_platform == 'darwin'",
+  "pynput>=1.8.2,<2",
+  "PySide6-Essentials>=6.10.1,<7",
+  "pyobjc-framework-ApplicationServices>=11.1,<13; sys_platform == 'darwin'",
+  "pyobjc-framework-Cocoa>=11.1,<13; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "coverage[toml]>=7.6,<8",
-  "pytest>=8.3,<9",
-  "pytest-qt>=4.4,<5",
-  "pytest-timeout>=2.3,<3",
-  "ruff>=0.9,<1",
+  "coverage[toml]>=7.10,<8",
+  "pytest>=8.4.2,<9",
+  "pytest-qt>=4.5,<5",
+  "pytest-timeout>=2.4,<3",
+  "ruff>=0.15,<1",
 ]
 package = [
-  "pyinstaller>=6.11,<7",
+  "pyinstaller>=6.15,<7",
 ]
 
 [project.scripts]
@@ -59,7 +67,7 @@ skip_covered = true
 fail_under = 75
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]

@@ -13,6 +13,7 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Generic, TypeVar
 
 from PySide6.QtCore import (
     QAbstractListModel,
@@ -1407,9 +1408,11 @@ class ClipListView(QListView):
 
 
 ImageLoadKey = tuple[str, int, int, int, int, bool]
+CacheKey = TypeVar("CacheKey")
+CacheValue = TypeVar("CacheValue")
 
 
-class _ByteLruCache[CacheKey, CacheValue]:
+class _ByteLruCache(Generic[CacheKey, CacheValue]):
     """A small exact-cost LRU with both byte and entry limits."""
 
     def __init__(self, max_bytes: int, max_entries: int) -> None:
