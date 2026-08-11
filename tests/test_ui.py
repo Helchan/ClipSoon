@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import inspect
-import math
 import re
 import sys
 import time
@@ -68,11 +66,9 @@ from clipsoon.ui import (
     _DestructiveConfirmationDialog,
     _hotkey_display,
     _hover_color,
-    _paint_flowing_neon_border,
     _paint_frosted_material,
     _parse_hotkey,
     _platform_hotkey_validation_error,
-    _sample_rounded_perimeter,
     _ScaledImageLoader,
     _settings_control_border_token,
     _style_sheet,
@@ -580,7 +576,6 @@ def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> No
         dialog.hide_on_deactivate_checkbox,
         dialog.remember_selection,
         dialog.launch_at_login,
-        dialog.neon_border,
     ):
         assert checkbox.font().pointSizeF() == metrics.settings_control_font_size_pt
         assert checkbox.height() == metrics.settings_checkbox_row_height
@@ -608,7 +603,7 @@ def test_settings_behavior_checkboxes_have_stable_non_overlapping_rows(qtbot) ->
         assert dialog.hide_on_deactivate_checkbox.height() == metrics.settings_checkbox_row_height, theme
         assert dialog.remember_selection.height() == metrics.settings_checkbox_row_height, theme
         assert dialog.launch_at_login.height() == metrics.settings_checkbox_row_height, theme
-        assert dialog.neon_border.height() == metrics.settings_checkbox_row_height, theme
+        assert not hasattr(dialog, "neon_border")
         option = QStyleOptionButton()
         dialog.capture.initStyleOption(option)
         indicator = dialog.capture.style().subElementRect(
@@ -623,8 +618,6 @@ def test_settings_behavior_checkboxes_have_stable_non_overlapping_rows(qtbot) ->
         assert dialog.capture.geometry().bottom() < dialog.hide_on_deactivate_checkbox.geometry().top(), theme
         assert dialog.paste.geometry().bottom() < dialog.remember_selection.geometry().top(), theme
         assert dialog.hide_on_deactivate_checkbox.geometry().bottom() < dialog.launch_at_login.geometry().top(), theme
-        assert dialog.remember_selection.geometry().bottom() < dialog.neon_border.geometry().top(), theme
-        assert dialog.launch_at_login.geometry().right() < dialog.neon_border.geometry().left(), theme
         dialog.close()
 
 
@@ -775,7 +768,6 @@ def test_settings_changes_and_reset_are_emitted_immediately(qtbot) -> None:
             theme="light",
             max_history_items=750,
             capture_enabled=False,
-            neon_border_enabled=False,
         ),
         accessibility_granted=True,
     )
@@ -790,7 +782,7 @@ def test_settings_changes_and_reset_are_emitted_immediately(qtbot) -> None:
     assert changes[-1]["theme"] == "frosted"
     assert changes[-1]["max_history_items"] == 500
     assert changes[-1]["capture_enabled"] is True
-    assert changes[-1]["neon_border_enabled"] is True
+    assert "neon_border_enabled" not in changes[-1]
 
 
 def test_destructive_confirmation_uses_the_clipsoon_dialog(qtbot) -> None:
@@ -831,24 +823,12 @@ def test_launch_at_login_setting_round_trips_through_dialog(qtbot) -> None:
     assert dialog.values()["launch_at_login"] is False
 
 
-def test_neon_border_setting_emits_immediately_and_can_be_reconciled(qtbot) -> None:
-    dialog = SettingsDialog(
-        AppSettings(neon_border_enabled=True),
-        accessibility_granted=True,
-    )
+def test_settings_dialog_no_longer_exposes_neon_border_control(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(), accessibility_granted=True)
     qtbot.addWidget(dialog)
-    changes: list[dict[str, object]] = []
-    dialog.settings_changed.connect(changes.append)
 
-    assert dialog.neon_border.text() == "流动霓虹边框"
-    assert dialog.neon_border.isChecked()
-    dialog.neon_border.setChecked(False)
-    assert changes[-1]["neon_border_enabled"] is False
-
-    before = len(changes)
-    dialog.apply_settings(AppSettings(neon_border_enabled=True))
-    assert dialog.neon_border.isChecked()
-    assert len(changes) == before
+    assert not hasattr(dialog, "neon_border")
+    assert "neon_border_enabled" not in dialog.values()
 
 
 def test_dark_settings_combo_popups_use_readable_theme_colors(qtbot) -> None:
@@ -1152,151 +1132,24 @@ def test_frosted_material_has_environmental_depth_rim_and_subtle_pointer_sheen()
     assert sum(active_light.getRgb()[:3]) > sum(resting_light.getRgb()[:3]) + 4
 
 
-def _render_neon_border(*, phase: float, appearance: _ThemeAppearance) -> QImage:
-    image = QImage(320, 220, QImage.Format.Format_ARGB32_Premultiplied)
-    image.fill(QColor("#202631") if appearance.dark else QColor("#EEF2F7"))
-    painter = QPainter(image)
-    _paint_flowing_neon_border(
-        painter,
-        QRectF(20, 20, 280, 180),
-        appearance,
-        phase,
-    )
-    painter.end()
-    return image
-
-
 @pytest.mark.parametrize(
-    "appearance",
-    (
-        _ThemeAppearance(dark=False),
-        _ThemeAppearance(dark=True),
-        _ThemeAppearance(dark=False, frosted=True),
-    ),
-    ids=("light", "dark", "frosted"),
+    "theme",
+    ("light", "dark", "frosted"),
 )
-def test_neon_border_moves_only_along_the_rounded_perimeter(appearance) -> None:
-    first = _render_neon_border(phase=0.08, appearance=appearance)
-    second = _render_neon_border(phase=0.58, appearance=appearance)
-    changed_edge_pixels = 0
-    for y in range(first.height()):
-        for x in range(first.width()):
-            if first.pixelColor(x, y) == second.pixelColor(x, y):
-                continue
-            assert x < 34 or x > 286 or y < 34 or y > 185
-            changed_edge_pixels += 1
-
-    assert changed_edge_pixels > 180
-    assert first.pixelColor(160, 110) == second.pixelColor(160, 110)
-    assert first.pixelColor(20, 20) == second.pixelColor(20, 20)
-
-
-def test_neon_border_uses_qt_67_compatible_equal_distance_sampling() -> None:
-    points = _sample_rounded_perimeter(QRectF(0, 0, 640, 420))
-    source = (
-        inspect.getsource(ui_module._sample_rounded_perimeter_geometry)
-        + inspect.getsource(ui_module._neon_trail_points)
-        + inspect.getsource(_paint_flowing_neon_border)
-    )
-
-    assert len(points) == ui_module._NEON_SAMPLE_COUNT
-    assert ".trimmed(" not in source
-    assert points[0] != points[-1]
-
-
-def _open_polyline_length(points: tuple[QPointF, ...]) -> float:
-    return sum(
-        math.hypot(end.x() - start.x(), end.y() - start.y()) for start, end in zip(points, points[1:], strict=False)
-    )
-
-
-@pytest.mark.parametrize(
-    "size",
-    ((700.0, 300.0), (500.0, 500.0), (300.0, 700.0)),
-    ids=("wide", "square", "tall"),
-)
-def test_neon_trail_length_follows_two_widths_plus_one_height(size) -> None:
-    width, height = size
-    geometry = ui_module._sample_rounded_perimeter_geometry(QRectF(0, 0, width, height))
-    trail = ui_module._neon_trail_points(geometry, 0.37)
-    sample_distance = geometry.path_length / ui_module._NEON_SAMPLE_COUNT
-
-    assert geometry.target_trail_length == pytest.approx(
-        min(geometry.path_length, 2.0 * geometry.width + geometry.height)
-    )
-    assert _open_polyline_length(trail) == pytest.approx(
-        geometry.target_trail_length,
-        abs=sample_distance * 1.5,
-    )
-
-
-def test_neon_trail_length_is_phase_invariant_across_the_closed_path() -> None:
-    geometry = ui_module._sample_rounded_perimeter_geometry(QRectF(0, 0, 700, 300))
-    sample_distance = geometry.path_length / ui_module._NEON_SAMPLE_COUNT
-
-    lengths = tuple(
-        _open_polyline_length(ui_module._neon_trail_points(geometry, phase))
-        for phase in (-1e-12, 0.0, 0.37, 1.0 - 1e-12, 4.25)
-    )
-
-    assert max(lengths) - min(lengths) < sample_distance
-    for length in lengths:
-        assert length == pytest.approx(geometry.target_trail_length, abs=sample_distance * 1.5)
-
-
-def test_neon_border_resize_recomputes_the_three_side_target(qtbot) -> None:
-    host = QWidget()
-    qtbot.addWidget(host)
-    border = ui_module._FlowingNeonBorder(host)
-    host.resize(720, 520)
-    host.show()
-    border.set_enabled(True)
-    qtbot.waitExposed(host)
-
-    border.resize(700, 300)
-    QCoreApplication.processEvents()
-    wide = border._perimeter_geometry
-    border.resize(500, 500)
-    QCoreApplication.processEvents()
-    square = border._perimeter_geometry
-
-    assert wide.path_length == pytest.approx(square.path_length, abs=0.05)
-    assert wide.target_trail_length > square.target_trail_length
-    assert wide.target_trail_length == pytest.approx(2.0 * wide.width + wide.height)
-    assert square.target_trail_length == pytest.approx(2.0 * square.width + square.height)
-
-
-def test_neon_animation_runs_only_while_visible_enabled_and_unblocked(qtbot) -> None:
-    current = {"settings": AppSettings(theme="frosted", neon_border_enabled=True)}
-    panel = ClipPanel(lambda: current["settings"])
+def test_main_panel_uses_static_thin_border_without_shadow_or_neon(qtbot, theme: str) -> None:
+    panel = ClipPanel(lambda: AppSettings(theme=theme))
     qtbot.addWidget(panel)
-
-    assert panel.neon_border._enabled
-    assert not panel.neon_border._timer.isActive()
-
     panel.show_panel()
     qtbot.waitExposed(panel)
-    qtbot.waitUntil(panel.neon_border._timer.isActive)
-    starting_phase = panel.neon_border._phase
-    qtbot.waitUntil(lambda: panel.neon_border._phase != starting_phase)
+    margins = panel._outer_layout.contentsMargins()
 
-    panel.set_settings_interaction_blocked(True)
-    assert panel.neon_border._suspended
-    assert not panel.neon_border._timer.isActive()
-
-    panel.set_settings_interaction_blocked(False)
-    qtbot.waitUntil(panel.neon_border._timer.isActive)
-
-    current["settings"] = AppSettings(theme="frosted", neon_border_enabled=False)
-    panel.apply_theme()
-    assert not panel.neon_border._enabled
-    assert not panel.neon_border._timer.isActive()
-
-    current["settings"] = AppSettings(theme="frosted", neon_border_enabled=True)
-    panel.apply_theme()
-    qtbot.waitUntil(panel.neon_border._timer.isActive)
-    panel.hide_panel()
-    qtbot.waitUntil(lambda: not panel.neon_border._timer.isActive())
+    assert panel.card.graphicsEffect() is None
+    assert not hasattr(panel, "neon_border")
+    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (1, 1, 1, 1)
+    assert re.search(
+        r"#card \{ background: [^;]+; border: 1px solid [^;]+; border-radius: 18px; \}",
+        panel.styleSheet(),
+    )
 
 
 def test_frosted_surface_recovers_when_qt_tears_down_its_hover_animation(qtbot) -> None:
@@ -1559,22 +1412,20 @@ def test_frosted_panel_uses_one_custom_painted_primary_shell(qtbot) -> None:
     panel = ClipPanel(lambda: current["settings"])
     qtbot.addWidget(panel)
 
-    expected_inset = 1 if sys.platform == "win32" else 14
     light_margins = panel.layout().contentsMargins()
-    assert light_margins.left() == expected_inset
-    assert light_margins.top() == expected_inset
+    assert light_margins.left() == 1
+    assert light_margins.top() == 1
 
     current["settings"] = AppSettings(theme="frosted")
     panel.apply_theme()
 
     assert panel.card.__class__.__name__ == "_FrostedSurface"
     frosted_margins = panel.layout().contentsMargins()
-    assert frosted_margins.left() == expected_inset
-    assert frosted_margins.top() == expected_inset
-    assert "#card { background: transparent; border: none;" in panel.styleSheet()
+    assert frosted_margins.left() == 1
+    assert frosted_margins.top() == 1
+    assert "#card { background: transparent; border: 1px solid rgba(58, 87, 134, 72);" in panel.styleSheet()
     assert "#detail { background: transparent; border: none;" in panel.styleSheet()
-    if panel.card.graphicsEffect() is not None:
-        assert not panel.card.graphicsEffect().isEnabled()
+    assert panel.card.graphicsEffect() is None
 
 
 @pytest.mark.skipif(
@@ -1785,9 +1636,9 @@ def test_windows_frosted_keeps_qt_non_layered_with_app_owned_material(
     assert panel.card.graphicsEffect() is None
     assert not panel.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     assert panel.autoFillBackground()
-    assert panel.neon_border._enabled
+    assert not hasattr(panel, "neon_border")
     assert "#panelWindow { background: transparent; }" not in panel.styleSheet()
-    assert "#card { background: transparent; border: none;" in panel.styleSheet()
+    assert "#card { background: transparent; border: 1px solid rgba(58, 87, 134, 72);" in panel.styleSheet()
     assert "rgba(232, 244, 255, 54)" in panel.styleSheet()
 
 
@@ -2648,8 +2499,7 @@ def test_clicking_detail_image_preview_opens_plain_image_viewer(qtbot, tmp_path:
     dialog = panel._image_viewer_dialog
     assert isinstance(dialog, ImageViewerDialog)
     assert panel._keep_open
-    assert panel.neon_border._suspended
-    assert not panel.neon_border._timer.isActive()
+    assert not hasattr(panel, "neon_border")
     assert not dialog.findChildren(QPushButton)
     assert not dialog.findChildren(QLabel)
     qtbot.waitUntil(lambda: not dialog.canvas.image.isNull(), timeout=1_000)
@@ -2661,7 +2511,6 @@ def test_clicking_detail_image_preview_opens_plain_image_viewer(qtbot, tmp_path:
     qtbot.waitUntil(lambda: panel._image_viewer_dialog is None, timeout=1_000)
     qtbot.waitUntil(panel.isVisible, timeout=1_000)
     assert not panel._keep_open
-    qtbot.waitUntil(panel.neon_border._timer.isActive, timeout=1_000)
 
 
 def test_windows_image_viewer_is_owned_by_panel_without_global_topmost(

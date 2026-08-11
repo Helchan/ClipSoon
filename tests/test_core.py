@@ -89,7 +89,6 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
         launch_at_login=True,
         panel_x=-320,
         panel_y=240,
-        neon_border_enabled=False,
         plain_text_compat_enabled=True,
         plain_text_target_apps=(
             r"C:\Program Files\Secure Client\client.exe",
@@ -103,7 +102,7 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
     assert value.remember_selection
     assert value.selection_memory_seconds == 300
     assert value.launch_at_login
-    assert not value.neon_border_enabled
+    assert not hasattr(value, "neon_border_enabled")
     assert value.plain_text_compat_enabled
     assert value.plain_text_target_apps == (
         r"C:\Program Files\Secure Client\client.exe",
@@ -117,15 +116,19 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
     assert settings.value.hotkey == "double:ctrl"
 
 
-def test_neon_border_setting_defaults_enabled_and_survives_legacy_json(tmp_path: Path) -> None:
+def test_removed_neon_border_setting_is_ignored_from_legacy_json_and_updates(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
-    path.write_text('{"theme": "dark"}\n', encoding="utf-8")
+    path.write_text('{"theme": "dark", "neon_border_enabled": false}\n', encoding="utf-8")
 
     loaded = JsonSettingsStore(path).load()
+    settings = ObservableSettings(JsonSettingsStore(tmp_path / "updated.json"))
+    updated = settings.update(neon_border_enabled=False, theme="light")
 
-    assert AppSettings().neon_border_enabled
-    assert loaded.neon_border_enabled
-    assert not AppSettings(neon_border_enabled=0).validated().neon_border_enabled
+    assert loaded.theme == "dark"
+    assert not hasattr(loaded, "neon_border_enabled")
+    assert updated.theme == "light"
+    assert not hasattr(updated, "neon_border_enabled")
+    assert "neon_border_enabled" not in (tmp_path / "updated.json").read_text(encoding="utf-8")
 
 
 def test_plain_text_compatibility_defaults_off_and_rejects_invalid_targets(tmp_path: Path) -> None:

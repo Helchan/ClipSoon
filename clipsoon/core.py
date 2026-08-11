@@ -212,7 +212,6 @@ class AppSettings:
     panel_x: int | None = None
     panel_y: int | None = None
     theme: str = "frosted"
-    neon_border_enabled: bool = True
     plain_text_compat_enabled: bool = False
     plain_text_target_apps: tuple[str, ...] = ()
 
@@ -232,7 +231,6 @@ class AppSettings:
             panel_x=_optional_coordinate(self.panel_x),
             panel_y=_optional_coordinate(self.panel_y),
             theme=self.theme if self.theme in {"light", "dark", "frosted"} else "frosted",
-            neon_border_enabled=bool(self.neon_border_enabled),
             plain_text_compat_enabled=bool(self.plain_text_compat_enabled),
             plain_text_target_apps=normalize_windows_app_paths(self.plain_text_target_apps),
         )
@@ -277,8 +275,9 @@ class ObservableSettings:
         return lambda: self._listeners.remove(listener) if listener in self._listeners else None
 
     def update(self, **changes: Any) -> AppSettings:
+        allowed = {field.name for field in fields(AppSettings)}
         values = asdict(self._value)
-        values.update(changes)
+        values.update({key: value for key, value in changes.items() if key in allowed})
         updated = AppSettings(**values).validated()
         self._store.save(updated)
         self._value = updated
