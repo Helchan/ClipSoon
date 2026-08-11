@@ -387,7 +387,11 @@ def test_windows_settings_only_offer_registered_combo_and_hide_double_interval(
     assert "呼出方式" not in [label.text() for label in field_labels]
     assert "自定义组合键" not in [label.text() for label in field_labels]
     assert [label.text() for label in field_labels].count("快捷键") == 1
-    assert dialog.findChildren(QComboBox) == [dialog.theme]
+    assert set(dialog.findChildren(QComboBox)) == {
+        dialog.theme,
+        dialog.running_apps_combo,
+        dialog.target_apps_combo,
+    }
     dialog.custom_hotkey.setKeySequence(QKeySequence("Ctrl+Alt+K"))
     assert dialog.values()["hotkey"] == "combo:ctrl+alt+k"
     warnings: list[tuple[str, object]] = []
@@ -410,6 +414,77 @@ def test_windows_settings_only_offer_registered_combo_and_hide_double_interval(
     ]
     assert len(interval_labels) == 1
     assert interval_labels[0].isHidden()
+
+
+def test_windows_plain_text_compatibility_targets_are_generic_and_immediate(
+    qtbot,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    secure_path = r"C:\Apps\SecureClient.exe"
+    editor_path = r"C:\Tools\Editor.exe"
+    dialog = SettingsDialog(
+        AppSettings(
+            plain_text_compat_enabled=True,
+            plain_text_target_apps=(secure_path,),
+        ),
+        accessibility_granted=True,
+        running_app_provider=lambda: (
+            ("Secure Client", secure_path),
+            ("文本编辑器", editor_path),
+        ),
+    )
+    qtbot.addWidget(dialog)
+    changes: list[dict[str, object]] = []
+    dialog.settings_changed.connect(changes.append)
+
+    section_titles = [
+        label.text() for label in dialog.findChildren(QLabel, "settingsSectionTitle")
+    ]
+    assert "剪贴板兼容" in section_titles
+    assert any(
+        label.text() == "切换到指定应用时，将当前文本剪贴板转换为纯文本；不会自动粘贴。"
+        for label in dialog.findChildren(QLabel)
+    )
+    assert dialog.plain_text_compat is not None
+    assert dialog.plain_text_compat.isChecked()
+    assert dialog.target_apps_combo is not None
+    assert dialog.running_apps_combo is not None
+    assert dialog.target_apps_combo.count() == 1
+    assert dialog.target_apps_combo.currentData() == secure_path
+    assert dialog.running_apps_combo.count() == 1
+    assert dialog.running_apps_combo.currentData() == editor_path
+
+    assert dialog.add_target_app_button is not None
+    dialog.add_target_app_button.click()
+    assert changes[-1]["plain_text_target_apps"] == (secure_path, editor_path)
+    assert dialog.target_apps_combo.count() == 2
+
+    dialog.target_apps_combo.setCurrentIndex(0)
+    assert dialog.remove_target_app_button is not None
+    dialog.remove_target_app_button.click()
+    assert changes[-1]["plain_text_target_apps"] == (editor_path,)
+
+    dialog.reset_button.click()
+    assert changes[-1]["plain_text_compat_enabled"] is False
+    assert changes[-1]["plain_text_target_apps"] == ()
+
+
+def test_non_windows_settings_preserve_windows_compatibility_values(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "linux")
+    target = r"C:\Apps\Remote.exe"
+    dialog = SettingsDialog(
+        AppSettings(
+            plain_text_compat_enabled=True,
+            plain_text_target_apps=(target,),
+        ),
+        accessibility_granted=True,
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.plain_text_compat is None
+    assert dialog.values()["plain_text_compat_enabled"] is True
+    assert dialog.values()["plain_text_target_apps"] == (target,)
 
 
 def test_non_windows_settings_retain_double_modifier_modes(qtbot, monkeypatch) -> None:

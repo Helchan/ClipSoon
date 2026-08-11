@@ -398,6 +398,34 @@ class WindowsClipboardReader:
             return self._materialize_image(sequence, result)
         return result
 
+    def read_text(self, sequence: int) -> tuple[str, str, int]:
+        """Read only a text fallback for an explicit compatibility conversion."""
+
+        if not self.api.open_clipboard(self.owner):
+            raise ClipboardBusyError("OpenClipboard failed")
+        try:
+            locked_sequence = self.api.sequence_number()
+            if locked_sequence != sequence:
+                raise ClipboardBusyError(
+                    f"clipboard sequence changed before text conversion: {sequence} -> {locked_sequence}"
+                )
+            formats = self.api.enum_formats()
+            names = [self.api.format_name(format_id) for format_id in formats]
+            if self.is_internal_write():
+                return "", "internal", self.api.sequence_number()
+            if self._is_private(formats, names):
+                return "", "private", self.api.sequence_number()
+            text = self._read_text(formats, names)
+            stable_sequence = self.api.sequence_number()
+            return (
+                (text, "", stable_sequence)
+                if text
+                else ("", "unsupported", stable_sequence)
+            )
+        finally:
+            if not self.api.close_clipboard():
+                raise ClipboardDataError("CloseClipboard failed")
+
     def _read_locked(self, sequence: int) -> ClipboardSnapshot | _ImageClipboardData:
         locked_sequence = self.api.sequence_number()
         if locked_sequence != sequence:
@@ -951,6 +979,7 @@ class WindowsClipboardBroker:
         payload_store: ImagePayloadStore,
         emit: Callable[[Mapping[str, Any]], None],
         *,
+        reader: WindowsClipboardReader | None = None,
         ignore_sequence: Callable[[int], None] = lambda _sequence: None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -960,6 +989,7 @@ class WindowsClipboardBroker:
         self.emit = emit
         self.ignore_sequence = ignore_sequence
         self.sleep = sleep
+        self.reader = reader or WindowsClipboardReader(api, owner, payload_store)
         self.png_format = api.register_format("PNG")
         self.preferred_drop_effect_format = api.register_format("Preferred DropEffect")
         self.internal_write_format = api.register_format("ClipSoon.InternalWrite")
@@ -971,6 +1001,9 @@ class WindowsClipboardBroker:
         try:
             if command_type == "write_clipboard":
                 self._write(command)
+                return
+            if command_type == "normalize_clipboard_text":
+                self._normalize_text(command)
                 return
             if command_type == "verify_clipboard":
                 self._verify(command)
@@ -1032,7 +1065,99 @@ class WindowsClipboardBroker:
                 str(exc),
             )
             return
+        self._commit_write(value)
 
+    def _normalize_text(self, command: Mapping[str, Any]) -> None:
+        request_id = self._request_id(command)
+        expected_sequence = command.get("sequence")
+        if (
+            request_id is None
+            or isinstance(expected_sequence, bool)
+            or not isinstance(expected_sequence, int)
+            or expected_sequence <= 0
+        ):
+            self._emit_result(
+                "write_result",
+                request_id or "",
+                "text",
+                False,
+                self.api.sequence_number(),
+                "invalid_request",
+                "normalize_clipboard_text requires a valid request_id and positive sequence",
+            )
+            return
+        self.emit(
+            {
+                "type": "write_started",
+                "request_id": request_id,
+                "kind": "text",
+                "time_ns": time.time_ns(),
+            }
+        )
+        try:
+            text, reason, stable_sequence = self.reader.read_text(expected_sequence)
+        except ClipboardBusyError as exc:
+            self._emit_result(
+                "write_result",
+                request_id,
+                "text",
+                False,
+                self.api.sequence_number(),
+                "clipboard_busy",
+                str(exc),
+            )
+            return
+        except Exception as exc:
+            self._emit_result(
+                "write_result",
+                request_id,
+                "text",
+                False,
+                self.api.sequence_number(),
+                "clipboard_read_failed",
+                str(exc),
+            )
+            return
+        if reason == "internal":
+            self._emit_result(
+                "write_result",
+                request_id,
+                "text",
+                True,
+                self.api.sequence_number(),
+                "already_normalized",
+            )
+            return
+        if not text:
+            self._emit_result(
+                "write_result",
+                request_id,
+                "text",
+                False,
+                self.api.sequence_number(),
+                reason or "unsupported",
+                "private or non-text clipboard content was not converted",
+            )
+            return
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        marker = request_id.encode("ascii") + b"\0"
+        value = _ClipboardWrite(
+            request_id,
+            "text",
+            (
+                (CF_UNICODETEXT, normalized.encode("utf-16-le") + b"\0\0"),
+                (self.internal_write_format, marker),
+            ),
+        )
+        self._commit_write(value, expected_sequence=stable_sequence)
+
+    def _commit_write(
+        self,
+        value: _ClipboardWrite,
+        *,
+        expected_sequence: int | None = None,
+    ) -> None:
+        request_id, kind = value.request_id, value.kind
         matching_sequence = self._matching_current_sequence(value, require_owner=True)
         if matching_sequence is not None:
             self.ignore_sequence(matching_sequence)
@@ -1040,6 +1165,17 @@ class WindowsClipboardBroker:
             return
 
         before_sequence = self.api.sequence_number()
+        if expected_sequence is not None and before_sequence != expected_sequence:
+            self._emit_result(
+                "write_result",
+                request_id,
+                kind,
+                False,
+                before_sequence,
+                "source_changed",
+                "clipboard changed before plain-text conversion",
+            )
+            return
         handles: list[int] = []
         try:
             for _format_id, data in value.formats:
@@ -1074,9 +1210,12 @@ class WindowsClipboardBroker:
             return
 
         wrote_all = False
+        source_changed = False
         write_error = ""
         try:
-            if not self.api.empty_clipboard():
+            if expected_sequence is not None and self.api.sequence_number() != expected_sequence:
+                source_changed = True
+            elif not self.api.empty_clipboard():
                 write_error = "EmptyClipboard failed"
             else:
                 wrote_all = True
@@ -1116,6 +1255,17 @@ class WindowsClipboardBroker:
                 self.api.sequence_number(),
                 "close_failed",
                 "CloseClipboard failed",
+            )
+            return
+        if source_changed:
+            self._emit_result(
+                "write_result",
+                request_id,
+                kind,
+                False,
+                self.api.sequence_number(),
+                "source_changed",
+                "clipboard changed before plain-text conversion",
             )
             return
         if not wrote_all:
@@ -1863,6 +2013,7 @@ class WindowsMessageLoop:
                 self.hwnd,
                 self.payload_store,
                 self.emitter.emit,
+                reader=reader,
                 ignore_sequence=self.host.ignore_sequence,
             )
             self._start_heartbeat()

@@ -90,6 +90,12 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
         panel_x=-320,
         panel_y=240,
         neon_border_enabled=False,
+        plain_text_compat_enabled=True,
+        plain_text_target_apps=(
+            r"C:\Program Files\Secure Client\client.exe",
+            r"c:/program files/secure client/CLIENT.EXE",
+            "not-an-executable",
+        ),
     )
     assert value.hotkey == "double:shift"
     assert value.max_history_items == 50
@@ -98,6 +104,10 @@ def test_settings_round_trip_validation_and_observation(tmp_path: Path) -> None:
     assert value.selection_memory_seconds == 300
     assert value.launch_at_login
     assert not value.neon_border_enabled
+    assert value.plain_text_compat_enabled
+    assert value.plain_text_target_apps == (
+        r"C:\Program Files\Secure Client\client.exe",
+    )
     assert (value.panel_x, value.panel_y) == (-320, 240)
     assert store.load() == value
     assert observed == [value]
@@ -116,6 +126,22 @@ def test_neon_border_setting_defaults_enabled_and_survives_legacy_json(tmp_path:
     assert AppSettings().neon_border_enabled
     assert loaded.neon_border_enabled
     assert not AppSettings(neon_border_enabled=0).validated().neon_border_enabled
+
+
+def test_plain_text_compatibility_defaults_off_and_rejects_invalid_targets(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        '{"plain_text_compat_enabled": true, "plain_text_target_apps": '
+        '["C:/Tools/Remote.exe", "c:\\\\tools\\\\REMOTE.EXE", "relative.exe", 9]}\n',
+        encoding="utf-8",
+    )
+
+    loaded = JsonSettingsStore(path).load()
+
+    assert not AppSettings().plain_text_compat_enabled
+    assert AppSettings().plain_text_target_apps == ()
+    assert loaded.plain_text_compat_enabled
+    assert loaded.plain_text_target_apps == (r"C:\Tools\Remote.exe",)
 
 
 def test_frosted_material_theme_is_the_default_and_legacy_themes_migrate(

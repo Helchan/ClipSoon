@@ -58,6 +58,47 @@ def _add_three_ordered_texts(application: ClipSoonApplication):
     return newest, middle, oldest
 
 
+def test_plain_text_compatibility_runs_once_per_target_entry(qtbot, tmp_path, monkeypatch) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    target_path = r"C:\Apps\RemoteClient.exe"
+    foreground = [42]
+    paths = {
+        42: target_path,
+        99: r"C:\Tools\Editor.exe",
+    }
+    monkeypatch.setattr(
+        PlatformBridge,
+        "window_executable_path",
+        staticmethod(lambda identifier: paths.get(identifier, "")),
+    )
+    monkeypatch.setattr(
+        PlatformBridge,
+        "foreground_window_id",
+        staticmethod(lambda: foreground[0]),
+    )
+    requests: list[str] = []
+    application.clipboard.request_plain_text_compatibility = (  # type: ignore[method-assign]
+        lambda callback: (requests.append("normalize"), callback(True, ""))
+    )
+    application.settings.update(
+        plain_text_compat_enabled=True,
+        plain_text_target_apps=(target_path,),
+    )
+
+    application._plain_text_foreground_changed(42)
+    application._plain_text_foreground_changed(42)
+    qtbot.waitUntil(lambda: requests == ["normalize"], timeout=1_000)
+
+    foreground[0] = 99
+    application._plain_text_foreground_changed(99)
+    foreground[0] = 42
+    application._plain_text_foreground_changed(42)
+    qtbot.waitUntil(lambda: requests == ["normalize", "normalize"], timeout=1_000)
+
+    application.shutdown()
+
+
 def test_application_routes_the_complete_panel_selection_to_sender(qtbot, tmp_path) -> None:
     application = ClipSoonApplication(QApplication.instance(), tmp_path)
     qtbot.addWidget(application.panel)

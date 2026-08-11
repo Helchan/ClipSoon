@@ -35,6 +35,7 @@ from clipsoon.system import (
     PlatformBridge,
     PynputPasteAdapter,
     SelectionSender,
+    WindowsForegroundMonitor,
     _bitmap_v5_payload,
     _canonical_key,
     _NativeClipboardStoreTask,
@@ -1510,6 +1511,151 @@ def test_windows_services_use_supervised_native_workers(monkeypatch, tmp_path: P
     assert clipboard_worker.stopped == 1
     assert hotkey_worker.stopped == 1
     assert custom_hotkey_worker.stopped == 1
+    repository.close()
+
+
+def test_windows_foreground_monitor_uses_event_hook_and_unhooks() -> None:
+    callbacks: list[object] = []
+    unhooked: list[int] = []
+
+    def set_hook(*arguments) -> int:
+        callbacks.append(arguments[3])
+        return 91
+
+    def unhook(handle) -> bool:
+        unhooked.append(int(handle.value))
+        return True
+
+    user32 = types.SimpleNamespace(
+        SetWinEventHook=FakeNativeCall(set_hook),
+        UnhookWinEvent=FakeNativeCall(unhook),
+    )
+    monitor = WindowsForegroundMonitor(user32)
+    changes: list[int] = []
+    monitor.foreground_changed.connect(changes.append)
+
+    assert monitor.start()
+    assert monitor.is_running
+    callback = callbacks[0]
+    callback(None, 3, ctypes.c_void_p(404), 0, 0, 0, 0)  # type: ignore[operator]
+    callback(None, 2, ctypes.c_void_p(405), 0, 0, 0, 0)  # type: ignore[operator]
+    assert changes == [404]
+
+    monitor.stop()
+    assert not monitor.is_running
+    assert unhooked == [91]
+
+
+def test_windows_process_executable_uses_full_process_path_and_closes_handle() -> None:
+    closed: list[int] = []
+
+    def window_identity(_hwnd, process_pointer) -> int:
+        ctypes.cast(
+            process_pointer,
+            ctypes.POINTER(system_module._WIN_DWORD),
+        ).contents.value = 1234
+        return 77
+
+    def query_path(handle, _flags, buffer, capacity_pointer) -> bool:
+        assert handle == 0x123456789
+        buffer.value = r"C:\Program Files\Remote Client\client.exe"
+        ctypes.cast(
+            capacity_pointer,
+            ctypes.POINTER(system_module._WIN_DWORD),
+        ).contents.value = len(buffer.value)
+        return True
+
+    user32 = types.SimpleNamespace(
+        GetWindowThreadProcessId=FakeNativeCall(window_identity),
+    )
+    kernel32 = types.SimpleNamespace(
+        OpenProcess=FakeNativeCall(
+            lambda access, inherit, process_id: (
+                0x123456789
+                if access == 0x1000 and inherit is False and process_id == 1234
+                else 0
+            )
+        ),
+        QueryFullProcessImageNameW=FakeNativeCall(query_path),
+        CloseHandle=FakeNativeCall(lambda handle: closed.append(handle) or True),
+    )
+
+    path = system_module._windows_process_executable(
+        404,
+        user32=user32,
+        kernel32=kernel32,
+    )
+
+    assert path == r"C:\Program Files\Remote Client\client.exe"
+    assert closed == [0x123456789]
+
+
+def test_windows_plain_text_compatibility_request_uses_current_sequence(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    monkeypatch.setattr(ClipboardController, "_sequence_number", lambda _self: 77)
+    clipboard = FakeClipboard()
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(clipboard, repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    results: list[tuple[bool, str]] = []
+
+    controller.request_plain_text_compatibility(
+        lambda ok, error: results.append((ok, error))
+    )
+
+    assert len(worker.sent) == 1
+    command = worker.sent[0]
+    assert command["type"] == "normalize_clipboard_text"
+    assert command["sequence"] == 77
+    assert set(command) == {"type", "request_id", "sequence"}
+    assert clipboard.write_history == []
+
+    worker.message.emit(
+        {
+            "type": "write_result",
+            "request_id": command["request_id"],
+            "kind": "text",
+            "ok": True,
+            "sequence": 78,
+            "code": "",
+            "error": "",
+        }
+    )
+
+    assert results == [(True, "")]
+    controller.stop()
+    repository.close()
+
+
+def test_windows_plain_text_compatibility_waits_for_capture_without_preemption(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    FakeWorkerSupervisor.instances.clear()
+    monkeypatch.setattr(system_module.sys, "platform", "win32")
+    monkeypatch.setattr(system_module, "WindowsWorkerSupervisor", FakeWorkerSupervisor)
+    monkeypatch.setattr(ClipboardController, "_sequence_number", lambda _self: 88)
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(FakeClipboard(), repository, AppSettings, lambda: "Source")
+    controller.start()
+    worker = FakeWorkerSupervisor.instances[-1]
+    worker.is_capture_pipeline_busy = True
+
+    controller.request_plain_text_compatibility(lambda _ok, _error: None)
+
+    assert worker.sent == []
+    assert worker.restarted == 0
+    worker.is_capture_pipeline_busy = False
+    controller._resume_waiting_windows_normalizations()
+    assert worker.sent[0]["type"] == "normalize_clipboard_text"
+    assert worker.sent[0]["sequence"] == 88
+    controller.stop()
     repository.close()
 
 

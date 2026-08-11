@@ -5,6 +5,7 @@ from __future__ import annotations
 import locale
 import logging
 import math
+import ntpath
 import sys
 import time
 from collections import OrderedDict
@@ -2674,6 +2675,7 @@ class SettingsDialog(QDialog):
         parent: QWidget | None = None,
         *,
         accessibility_granted: bool | None = None,
+        running_app_provider: Callable[[], Sequence[tuple[str, str]]] | None = None,
     ) -> None:
         _install_app_owned_caret_style()
         super().__init__(parent)
@@ -2683,6 +2685,8 @@ class SettingsDialog(QDialog):
         # modal validation prompt while this dialog is closing.
         self._closing = False
         self._theme_settings = settings
+        self._running_app_provider = running_app_provider or (lambda: ())
+        self._plain_text_target_apps = tuple(settings.plain_text_target_apps)
         self._external_dismiss_filter_installed = False
         self._external_dismiss_armed = False
         self._external_dismiss_timer = QTimer(self)
@@ -2892,7 +2896,60 @@ class SettingsDialog(QDialog):
         behavior_options.addWidget(self.neon_border, 2, 1)
         history_layout.addLayout(behavior_options)
         layout.addWidget(history_section)
-        self._settings_checkboxes = behavior_checkboxes
+        self.plain_text_compat: _SettingsCheckBox | None = None
+        self.running_apps_combo: QComboBox | None = None
+        self.target_apps_combo: QComboBox | None = None
+        self.add_target_app_button: QPushButton | None = None
+        self.refresh_running_apps_button: QPushButton | None = None
+        self.remove_target_app_button: QPushButton | None = None
+        self._plain_text_compat_enabled = bool(settings.plain_text_compat_enabled)
+        settings_checkboxes = list(behavior_checkboxes)
+        if sys.platform == "win32":
+            compatibility_section, compatibility_layout = section("剪贴板兼容")
+            self.plain_text_compat = _SettingsCheckBox("目标应用纯文本兼容")
+            self.plain_text_compat.setChecked(settings.plain_text_compat_enabled)
+            self.plain_text_compat.setFixedHeight(checkbox_row_height)
+            compatibility_layout.addWidget(self.plain_text_compat)
+            compatibility_description = QLabel(
+                "切换到指定应用时，将当前文本剪贴板转换为纯文本；不会自动粘贴。"
+            )
+            compatibility_description.setObjectName("settingsSubtitle")
+            compatibility_description.setWordWrap(True)
+            compatibility_layout.addWidget(compatibility_description)
+
+            compatibility_form = form_grid()
+            self.running_apps_combo = QComboBox()
+            self.add_target_app_button = QPushButton("添加")
+            self.refresh_running_apps_button = QPushButton("刷新")
+            running_row = QWidget()
+            running_layout = QHBoxLayout(running_row)
+            running_layout.setContentsMargins(0, 0, 0, 0)
+            running_layout.setSpacing(6)
+            running_layout.addWidget(self.running_apps_combo, 1)
+            running_layout.addWidget(self.refresh_running_apps_button)
+            running_layout.addWidget(self.add_target_app_button)
+            add_row(compatibility_form, 0, "运行中的应用", running_row)
+
+            self.target_apps_combo = QComboBox()
+            self.remove_target_app_button = QPushButton("移除")
+            target_row = QWidget()
+            target_layout = QHBoxLayout(target_row)
+            target_layout.setContentsMargins(0, 0, 0, 0)
+            target_layout.setSpacing(6)
+            target_layout.addWidget(self.target_apps_combo, 1)
+            target_layout.addWidget(self.remove_target_app_button)
+            add_row(compatibility_form, 1, "目标应用", target_row)
+            compatibility_layout.addLayout(compatibility_form)
+            layout.addWidget(compatibility_section)
+
+            self.add_target_app_button.clicked.connect(self._add_selected_target_app)
+            self.refresh_running_apps_button.clicked.connect(self._refresh_running_apps)
+            self.remove_target_app_button.clicked.connect(self._remove_selected_target_app)
+            self.plain_text_compat.toggled.connect(self._emit_settings_changed)
+            settings_checkboxes.append(self.plain_text_compat)
+            self._sync_target_app_controls()
+            self._refresh_running_apps()
+        self._settings_checkboxes = tuple(settings_checkboxes)
 
         self.accessibility_button = None
         platform_message = ""
@@ -2983,6 +3040,88 @@ class SettingsDialog(QDialog):
         # normal tab order and by pointer.
         self._initial_focus_control: QWidget = self
 
+    @staticmethod
+    def _target_app_label(path: str, title: str = "") -> str:
+        executable = ntpath.basename(path) or path
+        concise_title = " ".join(title.split())
+        if concise_title and concise_title.casefold() != executable.casefold():
+            return f"{concise_title[:64]} — {executable}"
+        return executable
+
+    def _refresh_running_apps(self) -> None:
+        if self.running_apps_combo is None or self.add_target_app_button is None:
+            return
+        selected_path = self.running_apps_combo.currentData()
+        configured = {ntpath.normcase(path) for path in self._plain_text_target_apps}
+        self.running_apps_combo.clear()
+        try:
+            candidates = tuple(self._running_app_provider())
+        except Exception:
+            LOGGER.exception("Could not enumerate running applications")
+            candidates = ()
+        for title, path in candidates:
+            if not path or ntpath.normcase(path) in configured:
+                continue
+            self.running_apps_combo.addItem(self._target_app_label(path, title), path)
+            self.running_apps_combo.setItemData(
+                self.running_apps_combo.count() - 1,
+                path,
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        if selected_path:
+            index = self.running_apps_combo.findData(selected_path)
+            if index >= 0:
+                self.running_apps_combo.setCurrentIndex(index)
+        self.add_target_app_button.setEnabled(self.running_apps_combo.count() > 0)
+
+    def _sync_target_app_controls(self) -> None:
+        if self.target_apps_combo is None or self.remove_target_app_button is None:
+            return
+        selected_path = self.target_apps_combo.currentData()
+        self.target_apps_combo.clear()
+        for path in self._plain_text_target_apps:
+            self.target_apps_combo.addItem(self._target_app_label(path), path)
+            self.target_apps_combo.setItemData(
+                self.target_apps_combo.count() - 1,
+                path,
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        if selected_path:
+            index = self.target_apps_combo.findData(selected_path)
+            if index >= 0:
+                self.target_apps_combo.setCurrentIndex(index)
+        self.remove_target_app_button.setEnabled(self.target_apps_combo.count() > 0)
+
+    def _add_selected_target_app(self) -> None:
+        if self.running_apps_combo is None:
+            return
+        path = self.running_apps_combo.currentData()
+        if not isinstance(path, str) or not path:
+            return
+        if ntpath.normcase(path) not in {
+            ntpath.normcase(candidate) for candidate in self._plain_text_target_apps
+        }:
+            self._plain_text_target_apps = (*self._plain_text_target_apps, path)
+            self._sync_target_app_controls()
+            self._refresh_running_apps()
+            self._emit_settings_changed()
+
+    def _remove_selected_target_app(self) -> None:
+        if self.target_apps_combo is None:
+            return
+        path = self.target_apps_combo.currentData()
+        if not isinstance(path, str) or not path:
+            return
+        identity = ntpath.normcase(path)
+        self._plain_text_target_apps = tuple(
+            candidate
+            for candidate in self._plain_text_target_apps
+            if ntpath.normcase(candidate) != identity
+        )
+        self._sync_target_app_controls()
+        self._refresh_running_apps()
+        self._emit_settings_changed()
+
     def values(self) -> dict[str, object]:
         if self.hotkey_mode is None:
             recorded = self.custom_hotkey.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
@@ -3008,6 +3147,12 @@ class SettingsDialog(QDialog):
             "selection_memory_seconds": self.selection_memory.value(),
             "launch_at_login": self.launch_at_login.isChecked(),
             "neon_border_enabled": self.neon_border.isChecked(),
+            "plain_text_compat_enabled": (
+                self.plain_text_compat.isChecked()
+                if self.plain_text_compat is not None
+                else self._plain_text_compat_enabled
+            ),
+            "plain_text_target_apps": self._plain_text_target_apps,
         }
 
     def _connect_immediate_changes(self) -> None:
@@ -3219,6 +3364,12 @@ class SettingsDialog(QDialog):
             self.selection_memory.setEnabled(settings.remember_selection)
             self.launch_at_login.setChecked(settings.launch_at_login)
             self.neon_border.setChecked(settings.neon_border_enabled)
+            self._plain_text_compat_enabled = bool(settings.plain_text_compat_enabled)
+            self._plain_text_target_apps = tuple(settings.plain_text_target_apps)
+            if self.plain_text_compat is not None:
+                self.plain_text_compat.setChecked(settings.plain_text_compat_enabled)
+                self._sync_target_app_controls()
+                self._refresh_running_apps()
         finally:
             self._updating_controls = False
 
@@ -3254,7 +3405,12 @@ class SettingsDialog(QDialog):
         self.update()
         for checkbox in self._settings_checkboxes:
             checkbox.set_theme(self._appearance)
-        for combo in (self.hotkey_mode, self.theme):
+        for combo in (
+            self.hotkey_mode,
+            self.theme,
+            self.running_apps_combo,
+            self.target_apps_combo,
+        ):
             if combo is not None:
                 _style_combo_popup(combo, self._appearance)
         if sys.platform == "win32":

@@ -31,6 +31,7 @@ from clipsoon.core import (
     FileItemClaimStatus,
     HistoryRepository,
     ValidatedFileItem,
+    normalize_windows_app_path,
 )
 from clipsoon.windows_focus_host import FOCUS_HELPER_TIMEOUT_SECONDS
 from clipsoon.windows_paste_host import (
@@ -60,6 +61,10 @@ _WINDOWS_FOCUS_RETRY_DELAYS_MS = (40, 80, 120)
 _FILE_VALIDATION_TIMEOUT_MS = 3_000
 _MAX_CONCURRENT_FILE_VALIDATIONS = 2
 _GA_ROOT = 2
+_EVENT_SYSTEM_FOREGROUND = 0x0003
+_WINEVENT_OUTOFCONTEXT = 0x0000
+_WINEVENT_SKIPOWNPROCESS = 0x0002
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 _WIN_BOOL = ctypes.c_int32
 _WIN_DWORD = ctypes.c_uint32
@@ -291,6 +296,139 @@ def _windows_foreground_window() -> int:
     if hasattr(value, "value"):
         value = value.value
     return int(value or 0)
+
+
+def _windows_process_executable(
+    identifier: int,
+    *,
+    user32: object | None = None,
+    kernel32: object | None = None,
+) -> str:
+    if identifier <= 0:
+        return ""
+    user_api = user32 or ctypes.windll.user32
+    kernel_api = kernel32 or ctypes.windll.kernel32
+    _thread_id, process_id = _windows_window_identity(user_api, identifier)
+    if not process_id:
+        return ""
+    open_process = kernel_api.OpenProcess
+    query_path = kernel_api.QueryFullProcessImageNameW
+    close_handle = kernel_api.CloseHandle
+    with suppress(AttributeError):
+        open_process.argtypes = (_WIN_DWORD, _WIN_BOOL, _WIN_DWORD)
+        open_process.restype = ctypes.c_void_p
+        query_path.argtypes = (
+            ctypes.c_void_p,
+            _WIN_DWORD,
+            ctypes.POINTER(ctypes.c_wchar),
+            ctypes.POINTER(_WIN_DWORD),
+        )
+        query_path.restype = _WIN_BOOL
+        close_handle.argtypes = (ctypes.c_void_p,)
+        close_handle.restype = _WIN_BOOL
+    handle = open_process(_PROCESS_QUERY_LIMITED_INFORMATION, False, process_id)
+    if not handle:
+        return ""
+    try:
+        capacity = _WIN_DWORD(32_768)
+        buffer = ctypes.create_unicode_buffer(capacity.value)
+        if not query_path(handle, 0, buffer, ctypes.byref(capacity)):
+            return ""
+        return normalize_windows_app_path(buffer.value)
+    finally:
+        close_handle(handle)
+
+
+class WindowsForegroundMonitor(QObject):
+    """Deliver Windows foreground transitions without polling or input hooks."""
+
+    foreground_changed = Signal(int)
+
+    def __init__(self, user32: object | None = None) -> None:
+        super().__init__()
+        self._user32 = user32
+        self._hook = 0
+        self._callback: object | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return bool(self._hook)
+
+    def start(self) -> bool:
+        if self._hook:
+            return True
+        if sys.platform != "win32" and self._user32 is None:
+            return False
+        user32 = self._user32 or ctypes.windll.user32
+        callback_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+            None,
+            ctypes.c_void_p,
+            _WIN_DWORD,
+            ctypes.c_void_p,
+            _WIN_LONG,
+            _WIN_LONG,
+            _WIN_DWORD,
+            _WIN_DWORD,
+        )
+
+        def event_callback(
+            _hook: object,
+            event: int,
+            hwnd: object,
+            _object_id: int,
+            _child_id: int,
+            _thread_id: int,
+            _event_time: int,
+        ) -> None:
+            if event != _EVENT_SYSTEM_FOREGROUND:
+                return
+            value = hwnd.value if hasattr(hwnd, "value") else hwnd
+            identifier = int(value or 0)
+            if identifier:
+                self.foreground_changed.emit(identifier)
+
+        self._callback = callback_type(event_callback)
+        set_hook = user32.SetWinEventHook
+        with suppress(AttributeError):
+            set_hook.argtypes = (
+                _WIN_DWORD,
+                _WIN_DWORD,
+                ctypes.c_void_p,
+                callback_type,
+                _WIN_DWORD,
+                _WIN_DWORD,
+                _WIN_DWORD,
+            )
+            set_hook.restype = ctypes.c_void_p
+        hook = set_hook(
+            _EVENT_SYSTEM_FOREGROUND,
+            _EVENT_SYSTEM_FOREGROUND,
+            None,
+            self._callback,
+            0,
+            0,
+            _WINEVENT_OUTOFCONTEXT | _WINEVENT_SKIPOWNPROCESS,
+        )
+        value = hook.value if hasattr(hook, "value") else hook
+        self._hook = int(value or 0)
+        if not self._hook:
+            self._callback = None
+            return False
+        return True
+
+    def stop(self) -> None:
+        if not self._hook:
+            self._callback = None
+            return
+        user32 = self._user32 or ctypes.windll.user32
+        with suppress(Exception):
+            unhook = user32.UnhookWinEvent
+            with suppress(AttributeError):
+                unhook.argtypes = (ctypes.c_void_p,)
+                unhook.restype = _WIN_BOOL
+            unhook(ctypes.c_void_p(self._hook))
+        self._hook = 0
+        self._callback = None
 
 
 def _positive_protocol_int(value: object) -> int | None:
@@ -729,6 +867,8 @@ class _PendingWindowsWrite:
     waiting_for_retry: bool = False
     session_id: str = ""
     paths: tuple[Path, ...] = ()
+    normalize_only: bool = False
+    expected_sequence: int | None = None
 
 
 @dataclass(slots=True)
@@ -1173,6 +1313,20 @@ class ClipboardController(QObject):
             self._windows_capture_pipeline_sequence = None
             if not raw_message.get("retrying") and not raw_message.get("fatal"):
                 self._retry_windows_capture(raw_message)
+        if kind in {"clipboard", "error"}:
+            QTimer.singleShot(0, self._resume_waiting_windows_normalizations)
+
+    def _resume_waiting_windows_normalizations(self) -> None:
+        worker = self._windows_worker
+        if (
+            worker is None
+            or not worker.is_healthy
+            or self._windows_capture_pipeline_busy(worker)
+        ):
+            return
+        for pending in tuple(self._windows_pending_writes.values()):
+            if pending.normalize_only and pending.waiting_for_retry:
+                self._prepare_windows_write(pending)
 
     def _queue_windows_manifest(self, message: dict[object, object]) -> None:
         sequence = message.get("sequence")
@@ -1483,6 +1637,43 @@ class ClipboardController(QObject):
             return
         self._prepare_windows_write(pending)
 
+    def request_plain_text_compatibility(
+        self,
+        callback: Callable[[bool, str], None],
+    ) -> None:
+        """Replace the current Windows text payload with eager CF_UNICODETEXT."""
+
+        if sys.platform != "win32":
+            callback(False, "纯文本兼容仅支持 Windows")
+            return
+        worker = self._windows_worker
+        sequence = self._sequence_number()
+        if worker is None or sequence is None or sequence <= 0:
+            callback(False, "Windows 剪贴板宿主不可用")
+            return
+        request_id = uuid.uuid4().hex
+        item = ClipItem(
+            id="__clipsoon_plain_text_compat__",
+            kind=ClipKind.TEXT,
+            content_hash=request_id,
+            created_at=0,
+            updated_at=0,
+        )
+        pending = _PendingWindowsWrite(
+            request_id,
+            item,
+            lambda receipt, error: callback(receipt is not None, error),
+            time.monotonic() + (_WINDOWS_WRITE_DEADLINE_MS / 1_000),
+            normalize_only=True,
+            expected_sequence=sequence,
+        )
+        self._windows_pending_writes[request_id] = pending
+        QTimer.singleShot(
+            _WINDOWS_WRITE_DEADLINE_MS,
+            lambda request_id=request_id: self._windows_write_timed_out(request_id),
+        )
+        self._prepare_windows_write(pending)
+
     def request_verify(
         self,
         receipt: ClipboardWriteReceipt,
@@ -1535,7 +1726,12 @@ class ClipboardController(QObject):
         for request_id in tuple(self._windows_pending_verifications):
             self._finish_windows_verify(request_id, False, "剪贴板内容已变化")
 
-        if not self._windows_pending_writes:
+        preemptible = tuple(
+            pending
+            for pending in self._windows_pending_writes.values()
+            if not pending.normalize_only
+        )
+        if not preemptible:
             return
         worker = self._windows_worker
         if worker is None:
@@ -1554,7 +1750,7 @@ class ClipboardController(QObject):
                 self._last_sequence = sequence
             self._windows_capture_failures.pop(sequence, None)
 
-        for pending in tuple(self._windows_pending_writes.values()):
+        for pending in preemptible:
             pending.awaiting_result = False
             pending.waiting_for_retry = True
             self._cleanup_windows_write_paths(pending.paths)
@@ -1582,13 +1778,16 @@ class ClipboardController(QObject):
             or self._windows_capture_preemption_session == worker.session_id
         ):
             pending.waiting_for_retry = True
-            if self._windows_capture_pipeline_busy(worker):
+            if self._windows_capture_pipeline_busy(worker) and not pending.normalize_only:
                 self._preempt_windows_capture_pipeline(
                     self._windows_capture_pipeline_sequence
                 )
             return
         if not worker.is_healthy or not _is_request_id(worker.session_id):
             pending.waiting_for_retry = True
+            return
+        if pending.normalize_only:
+            self._send_windows_plain_text_compatibility(pending)
             return
         pending.preparations += 1
         pending.preparing = True
@@ -1611,6 +1810,36 @@ class ClipboardController(QObject):
             )
         )
         self._thread_pool.start(task)
+
+    def _send_windows_plain_text_compatibility(self, pending: _PendingWindowsWrite) -> None:
+        worker = self._windows_worker
+        if (
+            worker is None
+            or not worker.is_healthy
+            or not _is_request_id(worker.session_id)
+            or pending.expected_sequence is None
+            or time.monotonic() >= pending.deadline
+        ):
+            pending.waiting_for_retry = True
+            return
+        pending.attempts += 1
+        pending.preparing = False
+        pending.awaiting_result = True
+        pending.waiting_for_retry = False
+        pending.session_id = worker.session_id
+        if not worker.send(
+            {
+                "type": "normalize_clipboard_text",
+                "request_id": pending.request_id,
+                "sequence": pending.expected_sequence,
+            }
+        ):
+            pending.awaiting_result = False
+            self._finish_windows_write(
+                pending.request_id,
+                None,
+                "无法发送纯文本兼容请求",
+            )
 
     def _windows_write_prepared(
         self,
@@ -2343,6 +2572,59 @@ class PlatformBridge:
         except Exception:
             LOGGER.debug("Windows window title unavailable", exc_info=True)
             return ""
+
+    @staticmethod
+    def window_executable_path(identifier: int) -> str:
+        if sys.platform != "win32" or identifier <= 0:
+            return ""
+        try:
+            return _windows_process_executable(identifier)
+        except Exception:
+            LOGGER.debug("Windows executable path unavailable", exc_info=True)
+            return ""
+
+    @staticmethod
+    def running_windows_apps() -> tuple[tuple[str, str], ...]:
+        """Return visible top-level applications as display-name/path pairs."""
+
+        if sys.platform != "win32":
+            return ()
+        try:
+            user32 = ctypes.windll.user32
+            callback_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+                _WIN_BOOL,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            )
+            applications: dict[str, tuple[str, str]] = {}
+
+            def visit(hwnd: object, _parameter: object) -> int:
+                value = hwnd.value if hasattr(hwnd, "value") else hwnd
+                identifier = int(value or 0)
+                if not identifier or not user32.IsWindowVisible(_windows_handle(identifier)):
+                    return 1
+                _thread_id, process_id = _windows_window_identity(user32, identifier)
+                if process_id == os.getpid():
+                    return 1
+                path = _windows_process_executable(identifier)
+                if not path:
+                    return 1
+                identity = path.replace("/", "\\").casefold()
+                if identity in applications:
+                    return 1
+                title = PlatformBridge.window_name(identifier).strip()
+                executable = path.replace("/", "\\").rsplit("\\", 1)[-1]
+                applications[identity] = (title or executable, path)
+                return 1
+
+            callback = callback_type(visit)
+            user32.EnumWindows(callback, None)
+            return tuple(
+                sorted(applications.values(), key=lambda value: (value[0].casefold(), value[1].casefold()))
+            )
+        except Exception:
+            LOGGER.debug("Could not enumerate visible Windows applications", exc_info=True)
+            return ()
 
     @staticmethod
     def target_from_window_id(

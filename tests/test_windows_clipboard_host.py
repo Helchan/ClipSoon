@@ -452,6 +452,159 @@ def test_private_marker_suppresses_payload_read(tmp_path: Path, marker: str) -> 
     assert not any(call.startswith("data:") for call in api.calls)
 
 
+def test_broker_normalizes_rich_text_to_unicode_text_and_internal_marker(
+    tmp_path: Path,
+) -> None:
+    request_id = "e" * 32
+    api = FakeClipboardApi(sequence=10)
+    api.formats = [CF_UNICODETEXT, api.html_format]
+    api.payloads[CF_UNICODETEXT] = "第一行\n第二行\0".encode("utf-16-le")
+    api.payloads[api.html_format] = b"<b>rich</b>"
+    events: list[dict[str, object]] = []
+    ignored: list[int] = []
+    store = ImagePayloadStore(tmp_path, session_id="f" * 32)
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        store,
+        events.append,
+        reader=make_reader(tmp_path, api),
+        ignore_sequence=ignored.append,
+        sleep=lambda _delay: None,
+    )
+
+    broker.handle(
+        {
+            "type": "normalize_clipboard_text",
+            "request_id": request_id,
+            "sequence": 10,
+        }
+    )
+
+    assert events[0]["type"] == "write_started"
+    assert events[-1] == {
+        "type": "write_result",
+        "request_id": request_id,
+        "kind": "text",
+        "ok": True,
+        "sequence": 11,
+        "code": "",
+        "error": "",
+    }
+    assert api.formats == [CF_UNICODETEXT, api.internal_write_format]
+    assert api.payloads[CF_UNICODETEXT] == "第一行\r\n第二行\0".encode("utf-16-le")
+    assert api.payloads[api.internal_write_format] == request_id.encode("ascii") + b"\0"
+    assert ignored == [11]
+
+
+def test_broker_plain_text_normalization_never_overwrites_a_newer_clipboard(
+    tmp_path: Path,
+) -> None:
+    request_id = "1" * 32
+    api = FakeClipboardApi(sequence=20)
+    events: list[dict[str, object]] = []
+
+    class SequenceChangingReader:
+        def read_text(self, sequence: int) -> tuple[str, str, int]:
+            assert sequence == 20
+            api.sequence = 21
+            return "stale source", "", 20
+
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        ImagePayloadStore(tmp_path, session_id="2" * 32),
+        events.append,
+        reader=SequenceChangingReader(),  # type: ignore[arg-type]
+        sleep=lambda _delay: None,
+    )
+
+    broker.handle(
+        {
+            "type": "normalize_clipboard_text",
+            "request_id": request_id,
+            "sequence": 20,
+        }
+    )
+
+    assert events[-1]["ok"] is False
+    assert events[-1]["code"] == "source_changed"
+    assert events[-1]["sequence"] == 21
+    assert api.empty_calls == 0
+    assert api.set_calls == []
+
+
+def test_broker_accepts_sequence_advance_caused_while_rendering_source_text(
+    tmp_path: Path,
+) -> None:
+    request_id = "5" * 32
+    api = FakeClipboardApi(sequence=40)
+    api.formats = [CF_UNICODETEXT]
+    api.payloads[CF_UNICODETEXT] = "delayed text\0".encode("utf-16-le")
+    read_bytes = api.global_bytes
+    rendered = [False]
+
+    def global_bytes(format_id: int) -> bytes:
+        value = read_bytes(format_id)
+        if format_id == CF_UNICODETEXT and not rendered[0]:
+            rendered[0] = True
+            api.sequence += 1
+        return value
+
+    api.global_bytes = global_bytes  # type: ignore[method-assign]
+    events: list[dict[str, object]] = []
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        ImagePayloadStore(tmp_path, session_id="6" * 32),
+        events.append,
+        reader=make_reader(tmp_path, api),
+        sleep=lambda _delay: None,
+    )
+
+    broker.handle(
+        {
+            "type": "normalize_clipboard_text",
+            "request_id": request_id,
+            "sequence": 40,
+        }
+    )
+
+    assert events[-1]["ok"] is True
+    assert events[-1]["sequence"] == 42
+    assert api.empty_calls == 1
+
+
+def test_broker_plain_text_normalization_skips_private_content(tmp_path: Path) -> None:
+    request_id = "3" * 32
+    private_format = 50_001
+    api = FakeClipboardApi(sequence=30)
+    api.formats = [private_format, CF_UNICODETEXT]
+    api.names[private_format] = "ExcludeClipboardContentFromMonitorProcessing"
+    api.payloads[CF_UNICODETEXT] = "secret\0".encode("utf-16-le")
+    events: list[dict[str, object]] = []
+    broker = WindowsClipboardBroker(
+        api,
+        123,
+        ImagePayloadStore(tmp_path, session_id="4" * 32),
+        events.append,
+        reader=make_reader(tmp_path, api),
+        sleep=lambda _delay: None,
+    )
+
+    broker.handle(
+        {
+            "type": "normalize_clipboard_text",
+            "request_id": request_id,
+            "sequence": 30,
+        }
+    )
+
+    assert events[-1]["ok"] is False
+    assert events[-1]["code"] == "private"
+    assert api.empty_calls == 0
+
+
 def test_host_skips_internal_write_without_opening_clipboard(tmp_path: Path) -> None:
     api = FakeClipboardApi(sequence=10)
     api.formats = [api.internal_write_format, api.png_format, CF_DIB]

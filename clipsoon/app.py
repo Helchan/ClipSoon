@@ -27,6 +27,7 @@ from clipsoon.core import (
     HistoryRepository,
     JsonSettingsStore,
     ObservableSettings,
+    normalize_windows_app_path,
 )
 from clipsoon.system import (
     ClipboardController,
@@ -37,6 +38,7 @@ from clipsoon.system import (
     PlatformBridge,
     PynputPasteAdapter,
     SelectionSender,
+    WindowsForegroundMonitor,
 )
 from clipsoon.ui import ClipPanel, SettingsDialog, _install_app_owned_caret_style, create_tray_icon
 
@@ -160,6 +162,13 @@ class ClipSoonApplication(QObject):
         self._pending_hotkey_candidate = ""
         self._pending_hotkey_restart_settings: AppSettings | None = None
         self._settings_dialog: SettingsDialog | None = None
+        self._plain_text_foreground_monitor = WindowsForegroundMonitor()
+        self._plain_text_foreground_monitor.foreground_changed.connect(
+            self._plain_text_foreground_changed
+        )
+        self._plain_text_active_target = ""
+        self._plain_text_compat_generation = 0
+        self._plain_text_monitor_failure_reported = False
 
         self.panel = ClipPanel(lambda: self.settings.value)
         # The timer is owned by the panel so closing the panel also cancels a
@@ -194,6 +203,7 @@ class ClipSoonApplication(QObject):
 
     def start(self) -> None:
         self.clipboard.start()
+        self._sync_plain_text_compatibility()
         self.tray_actions["pause"].setChecked(not self.settings.value.capture_enabled)
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray.show()
@@ -404,6 +414,7 @@ class ClipSoonApplication(QObject):
             self.settings.value,
             self.panel if self.panel.isVisible() else None,
             accessibility_granted=PlatformBridge.accessibility_permission_status(),
+            running_app_provider=PlatformBridge.running_windows_apps,
         )
         dialog.clear_requested.connect(self.clear_history)
         dialog.reveal_requested.connect(self.open_data_directory)
@@ -480,6 +491,11 @@ class ClipSoonApplication(QObject):
             self._queue_hotkey_restart(new)
         if old.capture_enabled != new.capture_enabled:
             self.clipboard.sync_cursor()
+        if (
+            old.plain_text_compat_enabled != new.plain_text_compat_enabled
+            or old.plain_text_target_apps != new.plain_text_target_apps
+        ):
+            self._sync_plain_text_compatibility()
         if (
             old.max_history_items != new.max_history_items
             or old.retention_days != new.retention_days
@@ -592,6 +608,100 @@ class ClipSoonApplication(QObject):
         ):
             self.toggle_panel()
 
+    def _sync_plain_text_compatibility(self) -> None:
+        self._plain_text_compat_generation += 1
+        self._plain_text_active_target = ""
+        settings = self.settings.value
+        should_run = bool(
+            PlatformBridge.is_windows()
+            and settings.plain_text_compat_enabled
+            and settings.plain_text_target_apps
+        )
+        if not should_run:
+            self._plain_text_foreground_monitor.stop()
+            self._plain_text_monitor_failure_reported = False
+            return
+        try:
+            monitor_started = self._plain_text_foreground_monitor.start()
+        except Exception:
+            LOGGER.exception("Could not start the Windows foreground monitor")
+            self._plain_text_foreground_monitor.stop()
+            monitor_started = False
+        if not monitor_started:
+            if not self._plain_text_monitor_failure_reported:
+                self._plain_text_monitor_failure_reported = True
+                self._notify_error("无法启动目标应用纯文本兼容监测")
+            return
+        self._plain_text_monitor_failure_reported = False
+        foreground = PlatformBridge.foreground_window_id()
+        if foreground is not None:
+            QTimer.singleShot(
+                0,
+                lambda identifier=foreground: self._plain_text_foreground_changed(identifier),
+            )
+
+    def _plain_text_foreground_changed(self, identifier: int) -> None:
+        settings = self.settings.value
+        if not settings.plain_text_compat_enabled or not settings.plain_text_target_apps:
+            self._plain_text_compat_generation += 1
+            self._plain_text_active_target = ""
+            return
+        path = normalize_windows_app_path(PlatformBridge.window_executable_path(identifier))
+        target_identities = {
+            candidate.replace("/", "\\").casefold()
+            for candidate in settings.plain_text_target_apps
+        }
+        identity = path.replace("/", "\\").casefold()
+        if not identity or identity not in target_identities:
+            if self._plain_text_active_target:
+                self._plain_text_compat_generation += 1
+            self._plain_text_active_target = ""
+            return
+        if identity == self._plain_text_active_target:
+            return
+        self._plain_text_compat_generation += 1
+        generation = self._plain_text_compat_generation
+        self._plain_text_active_target = identity
+        QTimer.singleShot(
+            80,
+            lambda: self._normalize_plain_text_for_target(
+                identifier,
+                identity,
+                generation,
+            ),
+        )
+
+    def _normalize_plain_text_for_target(
+        self,
+        identifier: int,
+        identity: str,
+        generation: int,
+    ) -> None:
+        if (
+            generation != self._plain_text_compat_generation
+            or identity != self._plain_text_active_target
+            or PlatformBridge.foreground_window_id() != identifier
+        ):
+            return
+        self.clipboard.request_plain_text_compatibility(
+            lambda ok, error, target=identity: self._plain_text_compatibility_finished(
+                target,
+                ok,
+                error,
+            )
+        )
+
+    @staticmethod
+    def _plain_text_compatibility_finished(target: str, ok: bool, error: str) -> None:
+        if ok:
+            LOGGER.info("Normalized clipboard text for compatibility target: %s", target)
+        else:
+            LOGGER.debug(
+                "Clipboard text compatibility skipped for %s: %s",
+                target,
+                error,
+            )
+
     def _send_finished(self, message: str, success: bool) -> None:
         self._reload_history()
         self.panel.set_status(message)
@@ -703,6 +813,8 @@ class ClipSoonApplication(QObject):
         self.panel.set_status(message)
 
     def shutdown(self) -> None:
+        self._plain_text_compat_generation += 1
+        self._plain_text_foreground_monitor.stop()
         self._panel_watch_timer.stop()
         self._hotkey_health_timer.stop()
         self._hotkey_restart_timer.stop()

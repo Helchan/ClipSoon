@@ -213,6 +213,8 @@ class AppSettings:
     panel_y: int | None = None
     theme: str = "frosted"
     neon_border_enabled: bool = True
+    plain_text_compat_enabled: bool = False
+    plain_text_target_apps: tuple[str, ...] = ()
 
     def validated(self) -> AppSettings:
         return AppSettings(
@@ -231,6 +233,8 @@ class AppSettings:
             panel_y=_optional_coordinate(self.panel_y),
             theme=self.theme if self.theme in {"light", "dark", "frosted"} else "frosted",
             neon_border_enabled=bool(self.neon_border_enabled),
+            plain_text_compat_enabled=bool(self.plain_text_compat_enabled),
+            plain_text_target_apps=normalize_windows_app_paths(self.plain_text_target_apps),
         )
 
 
@@ -308,6 +312,40 @@ def _optional_coordinate(value: Any) -> int | None:
         return _clamp(int(value), -100_000, 100_000)
     except (TypeError, ValueError):
         return None
+
+
+def normalize_windows_app_path(value: object) -> str:
+    """Normalize a persisted executable identity without touching the filesystem."""
+
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip().strip('"')
+    if not candidate or "\0" in candidate or len(candidate) > 32_767:
+        return ""
+    normalized = ntpath.normpath(candidate)
+    drive, tail = ntpath.splitdrive(normalized)
+    if (
+        not drive
+        or not tail.startswith(("\\", "/"))
+        or not normalized.casefold().endswith(".exe")
+    ):
+        return ""
+    return normalized
+
+
+def normalize_windows_app_paths(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for entry in value:
+        path = normalize_windows_app_path(entry)
+        identity = ntpath.normcase(path)
+        if not path or identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(path)
+    return tuple(normalized)
 
 
 # Persistence ---------------------------------------------------------------
