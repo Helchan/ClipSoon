@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import types
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -245,6 +246,45 @@ def make_controller(tmp_path: Path, clipboard: FakeClipboard) -> tuple[Clipboard
     controller._last_sequence = clipboard.sequence
     controller.start()
     return controller, repository
+
+
+def test_macos_clipboard_verify_requires_matching_sequence_and_request_marker(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(system_module.sys, "platform", "darwin")
+    clipboard = FakeClipboard()
+    repository = HistoryRepository(tmp_path)
+    controller = ClipboardController(clipboard, repository, AppSettings, lambda: "Source")
+    controller._sequence_number = lambda: clipboard.sequence  # type: ignore[method-assign]
+    receipts: list[tuple[ClipboardWriteReceipt | None, str]] = []
+    item = ClipItem("text", ClipKind.TEXT, "hash", 1, 1, text="payload")
+
+    controller.request_write(
+        item,
+        lambda receipt, error: receipts.append((receipt, error)),
+    )
+
+    assert len(receipts) == 1
+    receipt = receipts[0][0]
+    assert receipt is not None
+    assert receipt.sequence == clipboard.sequence
+    marker_mime = "application/x-clipsoon-request-id"
+    assert bytes(clipboard.mime.data(marker_mime)) == receipt.request_id.encode("ascii")
+
+    results: list[tuple[bool, str]] = []
+    controller.request_verify(receipt, lambda ok, error: results.append((ok, error)))
+    assert results == [(True, "")]
+
+    clipboard.sequence += 1
+    controller.request_verify(receipt, lambda ok, error: results.append((ok, error)))
+    assert results[-1] == (False, "剪贴板内容已变化")
+
+    clipboard.sequence = receipt.sequence
+    clipboard.mime.setData(marker_mime, b"different-request-marker")
+    controller.request_verify(receipt, lambda ok, error: results.append((ok, error)))
+    assert results[-1] == (False, "剪贴板内容已变化")
+    repository.close()
 
 
 def test_clipboard_capture_precedence_and_self_write(
@@ -2270,6 +2310,9 @@ class FakeRepository:
     def mark_used(self, item_id: str) -> None:
         self.used.append(item_id)
 
+    def mark_used_many(self, item_ids: Sequence[str]) -> None:
+        self.used.extend(dict.fromkeys(item_ids))
+
 
 class FakePaste:
     def __init__(self, succeeds: bool = True) -> None:
@@ -2454,20 +2497,16 @@ def test_selection_sender_uses_crlf_in_one_combined_windows_paste(qtbot, monkeyp
             ClipItem("image", ClipKind.IMAGE, "image", 2, 2, image_path="image.png"),
         ),
         (
-            ClipItem("image-1", ClipKind.IMAGE, "image-1", 1, 1, image_path="one.png"),
-            ClipItem("image-2", ClipKind.IMAGE, "image-2", 2, 2, image_path="two.png"),
-        ),
-        (
             ClipItem("text", ClipKind.TEXT, "text", 1, 1, text="first"),
             ClipItem("files", ClipKind.FILES, "files", 2, 2, files=("file.txt",)),
         ),
         (
-            ClipItem("files-1", ClipKind.FILES, "files-1", 1, 1, files=("one.txt",)),
-            ClipItem("files-2", ClipKind.FILES, "files-2", 2, 2, files=("two.txt",)),
+            ClipItem("image", ClipKind.IMAGE, "image", 1, 1, image_path="image.png"),
+            ClipItem("files", ClipKind.FILES, "files", 2, 2, files=("file.txt",)),
         ),
     ),
 )
-def test_selection_sender_rejects_multi_item_payloads_that_cannot_be_losslessly_combined(
+def test_selection_sender_rejects_mixed_multi_item_payloads(
     clips: tuple[ClipItem, ClipItem],
 ) -> None:
     writer, repository, paste = FakeWriter(), FakeRepository(), FakePaste()
@@ -2488,7 +2527,824 @@ def test_selection_sender_rejects_multi_item_payloads_that_cannot_be_losslessly_
     assert repository.used == []
     assert paste.count == 0
     assert hidden == []
-    assert rejected == ["一次发送多项目前仅支持文本；图片或文件请单项发送"]
+    assert rejected == ["一次批量发送只支持同一类型；请分别选择文本、图片或文件"]
+
+
+def test_selection_sender_combines_file_items_with_stable_normalized_deduplication(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    repository = HistoryRepository(tmp_path / "history")
+    first_path = tmp_path / "first.txt"
+    shared_path = tmp_path / "shared.txt"
+    last_path = tmp_path / "last.txt"
+    for path in (first_path, shared_path, last_path):
+        path.write_text(path.stem, encoding="utf-8")
+    first = repository.add_files((str(first_path), str(shared_path)))
+    shared_alias = tmp_path / "unused-parent" / ".." / shared_path.name
+    second = repository.add_files((str(shared_alias), str(last_path)))
+    writer, paste = DeferredWriter(), FakePaste()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    target = FakeTarget()
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: hidden.append(True),
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many((first, second), target)  # type: ignore[arg-type]
+
+    qtbot.waitUntil(lambda: len(writer.writes) == 1, timeout=1_000)
+    combined = writer.writes[0]
+    assert combined.id == "__clipsoon_combined_files__"
+    assert combined.kind is ClipKind.FILES
+    assert combined.files == (str(first_path), str(shared_path), str(last_path))
+    assert repository.get(first.id).use_count == 0  # type: ignore[union-attr]
+    assert repository.get(second.id).use_count == 0  # type: ignore[union-attr]
+    assert hidden == []
+    assert paste.count == 0
+
+    receipt = ClipboardWriteReceipt("a" * 32, ClipKind.FILES, 1)
+    writer.write_callbacks[0](receipt, "")
+    writer.write_callbacks[0](receipt, "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    assert repository.get(first.id).use_count == 1  # type: ignore[union-attr]
+    assert repository.get(second.id).use_count == 1  # type: ignore[union-attr]
+    assert hidden == [True]
+    assert target.activations == 1
+
+    verify_callback = writer.verify_callbacks[0][1]
+    verify_callback(True, "")
+    verify_callback(True, "")
+
+    assert len(writer.writes) == 1
+    assert paste.count == 1
+    assert repository.get(first.id).use_count == 1  # type: ignore[union-attr]
+    assert repository.get(second.id).use_count == 1  # type: ignore[union-attr]
+    assert finished == [
+        ("已触发 1 次文件粘贴（2 条记录，共 3 个文件或目录）", True)
+    ]
+    repository.close()
+
+
+def test_selection_sender_combines_file_items_in_copy_only_mode(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    repository = HistoryRepository(tmp_path / "history")
+    first_path = tmp_path / "first.txt"
+    shared_path = tmp_path / "shared.txt"
+    last_path = tmp_path / "last.txt"
+    for path in (first_path, shared_path, last_path):
+        path.write_text(path.stem, encoding="utf-8")
+    first = repository.add_files((str(first_path), str(shared_path)))
+    second = repository.add_files((str(shared_path), str(last_path)))
+    writer, paste = DeferredWriter(), FakePaste()
+    target = FakeTarget()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_after_selection=False),
+        lambda: hidden.append(True),
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many((first, second), target)  # type: ignore[arg-type]
+
+    qtbot.waitUntil(lambda: len(writer.writes) == 1, timeout=1_000)
+    assert writer.writes[0].kind is ClipKind.FILES
+    assert writer.writes[0].files == (
+        str(first_path),
+        str(shared_path),
+        str(last_path),
+    )
+    assert repository.get(first.id).use_count == 0  # type: ignore[union-attr]
+    assert repository.get(second.id).use_count == 0  # type: ignore[union-attr]
+
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.FILES, 1), "")
+
+    assert repository.get(first.id).use_count == 1  # type: ignore[union-attr]
+    assert repository.get(second.id).use_count == 1  # type: ignore[union-attr]
+    assert hidden == [True]
+    assert target.activations == 0
+    assert writer.verify_callbacks == []
+    assert paste.count == 0
+    assert finished == [
+        ("已合并复制 2 条文件记录（3 个文件或目录）", True)
+    ]
+    repository.close()
+
+
+def test_selection_sender_rejects_file_batch_over_path_limit_before_side_effects(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    paths = tuple(str(tmp_path / f"virtual-{index}.txt") for index in range(1_001))
+    items = (
+        ClipItem(
+            "files-first",
+            ClipKind.FILES,
+            "files-first",
+            1,
+            1,
+            files=paths[:500],
+        ),
+        ClipItem(
+            "files-second",
+            ClipKind.FILES,
+            "files-second",
+            2,
+            2,
+            files=paths[500:],
+        ),
+    )
+
+    class ValidFileBatchRepository:
+        def __init__(self) -> None:
+            self.items = {item.id: item for item in items}
+            self.used: list[str] = []
+
+        def validate_file_item(self, item_id: str):
+            return system_module.ValidatedFileItem(self.items[item_id], 0)
+
+        def claim_validated_file_item(self, validated):
+            return types.SimpleNamespace(
+                status=system_module.FileItemClaimStatus.ACCEPTED,
+                item=validated.item,
+            )
+
+        def mark_used(self, item_id: str) -> None:
+            self.used.append(item_id)
+
+    repository = ValidFileBatchRepository()
+    writer, paste = FakeWriter(), FakePaste()
+    target = FakeTarget()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: hidden.append(True),
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(items, target)  # type: ignore[arg-type]
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert not finished[0][1]
+    assert "1000" in finished[0][0].replace(",", "")
+    assert writer.writes == []
+    assert repository.used == []
+    assert hidden == []
+    assert target.activations == 0
+    assert paste.count == 0
+
+
+def test_selection_sender_file_batch_missing_member_stops_before_clipboard_write(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    repository = HistoryRepository(tmp_path / "history")
+    available_path = tmp_path / "available.txt"
+    missing_path = tmp_path / "missing.txt"
+    available_path.write_text("available", encoding="utf-8")
+    missing_path.write_text("missing", encoding="utf-8")
+    available = repository.add_files((str(available_path),))
+    missing = repository.add_files((str(missing_path),))
+    missing_path.unlink()
+    writer, paste = FakeWriter(), FakePaste()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: hidden.append(True),
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many((available, missing), FakeTarget())  # type: ignore[arg-type]
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert not finished[0][1]
+    assert "原文件已不存在" in finished[0][0]
+    assert repository.get(available.id).use_count == 0  # type: ignore[union-attr]
+    assert repository.get(missing.id) is None
+    assert writer.writes == []
+    assert paste.count == 0
+    assert hidden == []
+    repository.close()
+
+
+def test_selection_sender_rechecks_all_file_paths_immediately_before_batch_write(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = HistoryRepository(tmp_path / "history")
+    first_path = tmp_path / "first.txt"
+    second_path = tmp_path / "second.txt"
+    first_path.write_text("first", encoding="utf-8")
+    second_path.write_text("second", encoding="utf-8")
+    first = repository.add_files((str(first_path),))
+    second = repository.add_files((str(second_path),))
+    original_validate = repository.validate_file_item
+
+    def validate_then_remove_earlier_path(item_id: str):
+        validated = original_validate(item_id)
+        if item_id == second.id:
+            first_path.unlink()
+        return validated
+
+    monkeypatch.setattr(
+        repository,
+        "validate_file_item",
+        validate_then_remove_earlier_path,
+    )
+    writer, paste = FakeWriter(), FakePaste()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: hidden.append(True),
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many((first, second), FakeTarget())  # type: ignore[arg-type]
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert finished[0][1] is False
+    assert "原文件已不存在" in finished[0][0]
+    assert writer.writes == []
+    assert repository.get(first.id) is None
+    assert repository.get(second.id).use_count == 0  # type: ignore[union-attr]
+    assert paste.count == 0
+    assert hidden == []
+    repository.close()
+
+
+def test_selection_sender_applies_one_deadline_to_the_whole_file_batch(
+    qtbot,
+    monkeypatch,
+) -> None:
+    items = (
+        ClipItem(
+            "files-first",
+            ClipKind.FILES,
+            "files-first",
+            1,
+            1,
+            files=("/virtual/first.txt",),
+        ),
+        ClipItem(
+            "files-second",
+            ClipKind.FILES,
+            "files-second",
+            2,
+            2,
+            files=("/virtual/second.txt",),
+        ),
+    )
+
+    class DeadlineRepository:
+        def __init__(self) -> None:
+            self.items = {item.id: item for item in items}
+            self.validated: list[str] = []
+            self.used: list[str] = []
+
+        def validate_file_item(self, item_id: str):
+            self.validated.append(item_id)
+            return system_module.ValidatedFileItem(self.items[item_id], 0)
+
+        def mark_used(self, item_id: str) -> None:
+            self.used.append(item_id)
+
+    monotonic_values = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(
+        system_module.time,
+        "monotonic",
+        lambda: next(monotonic_values, 1.0),
+    )
+    repository = DeadlineRepository()
+    writer, paste = FakeWriter(), FakePaste()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: hidden.append(True),
+        file_batch_validation_deadline_ms=50,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(items, FakeTarget())  # type: ignore[arg-type]
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert finished[0][1] is False
+    assert "批量文件验证超时" in finished[0][0]
+    assert repository.validated == [items[0].id]
+    assert repository.used == []
+    assert writer.writes == []
+    assert paste.count == 0
+    assert hidden == []
+
+
+def test_selection_sender_sends_image_batch_in_order_and_hides_panel_once(qtbot) -> None:
+    images = tuple(
+        ClipItem(
+            f"image-{index}",
+            ClipKind.IMAGE,
+            f"hash-{index}",
+            index,
+            index,
+            image_path=f"{index}.png",
+        )
+        for index in range(3)
+    )
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    target = FakeTarget()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: hidden.append(True),
+        image_batch_settle_ms=0,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(images, target)  # type: ignore[arg-type]
+
+    verify_index = 0
+    for index, image in enumerate(images):
+        qtbot.waitUntil(lambda index=index: len(writer.writes) == index + 1, timeout=1_000)
+        assert writer.writes[index] is image
+        assert writer.writes == list(images[: index + 1])
+        writer.write_callbacks[index](
+            ClipboardWriteReceipt(chr(97 + index) * 32, ClipKind.IMAGE, index + 1),
+            "",
+        )
+        writer.write_callbacks[index](
+            ClipboardWriteReceipt(chr(97 + index) * 32, ClipKind.IMAGE, index + 1),
+            "",
+        )
+        qtbot.waitUntil(
+            lambda verify_index=verify_index: len(writer.verify_callbacks) == verify_index + 1,
+            timeout=1_000,
+        )
+        assert repository.used == [item.id for item in images[: index + 1]]
+        assert hidden == [True]
+        verify_callback = writer.verify_callbacks[verify_index][1]
+        verify_callback(True, "")
+        verify_callback(True, "")
+        verify_index += 1
+        qtbot.waitUntil(
+            lambda verify_index=verify_index: len(writer.verify_callbacks)
+            == verify_index + 1,
+            timeout=1_000,
+        )
+        barrier_callback = writer.verify_callbacks[verify_index][1]
+        barrier_callback(True, "")
+        barrier_callback(True, "")
+        verify_index += 1
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert writer.writes == list(images)
+    assert repository.used == [item.id for item in images]
+    assert hidden == [True]
+    assert target.activations == 1
+    assert paste.count == len(images)
+    assert finished[0][1]
+    assert "3" in finished[0][0]
+    assert "图片" in finished[0][0]
+
+
+def test_selection_sender_keeps_busy_until_final_image_settle_finishes(qtbot) -> None:
+    images = (
+        ClipItem("image-1", ClipKind.IMAGE, "hash-1", 1, 1, image_path="1.png"),
+        ClipItem("image-2", ClipKind.IMAGE, "hash-2", 2, 2, image_path="2.png"),
+    )
+    waiting = ClipItem("waiting", ClipKind.TEXT, "waiting", 3, 3, text="waiting")
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    rejected: list[str] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: None,
+        image_batch_settle_ms=0,
+    )
+    sender.rejected.connect(rejected.append)
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(images, FakeTarget())  # type: ignore[arg-type]
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.IMAGE, 1), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    writer.verify_callbacks[0][1](True, "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 2, timeout=1_000)
+    writer.verify_callbacks[1][1](True, "")
+    qtbot.waitUntil(lambda: len(writer.writes) == 2, timeout=1_000)
+    writer.write_callbacks[1](ClipboardWriteReceipt("b" * 32, ClipKind.IMAGE, 2), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 3, timeout=1_000)
+    writer.verify_callbacks[2][1](True, "")
+
+    sender.send(waiting, None)
+
+    assert finished == []
+    assert writer.writes == list(images)
+    assert rejected == ["已有发送任务正在进行，请稍候"]
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 4, timeout=1_000)
+    writer.verify_callbacks[3][1](True, "")
+    assert finished == [("已触发 2/2 张图片粘贴", True)]
+    assert paste.count == 2
+
+
+def test_selection_sender_applies_one_deadline_to_the_whole_image_batch(qtbot) -> None:
+    images = (
+        ClipItem("image-1", ClipKind.IMAGE, "hash-1", 1, 1, image_path="1.png"),
+        ClipItem("image-2", ClipKind.IMAGE, "hash-2", 2, 2, image_path="2.png"),
+    )
+    waiting = ClipItem("waiting", ClipKind.TEXT, "waiting", 3, 3, text="waiting")
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    rejected: list[str] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: None,
+        image_batch_settle_ms=0,
+        image_batch_deadline_ms=50,
+    )
+    sender.rejected.connect(rejected.append)
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(images, FakeTarget())  # type: ignore[arg-type]
+
+    qtbot.wait(60)
+    assert finished == []
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.IMAGE, 1), "")
+    assert finished == [
+        (
+            "已触发 0/2 张图片粘贴；第 1 张图片发送失败："
+            "图片批量发送超时，已停止后续图片",
+            False,
+        )
+    ]
+    sender.send(waiting, None)
+    assert writer.writes == [images[0], waiting]
+    assert rejected == []
+    assert repository.used == []
+    assert paste.count == 0
+
+
+def test_selection_sender_image_batch_failure_stops_and_reports_progress(qtbot) -> None:
+    images = tuple(
+        ClipItem(
+            f"image-{index}",
+            ClipKind.IMAGE,
+            f"hash-{index}",
+            index,
+            index,
+            image_path=f"{index}.png",
+        )
+        for index in range(3)
+    )
+
+    class ScriptedPaste:
+        def __init__(self) -> None:
+            self.outcomes = iter((True, False, True))
+            self.count = 0
+
+        def paste(self) -> bool:
+            self.count += 1
+            return next(self.outcomes)
+
+    writer, repository, paste = DeferredWriter(), FakeRepository(), ScriptedPaste()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: hidden.append(True),
+        image_batch_settle_ms=0,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(images, FakeTarget())  # type: ignore[arg-type]
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.IMAGE, 1), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    writer.verify_callbacks[0][1](True, "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 2, timeout=1_000)
+    writer.verify_callbacks[1][1](True, "")
+    qtbot.waitUntil(lambda: len(writer.writes) == 2, timeout=1_000)
+    writer.write_callbacks[1](ClipboardWriteReceipt("b" * 32, ClipKind.IMAGE, 2), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 3, timeout=1_000)
+    writer.verify_callbacks[2][1](True, "")
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert writer.writes == list(images[:2])
+    assert repository.used == [images[0].id, images[1].id]
+    assert hidden == [True]
+    assert paste.count == 2
+    assert not finished[0][1]
+    assert "1/3" in finished[0][0]
+
+
+def test_selection_sender_image_batch_reports_zero_progress_when_first_write_fails() -> None:
+    images = (
+        ClipItem(
+            "image-first",
+            ClipKind.IMAGE,
+            "hash-first",
+            1,
+            1,
+            image_path="first.png",
+        ),
+        ClipItem(
+            "image-second",
+            ClipKind.IMAGE,
+            "hash-second",
+            2,
+            2,
+            image_path="second.png",
+        ),
+    )
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: hidden.append(True),
+        image_batch_settle_ms=0,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(images, FakeTarget())  # type: ignore[arg-type]
+    writer.write_callbacks[0](None, "write failed")
+
+    assert finished == [
+        (
+            "已触发 0/2 张图片粘贴；第 1 张图片发送失败："
+            "无法写入系统剪贴板：write failed",
+            False,
+        )
+    ]
+    assert writer.writes == [images[0]]
+    assert repository.used == []
+    assert paste.count == 0
+    assert hidden == []
+
+
+def test_selection_sender_image_batch_does_not_rewrite_external_clipboard_before_paste(
+    qtbot,
+) -> None:
+    images = (
+        ClipItem(
+            "image-first",
+            ClipKind.IMAGE,
+            "hash-first",
+            1,
+            1,
+            image_path="first.png",
+        ),
+        ClipItem(
+            "image-second",
+            ClipKind.IMAGE,
+            "hash-second",
+            2,
+            2,
+            image_path="second.png",
+        ),
+    )
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: hidden.append(True),
+        image_batch_settle_ms=0,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(images, FakeTarget())  # type: ignore[arg-type]
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.IMAGE, 1), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    writer.verify_callbacks[0][1](False, "external clipboard")
+
+    assert writer.writes == [images[0]]
+    assert repository.used == [images[0].id]
+    assert paste.count == 0
+    assert hidden == [True]
+    assert finished == [
+        (
+            "已触发 0/2 张图片粘贴；第 1 张图片发送失败："
+            "剪贴板已变化，已停止图片批次：external clipboard",
+            False,
+        )
+    ]
+
+
+def test_selection_sender_image_batch_stops_when_clipboard_changes_during_settle(
+    qtbot,
+) -> None:
+    images = tuple(
+        ClipItem(
+            f"image-{index}",
+            ClipKind.IMAGE,
+            f"hash-{index}",
+            index,
+            index,
+            image_path=f"{index}.png",
+        )
+        for index in range(3)
+    )
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    hidden: list[bool] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_delay_ms=0),
+        lambda: hidden.append(True),
+        image_batch_settle_ms=0,
+    )
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send_many(images, FakeTarget())  # type: ignore[arg-type]
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.IMAGE, 1), "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 1, timeout=1_000)
+    writer.verify_callbacks[0][1](True, "")
+    qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 2, timeout=1_000)
+    writer.verify_callbacks[1][1](False, "changed")
+
+    qtbot.waitUntil(lambda: bool(finished), timeout=1_000)
+    assert writer.writes == [images[0]]
+    assert repository.used == [images[0].id]
+    assert hidden == [True]
+    assert paste.count == 1
+    assert not finished[0][1]
+    assert "1/3" in finished[0][0]
+    assert "剪贴板已变化" in finished[0][0]
+
+
+@pytest.mark.parametrize(
+    ("target", "settings", "image_count", "message"),
+    (
+        (
+            None,
+            AppSettings(paste_delay_ms=0),
+            2,
+            "未找到原目标窗口，无法批量发送图片",
+        ),
+        (
+            FakeTarget(),
+            AppSettings(paste_after_selection=False, paste_delay_ms=0),
+            2,
+            "批量发送图片需要开启“选择后自动粘贴”",
+        ),
+        (
+            FakeTarget(),
+            AppSettings(paste_delay_ms=0),
+            21,
+            "一次最多批量发送 20 张图片",
+        ),
+    ),
+)
+def test_selection_sender_rejects_unsafe_image_batches_without_side_effects(
+    target: FakeTarget | None,
+    settings: AppSettings,
+    image_count: int,
+    message: str,
+) -> None:
+    images = tuple(
+        ClipItem(
+            f"image-{index}",
+            ClipKind.IMAGE,
+            f"hash-{index}",
+            index,
+            index,
+            image_path=f"{index}.png",
+        )
+        for index in range(image_count)
+    )
+    writer, repository, paste = FakeWriter(), FakeRepository(), FakePaste()
+    hidden: list[bool] = []
+    rejected: list[str] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: settings,
+        lambda: hidden.append(True),
+        image_batch_settle_ms=0,
+    )
+    sender.rejected.connect(rejected.append)
+
+    sender.send_many(images, target)  # type: ignore[arg-type]
+
+    assert rejected == [message]
+    assert writer.writes == []
+    assert repository.used == []
+    assert paste.count == 0
+    assert hidden == []
+
+
+def test_selection_sender_rejects_a_second_request_while_busy() -> None:
+    active = ClipItem("active", ClipKind.TEXT, "active", 1, 1, text="active")
+    waiting = ClipItem("waiting", ClipKind.TEXT, "waiting", 2, 2, text="waiting")
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    hidden: list[bool] = []
+    rejected: list[str] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        AppSettings,
+        lambda: hidden.append(True),
+    )
+    sender.rejected.connect(rejected.append)
+
+    sender.send(active, None)
+    sender.send(waiting, None)
+
+    assert writer.writes == [active]
+    assert rejected == ["已有发送任务正在进行，请稍候"]
+    assert repository.used == []
+    assert paste.count == 0
+    assert hidden == []
+
+
+def test_selection_sender_releases_busy_when_history_usage_update_fails() -> None:
+    first = ClipItem("first", ClipKind.TEXT, "first", 1, 1, text="first")
+    second = ClipItem("second", ClipKind.TEXT, "second", 2, 2, text="second")
+
+    class RecoveringRepository:
+        def __init__(self) -> None:
+            self.fail = True
+            self.used: list[str] = []
+
+        def mark_used(self, item_id: str) -> None:
+            if self.fail:
+                raise RuntimeError("db locked")
+            self.used.append(item_id)
+
+    writer, repository, paste = FakeWriter(), RecoveringRepository(), FakePaste()
+    hidden: list[bool] = []
+    rejected: list[str] = []
+    finished: list[tuple[str, bool]] = []
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: AppSettings(paste_after_selection=False),
+        lambda: hidden.append(True),
+    )
+    sender.rejected.connect(rejected.append)
+    sender.finished.connect(lambda message, success: finished.append((message, success)))
+
+    sender.send(first, None)
+    repository.fail = False
+    sender.send(second, None)
+
+    assert writer.writes == [first, second]
+    assert repository.used == [second.id]
+    assert hidden == [True]
+    assert paste.count == 0
+    assert rejected == []
+    assert finished == [
+        ("已复制，但无法更新历史使用次数：db locked", False),
+        ("已复制到剪贴板", True),
+    ]
 
 
 def test_selection_sender_combines_multi_item_copy_only_mode() -> None:
@@ -2573,7 +3429,9 @@ def test_selection_sender_rewrites_the_same_combined_payload_once(qtbot) -> None
 
     assert len(writer.writes) == 2
     assert writer.writes[1] == writer.writes[0]
-    writer.write_callbacks[1](ClipboardWriteReceipt("b" * 32, ClipKind.TEXT, 2), "")
+    rewrite_receipt = ClipboardWriteReceipt("b" * 32, ClipKind.TEXT, 2)
+    writer.write_callbacks[1](rewrite_receipt, "")
+    writer.write_callbacks[1](rewrite_receipt, "")
     qtbot.waitUntil(lambda: len(writer.verify_callbacks) == 2, timeout=1_000)
     final_verify = writer.verify_callbacks[1][1]
     final_verify(True, "")

@@ -266,12 +266,15 @@ def test_repository_text_file_image_dedup_and_persistence(tmp_path: Path) -> Non
     assert Path(image.image_path).read_bytes() == png
     assert repo.add_image(png, 2, 3).id == image.id
     repo.set_favorite(first.id, True)
-    repo.mark_used(first.id)
+    repo.mark_used_many((first.id, different.id, first.id))
     repo.close()
 
     reopened = HistoryRepository(tmp_path, clock=clock)
     restored = reopened.get(first.id)
     assert restored and restored.is_favorite and restored.use_count == 1
+    restored_different = reopened.get(different.id)
+    assert restored_different and restored_different.use_count == 1
+    assert restored_different.last_used_at == restored.last_used_at
     assert reopened.delete(image.id)
     assert not reopened.delete("missing")
     assert not Path(image.image_path).exists()

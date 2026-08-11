@@ -31,6 +31,7 @@ from clipsoon.core import (
     FileItemClaimStatus,
     HistoryRepository,
     ValidatedFileItem,
+    _file_path_is_definitively_missing,
     normalize_windows_app_path,
 )
 from clipsoon.windows_focus_host import FOCUS_HELPER_TIMEOUT_SECONDS
@@ -59,7 +60,13 @@ _WINDOWS_MAX_WRITE_ATTEMPTS = 2
 _WINDOWS_FOCUS_HELPER_TIMEOUT_SECONDS = FOCUS_HELPER_TIMEOUT_SECONDS
 _WINDOWS_FOCUS_RETRY_DELAYS_MS = (40, 80, 120)
 _FILE_VALIDATION_TIMEOUT_MS = 3_000
+_FILE_BATCH_VALIDATION_DEADLINE_MS = 10_000
 _MAX_CONCURRENT_FILE_VALIDATIONS = 2
+_IMAGE_BATCH_SETTLE_MS = 500
+_IMAGE_BATCH_DEADLINE_MS = 60_000
+_MAX_IMAGE_BATCH_ITEMS = 20
+_MAX_FILE_BATCH_PATHS = 1_000
+_CLIPSOON_REQUEST_MIME = "application/x-clipsoon-request-id"
 _GA_ROOT = 2
 _EVENT_SYSTEM_FOREGROUND = 0x0003
 _WINEVENT_OUTOFCONTEXT = 0x0000
@@ -897,6 +904,25 @@ class _FileItemValidationTask:
         self.signals.finished.emit(item, "")
 
 
+class _FileBatchPathValidationTask:
+    item_id = "__clipsoon_file_batch_final_validation__"
+
+    def __init__(self, paths: tuple[str, ...]) -> None:
+        self.paths = paths
+        self.signals = _FileItemValidationSignals()
+
+    def run(self) -> None:
+        try:
+            valid = not any(
+                _file_path_is_definitively_missing(path) for path in self.paths
+            )
+        except Exception as exc:
+            LOGGER.exception("Final file batch validation failed")
+            self.signals.finished.emit(False, str(exc))
+            return
+        self.signals.finished.emit(valid, "")
+
+
 class _ImageStoreTask(QRunnable):
     def __init__(
         self,
@@ -1575,7 +1601,7 @@ class ClipboardController(QObject):
 
         return image_mime
 
-    def write_item(self, item: ClipItem) -> bool:
+    def write_item(self, item: ClipItem, *, request_id: str | None = None) -> bool:
         if sys.platform == "win32":
             LOGGER.error("Synchronous GUI-process clipboard writes are disabled on Windows")
             return False
@@ -1583,6 +1609,8 @@ class ClipboardController(QObject):
         if mime_factory is None:
             return False
         mime = mime_factory()
+        marker = request_id or uuid.uuid4().hex
+        mime.setData(_CLIPSOON_REQUEST_MIME, marker.encode("ascii"))
         try:
             self._self_write = True
             self.clipboard.setMimeData(mime, QClipboard.Mode.Clipboard)
@@ -1602,7 +1630,7 @@ class ClipboardController(QObject):
     ) -> None:
         if sys.platform != "win32":
             request_id = uuid.uuid4().hex
-            if self.write_item(item):
+            if self.write_item(item, request_id=request_id):
                 callback(
                     ClipboardWriteReceipt(request_id, item.kind, self._sequence_number()),
                     "",
@@ -1679,6 +1707,24 @@ class ClipboardController(QObject):
         receipt: ClipboardWriteReceipt,
         callback: Callable[[bool, str], None],
     ) -> None:
+        if sys.platform == "darwin":
+            current_sequence = self._sequence_number()
+            if (
+                receipt.sequence is None
+                or current_sequence is None
+                or current_sequence != receipt.sequence
+            ):
+                callback(False, "剪贴板内容已变化")
+                return
+            try:
+                mime = self.clipboard.mimeData(QClipboard.Mode.Clipboard)
+                marker = bytes(mime.data(_CLIPSOON_REQUEST_MIME)).decode("ascii") if mime else ""
+            except Exception:
+                LOGGER.exception("Could not verify the macOS clipboard marker")
+                callback(False, "无法验证剪贴板内容")
+                return
+            callback(marker == receipt.request_id, "" if marker == receipt.request_id else "剪贴板内容已变化")
+            return
         if sys.platform != "win32":
             callback(True, "")
             return
@@ -2873,19 +2919,42 @@ class SelectionSender(QObject):
         hide_panel: Callable[[], None],
         *,
         file_validation_timeout_ms: int = _FILE_VALIDATION_TIMEOUT_MS,
+        file_batch_validation_deadline_ms: int = _FILE_BATCH_VALIDATION_DEADLINE_MS,
+        image_batch_settle_ms: int = _IMAGE_BATCH_SETTLE_MS,
+        image_batch_deadline_ms: int = _IMAGE_BATCH_DEADLINE_MS,
     ) -> None:
         super().__init__()
         self.clipboard, self.repository = clipboard, repository
         self.paste_adapter, self._settings = paste_adapter, settings
         self._hide_panel = hide_panel
         self._busy = False
-        self._validation_tasks: set[_FileItemValidationTask] = set()
+        self._validation_tasks: set[
+            _FileItemValidationTask | _FileBatchPathValidationTask
+        ] = set()
         self._validation_generation = 0
         self._send_generation = 0
+        self._dispatched_write_generation: int | None = None
         self._file_validation_timeout_ms = max(50, int(file_validation_timeout_ms))
+        self._file_batch_validation_deadline_ms = max(
+            50,
+            int(file_batch_validation_deadline_ms),
+        )
+        self._image_batch_settle_ms = max(0, int(image_batch_settle_ms))
+        self._image_batch_deadline_ms = max(50, int(image_batch_deadline_ms))
+        self._batch_mode = "single"
         self._batch_item_ids: tuple[str, ...] = ()
+        self._current_item_ids: tuple[str, ...] = ()
+        self._batch_items: deque[ClipItem] = deque()
         self._batch_target: ForegroundTargetHandle | None = None
         self._batch_total = 0
+        self._batch_completed = 0
+        self._batch_image_deadline = 0.0
+        self._batch_panel_hidden = False
+        self._batch_file_count = 0
+        self._batch_file_validation_deadline = 0.0
+        self._batch_file_pending_ids: deque[str] = deque()
+        self._batch_validated_files: list[ValidatedFileItem] = []
+        self._batch_validation_restarts = 0
         self._batch_settings: AppSettings | None = None
 
     def send(self, item: ClipItem, target: ForegroundTargetHandle | None) -> None:
@@ -2897,24 +2966,105 @@ class SelectionSender(QObject):
         target: ForegroundTargetHandle | None,
     ) -> None:
         if self._busy:
+            self.rejected.emit("已有发送任务正在进行，请稍候")
             return
         batch = tuple(items)
         if not batch:
             return
-        if len(batch) > 1 and any(item.kind is not ClipKind.TEXT for item in batch):
-            self.rejected.emit("一次发送多项目前仅支持文本；图片或文件请单项发送")
-            return
         settings = self._settings()
-        item = batch[0] if len(batch) == 1 else self._combine_text_items(batch)
+        if len(batch) == 1:
+            self._begin_batch(batch, target, settings, "single")
+            self._send_item(batch[0])
+            return
+
+        kinds = {item.kind for item in batch}
+        if len(kinds) != 1:
+            self.rejected.emit(
+                "一次批量发送只支持同一类型；请分别选择文本、图片或文件"
+            )
+            return
+        kind = batch[0].kind
+        if kind is ClipKind.TEXT:
+            self._begin_batch(batch, target, settings, "aggregate_text")
+            self._send_item(self._combine_text_items(batch))
+            return
+        if kind is ClipKind.FILES:
+            self._begin_batch(batch, target, settings, "aggregate_files")
+            self._start_file_batch_validation()
+            return
+        if len(batch) > _MAX_IMAGE_BATCH_ITEMS:
+            self.rejected.emit(f"一次最多批量发送 {_MAX_IMAGE_BATCH_ITEMS} 张图片")
+            return
+        if target is None:
+            self.rejected.emit("未找到原目标窗口，无法批量发送图片")
+            return
+        if not settings.paste_after_selection:
+            self.rejected.emit("批量发送图片需要开启“选择后自动粘贴”")
+            return
+        self._begin_batch(batch, target, settings, "sequential_images")
+        self._batch_items = deque(batch)
+        self._send_next_batch_image()
+
+    def _begin_batch(
+        self,
+        batch: tuple[ClipItem, ...],
+        target: ForegroundTargetHandle | None,
+        settings: AppSettings,
+        mode: str,
+    ) -> None:
         self._busy = True
-        self._batch_item_ids = tuple(original.id for original in batch)
+        self._batch_mode = mode
+        self._batch_item_ids = tuple(item.id for item in batch)
+        self._current_item_ids = self._batch_item_ids
         self._batch_target = target
         self._batch_total = len(batch)
+        self._batch_completed = 0
+        self._batch_image_deadline = (
+            time.monotonic() + self._image_batch_deadline_ms / 1_000
+            if mode == "sequential_images"
+            else 0.0
+        )
+        self._batch_panel_hidden = False
+        self._batch_file_count = 0
+        self._batch_file_validation_deadline = (
+            time.monotonic() + self._file_batch_validation_deadline_ms / 1_000
+            if mode == "aggregate_files"
+            else 0.0
+        )
+        self._batch_file_pending_ids.clear()
+        self._batch_validated_files.clear()
+        self._batch_validation_restarts = 0
         # An in-flight batch is one user transaction. Settings changed while
-        # it is running apply to the next request instead of changing whether
-        # the already-combined payload is pasted or only copied.
+        # it is running apply only to the next request.
         self._batch_settings = settings if len(batch) > 1 else None
+
+    def _send_next_batch_image(self) -> None:
+        if (
+            not self._busy
+            or self._batch_mode != "sequential_images"
+            or not self._batch_items
+        ):
+            return
+        if self._image_batch_deadline_reached(self._send_generation):
+            return
+        item = self._batch_items.popleft()
+        self._current_item_ids = (item.id,)
         self._send_item(item)
+
+    def _image_batch_deadline_reached(self, send_generation: int) -> bool:
+        if (
+            not self._busy
+            or self._batch_mode != "sequential_images"
+            or self._batch_image_deadline <= 0
+            or time.monotonic() < self._batch_image_deadline
+        ):
+            return False
+        self._finish_send(
+            send_generation,
+            "图片批量发送超时，已停止后续图片",
+            False,
+        )
+        return True
 
     @staticmethod
     def _combine_text_items(items: Sequence[ClipItem]) -> ClipItem:
@@ -2926,6 +3076,226 @@ class SelectionSender(QObject):
             created_at=0,
             updated_at=0,
             text=line_break.join(item.text for item in items),
+        )
+
+    def _start_file_batch_validation(self) -> None:
+        if not self._busy or self._batch_mode != "aggregate_files":
+            return
+        self._send_generation += 1
+        send_generation = self._send_generation
+        self._batch_file_pending_ids = deque(self._batch_item_ids)
+        self._batch_validated_files.clear()
+        self._start_next_file_batch_validation(send_generation)
+
+    def _start_next_file_batch_validation(self, send_generation: int) -> None:
+        if (
+            send_generation != self._send_generation
+            or not self._busy
+            or self._batch_mode != "aggregate_files"
+        ):
+            return
+        if not self._batch_file_pending_ids:
+            self._complete_file_batch_validation(send_generation)
+            return
+        timeout_ms = self._remaining_file_batch_validation_ms()
+        if timeout_ms <= 0:
+            self._finish_send(send_generation, "批量文件验证超时，请重试", False)
+            return
+        item_id = self._batch_file_pending_ids.popleft()
+        if any(task.item_id == item_id for task in self._validation_tasks):
+            self._finish_send(send_generation, "原文件仍在验证，请稍后重试", False)
+            return
+        if len(self._validation_tasks) >= _MAX_CONCURRENT_FILE_VALIDATIONS:
+            self._finish_send(send_generation, "后台文件验证繁忙，请稍后重试", False)
+            return
+        self._validation_generation += 1
+        validation_generation = self._validation_generation
+        self._start_file_item_validation(
+            item_id,
+            self._batch_target,
+            validation_generation,
+            send_generation,
+        )
+        QTimer.singleShot(
+            min(self._file_validation_timeout_ms, timeout_ms),
+            lambda: self._file_item_validation_timed_out(
+                validation_generation,
+                send_generation,
+            ),
+        )
+
+    def _remaining_file_batch_validation_ms(self) -> int:
+        if self._batch_file_validation_deadline <= 0:
+            return 0
+        return max(
+            0,
+            int((self._batch_file_validation_deadline - time.monotonic()) * 1_000),
+        )
+
+    def _complete_file_batch_validation(
+        self,
+        send_generation: int,
+        *,
+        checked_paths: tuple[str, ...] | None = None,
+    ) -> None:
+        accepted: list[ClipItem] = []
+        refreshed = False
+        try:
+            for validated in self._batch_validated_files:
+                claim = self.repository.claim_validated_file_item(validated)
+                if claim.status is FileItemClaimStatus.MISSING:
+                    self._finish_send(
+                        send_generation,
+                        "原文件已不存在，已从历史移除",
+                        False,
+                    )
+                    return
+                if claim.status is FileItemClaimStatus.REFRESHED:
+                    refreshed = True
+                    break
+                if claim.status is not FileItemClaimStatus.ACCEPTED or claim.item is None:
+                    self._finish_send(send_generation, "无法确认原文件", False)
+                    return
+                accepted.append(claim.item)
+        except Exception as exc:
+            LOGGER.exception("Validated file batch claim failed")
+            self._finish_send(send_generation, f"无法确认原文件：{exc}", False)
+            return
+        if refreshed:
+            self._batch_validation_restarts += 1
+            if self._batch_validation_restarts > 3:
+                self._finish_send(send_generation, "文件记录持续变化，请稍后重试", False)
+                return
+            self._start_file_batch_validation()
+            return
+
+        flattened: list[str] = []
+        seen: set[str] = set()
+        for item in accepted:
+            for path in item.files:
+                identity = os.path.normcase(os.path.normpath(path))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                flattened.append(path)
+        if not flattened:
+            self._finish_send(send_generation, "批量文件列表为空", False)
+            return
+        if len(flattened) > _MAX_FILE_BATCH_PATHS:
+            self._finish_send(
+                send_generation,
+                f"一次最多批量发送 {_MAX_FILE_BATCH_PATHS} 个文件或目录",
+                False,
+            )
+            return
+        flattened_paths = tuple(flattened)
+        if checked_paths is None:
+            self._start_final_file_batch_validation(
+                flattened_paths,
+                send_generation,
+            )
+            return
+        if flattened_paths != checked_paths:
+            self._batch_validation_restarts += 1
+            if self._batch_validation_restarts > 3:
+                self._finish_send(send_generation, "文件记录持续变化，请稍后重试", False)
+                return
+            self._start_file_batch_validation()
+            return
+        if self._remaining_file_batch_validation_ms() <= 0:
+            self._finish_send(send_generation, "批量文件验证超时，请重试", False)
+            return
+        self._batch_file_count = len(flattened)
+        self._current_item_ids = self._batch_item_ids
+        combined = ClipItem(
+            id="__clipsoon_combined_files__",
+            kind=ClipKind.FILES,
+            content_hash="combined-files",
+            created_at=0,
+            updated_at=0,
+            files=flattened_paths,
+        )
+        self._request_item_write(combined, self._batch_target, send_generation)
+
+    def _start_final_file_batch_validation(
+        self,
+        paths: tuple[str, ...],
+        send_generation: int,
+    ) -> None:
+        timeout_ms = self._remaining_file_batch_validation_ms()
+        if timeout_ms <= 0:
+            self._finish_send(send_generation, "批量文件验证超时，请重试", False)
+            return
+        if len(self._validation_tasks) >= _MAX_CONCURRENT_FILE_VALIDATIONS:
+            self._finish_send(send_generation, "后台文件验证繁忙，请稍后重试", False)
+            return
+        self._validation_generation += 1
+        validation_generation = self._validation_generation
+        task = _FileBatchPathValidationTask(paths)
+        self._validation_tasks.add(task)
+        task.signals.finished.connect(
+            lambda valid, error, task=task: self._final_file_batch_validated(
+                task,
+                paths,
+                valid,
+                error,
+                validation_generation,
+                send_generation,
+            )
+        )
+        threading.Thread(
+            target=task.run,
+            name=f"ClipSoon-file-batch-final-validation-{validation_generation}",
+            daemon=True,
+        ).start()
+        QTimer.singleShot(
+            min(self._file_validation_timeout_ms, timeout_ms),
+            lambda: self._file_item_validation_timed_out(
+                validation_generation,
+                send_generation,
+            ),
+        )
+
+    def _final_file_batch_validated(
+        self,
+        task: _FileBatchPathValidationTask,
+        paths: tuple[str, ...],
+        valid: object,
+        error: str,
+        validation_generation: int,
+        send_generation: int,
+    ) -> None:
+        self._validation_tasks.discard(task)
+        if (
+            validation_generation != self._validation_generation
+            or send_generation != self._send_generation
+            or not self._busy
+            or self._batch_mode != "aggregate_files"
+        ):
+            return
+        self._validation_generation += 1
+        if error:
+            self._finish_send(send_generation, f"无法验证批量文件：{error}", False)
+            return
+        if valid is not True:
+            self._batch_validation_restarts += 1
+            if self._batch_validation_restarts > 3:
+                self._finish_send(
+                    send_generation,
+                    "原文件已不存在，已停止批量发送",
+                    False,
+                )
+                return
+            # Re-run repository validation so a definitively missing path is
+            # removed through the existing revision-CAS cleanup contract.
+            self._start_file_batch_validation()
+            return
+        # Claim revisions again after the final filesystem pass. A source
+        # record refreshed while paths were being checked restarts the whole
+        # batch instead of writing the now-stale URL list on macOS.
+        self._complete_file_batch_validation(
+            send_generation,
+            checked_paths=paths,
         )
 
     def _send_item(self, item: ClipItem) -> None:
@@ -3019,6 +3389,11 @@ class SelectionSender(QObject):
             self._validation_generation += 1
             self._finish_send(send_generation, "原文件已不存在，已从历史移除", False)
             return
+        if self._batch_mode == "aggregate_files":
+            self._validation_generation += 1
+            self._batch_validated_files.append(validated)
+            self._start_next_file_batch_validation(send_generation)
+            return
         try:
             claim = self.repository.claim_validated_file_item(validated)
         except Exception as exc:
@@ -3081,10 +3456,15 @@ class SelectionSender(QObject):
     ) -> None:
         if send_generation != self._send_generation or not self._busy:
             return
+        if self._image_batch_deadline_reached(send_generation):
+            return
+        if self._dispatched_write_generation == send_generation:
+            return
         if receipt is None or receipt.kind is not item.kind:
             message = f"无法写入系统剪贴板：{error}" if error else "无法写入系统剪贴板"
             self._finish_send(send_generation, message, False)
             return
+        self._dispatched_write_generation = send_generation
         self._dispatch_written(item, target, receipt, send_generation)
 
     def _dispatch_written(
@@ -3094,12 +3474,40 @@ class SelectionSender(QObject):
         receipt: ClipboardWriteReceipt,
         send_generation: int,
     ) -> None:
-        for item_id in self._batch_item_ids:
-            self.repository.mark_used(item_id)
-        self._hide_panel()
+        try:
+            item_ids = tuple(dict.fromkeys(self._current_item_ids))
+            mark_used_many = getattr(self.repository, "mark_used_many", None)
+            if callable(mark_used_many):
+                mark_used_many(item_ids)
+            else:
+                for item_id in item_ids:
+                    self.repository.mark_used(item_id)
+        except Exception as exc:
+            LOGGER.exception("Could not update clipboard history usage")
+            self._finish_send(
+                send_generation,
+                f"已复制，但无法更新历史使用次数：{exc}",
+                False,
+            )
+            return
+        if not self._batch_panel_hidden:
+            self._hide_panel()
+            self._batch_panel_hidden = True
         settings = self._batch_settings or self._settings()
         if not settings.paste_after_selection or target is None:
             self._finish_send(send_generation, "已复制到剪贴板", True)
+            return
+        if self._batch_mode == "sequential_images" and self._batch_completed:
+            QTimer.singleShot(
+                0,
+                lambda: self._verify_before_paste(
+                    item,
+                    target,
+                    receipt,
+                    send_generation,
+                    rewrite_count=0,
+                ),
+            )
             return
         QTimer.singleShot(
             35,
@@ -3148,6 +3556,8 @@ class SelectionSender(QObject):
     ) -> None:
         if send_generation != self._send_generation or not self._busy:
             return
+        if self._image_batch_deadline_reached(send_generation):
+            return
         # Some macOS apps report activation asynchronously. A successful native
         # activate call is accepted, but a positively different foreground is not.
         if not target.is_active():
@@ -3176,6 +3586,7 @@ class SelectionSender(QObject):
             lambda ok, error: self._clipboard_verified(
                 item,
                 target,
+                receipt,
                 send_generation,
                 rewrite_count,
                 ok,
@@ -3187,6 +3598,7 @@ class SelectionSender(QObject):
         self,
         item: ClipItem,
         target: ForegroundTargetHandle,
+        receipt: ClipboardWriteReceipt,
         send_generation: int,
         rewrite_count: int,
         ok: bool,
@@ -3194,7 +3606,17 @@ class SelectionSender(QObject):
     ) -> None:
         if send_generation != self._send_generation or not self._busy:
             return
+        if self._image_batch_deadline_reached(send_generation):
+            return
         if not ok:
+            if self._batch_mode == "sequential_images":
+                message = (
+                    f"剪贴板已变化，已停止图片批次：{error}"
+                    if error
+                    else "剪贴板已变化，已停止图片批次"
+                )
+                self._finish_send(send_generation, message, False)
+                return
             if rewrite_count >= 1:
                 message = (
                     f"剪贴板验证失败，已取消自动粘贴：{error}"
@@ -3223,6 +3645,9 @@ class SelectionSender(QObject):
             self._finish_send(send_generation, "已复制，但目标窗口未激活", False)
             return
         pasted = self.paste_adapter.paste()
+        if pasted and self._batch_mode == "sequential_images":
+            self._image_item_pasted(item, target, receipt, send_generation)
+            return
         success_message = (
             "已触发粘贴"
             if pasted and getattr(target, "kind", "") == "windows"
@@ -3234,6 +3659,96 @@ class SelectionSender(QObject):
             pasted,
         )
 
+    def _image_item_pasted(
+        self,
+        item: ClipItem,
+        target: ForegroundTargetHandle,
+        receipt: ClipboardWriteReceipt,
+        send_generation: int,
+    ) -> None:
+        if send_generation != self._send_generation or not self._busy:
+            return
+        # Invalidate duplicate verification callbacks before either completing
+        # the batch or scheduling the next image.
+        self._send_generation += 1
+        continuation_generation = self._send_generation
+        self._batch_completed += 1
+        QTimer.singleShot(
+            self._image_batch_settle_ms,
+            lambda: self._image_settle_finished(
+                item,
+                target,
+                receipt,
+                continuation_generation,
+            ),
+        )
+
+    def _image_settle_finished(
+        self,
+        _item: ClipItem,
+        target: ForegroundTargetHandle,
+        receipt: ClipboardWriteReceipt,
+        send_generation: int,
+    ) -> None:
+        if (
+            send_generation != self._send_generation
+            or not self._busy
+            or self._batch_mode != "sequential_images"
+        ):
+            return
+        if self._image_batch_deadline_reached(send_generation):
+            return
+        if not target.is_active():
+            self._finish_send(
+                send_generation,
+                "目标窗口已变化，已停止后续图片",
+                False,
+            )
+            return
+        # Keep the previous image on the clipboard for the entire settle window.
+        # Only replace it after confirming that neither the user nor another app
+        # has written a different payload in the meantime.
+        self.clipboard.request_verify(
+            receipt,
+            lambda ok, error: self._previous_image_verified(
+                target,
+                send_generation,
+                ok,
+                error,
+            ),
+        )
+
+    def _previous_image_verified(
+        self,
+        target: ForegroundTargetHandle,
+        send_generation: int,
+        ok: bool,
+        error: str,
+    ) -> None:
+        if send_generation != self._send_generation or not self._busy:
+            return
+        if self._image_batch_deadline_reached(send_generation):
+            return
+        if not ok:
+            message = (
+                f"剪贴板已变化，已停止后续图片：{error}"
+                if error
+                else "剪贴板已变化，已停止后续图片"
+            )
+            self._finish_send(send_generation, message, False)
+            return
+        if not target.is_active():
+            self._finish_send(
+                send_generation,
+                "目标窗口已变化，已停止后续图片",
+                False,
+            )
+            return
+        if self._batch_items:
+            self._send_next_batch_image()
+            return
+        self._finish_send(send_generation, "已触发粘贴", True)
+
     def _rewrite_finished(
         self,
         item: ClipItem,
@@ -3244,6 +3759,8 @@ class SelectionSender(QObject):
     ) -> None:
         if send_generation != self._send_generation or not self._busy:
             return
+        if self._dispatched_write_generation == send_generation:
+            return
         if receipt is None or receipt.kind is not item.kind:
             message = (
                 f"剪贴板重写失败，已取消自动粘贴：{error}"
@@ -3252,6 +3769,7 @@ class SelectionSender(QObject):
             )
             self._finish_send(send_generation, message, False)
             return
+        self._dispatched_write_generation = send_generation
         self._verify_before_paste(
             item,
             target,
@@ -3263,18 +3781,56 @@ class SelectionSender(QObject):
     def _finish_send(self, send_generation: int, message: str, success: bool) -> None:
         if send_generation != self._send_generation:
             return
-        # Invalidate duplicate or late callbacks from the one aggregate
-        # transaction before releasing the busy gate.
+        # Invalidate duplicate or late callbacks before releasing the busy gate.
         self._send_generation += 1
+        self._validation_generation += 1
+        self._dispatched_write_generation = None
+        mode = self._batch_mode
         total = self._batch_total
+        completed = self._batch_completed
+        file_count = self._batch_file_count
         target_kind = getattr(self._batch_target, "kind", "")
         copied_only = message == "已复制到剪贴板"
+        self._batch_mode = "single"
         self._batch_item_ids = ()
+        self._current_item_ids = ()
+        self._batch_items.clear()
         self._batch_target = None
         self._batch_total = 0
+        self._batch_completed = 0
+        self._batch_image_deadline = 0.0
+        self._batch_panel_hidden = False
+        self._batch_file_count = 0
+        self._batch_file_validation_deadline = 0.0
+        self._batch_file_pending_ids.clear()
+        self._batch_validated_files.clear()
+        self._batch_validation_restarts = 0
         self._batch_settings = None
         self._busy = False
-        if total > 1:
+        if mode == "sequential_images":
+            if success:
+                message = f"已触发 {completed}/{total} 张图片粘贴"
+            elif completed:
+                message = f"已触发 {completed}/{total} 张图片粘贴；{message}"
+            else:
+                message = (
+                    f"已触发 0/{total} 张图片粘贴；"
+                    f"第 1 张图片发送失败：{message}"
+                )
+        elif mode == "aggregate_files":
+            if success and copied_only:
+                message = (
+                    f"已合并复制 {total} 条文件记录"
+                    f"（{file_count} 个文件或目录）"
+                )
+            elif success:
+                message = (
+                    f"已触发 1 次文件粘贴（{total} 条记录，"
+                    f"共 {file_count} 个文件或目录）"
+                )
+            else:
+                message = f"{total} 条文件记录批量发送失败：{message}"
+        elif total > 1:
             if success:
                 if copied_only:
                     message = f"已合并复制 {total} 项"

@@ -150,6 +150,8 @@ class HistoryStore(Protocol):
 
     def mark_used(self, item_id: str) -> None: ...
 
+    def mark_used_many(self, item_ids: Sequence[str]) -> None: ...
+
     def set_favorite(self, item_id: str, favorite: bool) -> None: ...
 
     def delete(self, item_id: str) -> None: ...
@@ -583,14 +585,21 @@ class HistoryRepository:
         return item
 
     def mark_used(self, item_id: str) -> None:
+        self.mark_used_many((item_id,))
+
+    def mark_used_many(self, item_ids: Sequence[str]) -> None:
+        unique_ids = tuple(dict.fromkeys(item_ids))
+        if not unique_ids:
+            return
+        now = self._clock.now()
         with self._lock, self._connection:
-            self._connection.execute(
+            self._connection.executemany(
                 """
                 UPDATE clips
                 SET use_count = use_count + 1, last_used_at = ?, revision = revision + 1
                 WHERE id = ?
                 """,
-                (self._clock.now(), item_id),
+                ((now, item_id) for item_id in unique_ids),
             )
 
     def set_favorite(self, item_id: str, favorite: bool) -> None:

@@ -161,7 +161,38 @@ def test_unsupported_multi_send_rejection_preserves_visible_selection(qtbot, tmp
         files.id,
         text.id,
     ]
-    assert application.panel.status.text() == "一次发送多项目前仅支持文本；图片或文件请单项发送"
+    assert application.panel.status.text() == "一次批量发送只支持同一类型；请分别选择文本、图片或文件"
+    application.shutdown()
+
+
+def test_image_batch_without_original_target_reports_rejection_in_panel(
+    qtbot,
+    tmp_path,
+) -> None:
+    application = ClipSoonApplication(QApplication.instance(), tmp_path)
+    qtbot.addWidget(application.panel)
+    first = application.repository.add_image(b"first-image", 1, 1)
+    time.sleep(0.002)
+    second = application.repository.add_image(b"second-image", 1, 1)
+    application._reload_history()
+    assert _panel_visible_ids(application) == [second.id, first.id]
+    assert application.target is None
+    selection = application.panel.list.selectionModel()
+    selection.clearSelection()
+    for row in (0, 1):
+        selection.select(
+            application.panel.model.index(row),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+
+    application.panel._send_selected()
+
+    assert [item.id for item in application.panel._selected_items()] == [
+        second.id,
+        first.id,
+    ]
+    assert application.panel.status.text() == "未找到原目标窗口，无法批量发送图片"
     application.shutdown()
 
 

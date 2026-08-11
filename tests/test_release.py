@@ -14,7 +14,7 @@ def test_release_version_is_consistent() -> None:
     product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
     acceptance = (PROJECT_ROOT / "docs/验收报告.md").read_text(encoding="utf-8")
 
-    assert __version__ == "1.1.9"
+    assert __version__ == "1.1.10"
     assert project["project"]["version"] == __version__
     assert f"当前发布版本：`v{__version__}`" in readme
     assert f'git tag -a v{__version__} -m "ClipSoon {__version__}"' in readme
@@ -45,7 +45,7 @@ def test_supported_python_versions_and_dependency_floors_are_declared() -> None:
     assert "pyinstaller>=6.15,<7" in optional_dependencies["package"]
 
 
-def test_multi_send_single_paste_contract_is_documented() -> None:
+def test_multi_send_contract_is_documented() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
     architecture = (PROJECT_ROOT / "docs/架构设计.md").read_text(encoding="utf-8")
@@ -53,8 +53,19 @@ def test_multi_send_single_paste_contract_is_documented() -> None:
     assert "合并为一个临时文本负载" in readme
     assert "仅触发一次系统粘贴" in readme
     assert "不额外追加末尾换行" in product_spec
-    assert "图片或文件请单项发送" in product_spec
+    assert "稳定扁平化" in readme
+    assert "一个 `FILES` 负载" in readme
+    assert "规范化重复路径保留首次" in product_spec
+    assert "去重后最多 1,000 个文件或目录" in product_spec
+    assert "1,001 个及以上在 write/hide/use_count 前失败" in product_spec
+    assert "write/ACK/activate/verify/paste" in product_spec
+    assert "数量不超过 20" in architecture
+    assert "图片批次非原子" in readme
+    assert "`k/N`" in product_spec
+    assert "混合类型必须零副作用拒绝" in product_spec
+    assert "图片或文件请单项发送" not in product_spec
     assert "不模拟 Enter" in architecture
+    assert "只报告“已触发粘贴”" in product_spec
 
 
 def test_static_panel_border_contract_is_documented() -> None:
