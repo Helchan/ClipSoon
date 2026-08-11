@@ -3693,8 +3693,8 @@ class SelectionSender(QObject):
         try:
             interval_ms = int(settings.image_batch_interval_ms)
         except (TypeError, ValueError):
-            interval_ms = 150
-        return min(1_000, max(100, interval_ms))
+            interval_ms = 100
+        return min(1_000, max(20, interval_ms))
 
     def _image_settle_finished(
         self,

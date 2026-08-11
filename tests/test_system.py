@@ -2936,13 +2936,37 @@ def test_selection_sender_sends_image_batch_in_order_and_hides_panel_once(qtbot)
     assert "图片" in finished[0][0]
 
 
+@pytest.mark.parametrize(
+    ("raw_interval", "expected"),
+    (
+        (0, 20),
+        (1_001, 1_000),
+        ("invalid", 100),
+    ),
+)
+def test_selection_sender_clamps_unvalidated_image_batch_interval(
+    raw_interval: object,
+    expected: int,
+) -> None:
+    settings = AppSettings(image_batch_interval_ms=raw_interval)  # type: ignore[arg-type]
+    sender = SelectionSender(
+        DeferredWriter(),  # type: ignore[arg-type]
+        FakeRepository(),  # type: ignore[arg-type]
+        FakePaste(),  # type: ignore[arg-type]
+        lambda: settings,
+        lambda: None,
+    )
+
+    assert sender._image_batch_interval_ms() == expected
+
+
 def test_selection_sender_uses_snapshotted_image_batch_interval(monkeypatch) -> None:
     images = (
         ClipItem("image-1", ClipKind.IMAGE, "hash-1", 1, 1, image_path="1.png"),
         ClipItem("image-2", ClipKind.IMAGE, "hash-2", 2, 2, image_path="2.png"),
     )
     writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
-    settings = [AppSettings(paste_delay_ms=60, image_batch_interval_ms=150)]
+    settings = [AppSettings(paste_delay_ms=60)]
     scheduled: list[tuple[int, object]] = []
 
     class CapturingTimer:
@@ -2970,7 +2994,7 @@ def test_selection_sender_uses_snapshotted_image_batch_interval(monkeypatch) -> 
     writer.verify_callbacks[0][1](True, "")
 
     delay_ms, first_settle = scheduled.pop(0)
-    assert delay_ms == 150
+    assert delay_ms == 100
     settings[0].image_batch_interval_ms = 900
     first_settle()  # type: ignore[operator]
     writer.verify_callbacks[1][1](True, "")
@@ -2982,7 +3006,7 @@ def test_selection_sender_uses_snapshotted_image_batch_interval(monkeypatch) -> 
     writer.verify_callbacks[2][1](True, "")
 
     delay_ms, second_settle = scheduled.pop(0)
-    assert delay_ms == 150
+    assert delay_ms == 100
     assert scheduled == []
     second_settle()  # type: ignore[operator]
     writer.verify_callbacks[3][1](True, "")

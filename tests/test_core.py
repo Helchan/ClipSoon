@@ -180,8 +180,8 @@ def test_hotkey_validation() -> None:
     assert not valid_hotkey("double:space")
     assert not valid_hotkey("no-prefix")
     assert AppSettings(double_tap_interval_ms="bad").validated().double_tap_interval_ms == 180
-    assert AppSettings().image_batch_interval_ms == 150
-    assert AppSettings(image_batch_interval_ms=0).validated().image_batch_interval_ms == 100
+    assert AppSettings().image_batch_interval_ms == 100
+    assert AppSettings(image_batch_interval_ms=0).validated().image_batch_interval_ms == 20
     assert AppSettings(image_batch_interval_ms="bad").validated().image_batch_interval_ms == 100
     assert AppSettings().selection_memory_seconds == 3
     assert AppSettings(selection_memory_seconds=0).validated().selection_memory_seconds == 1

@@ -290,7 +290,7 @@ def test_settings_dialog_applies_changes_and_reset_without_a_save_step(qtbot, tm
     dialog.reset_button.click()
     assert application.settings.value.theme == "frosted"
     assert application.settings.value.max_history_items == 500
-    assert application.settings.value.image_batch_interval_ms == 150
+    assert application.settings.value.image_batch_interval_ms == 100
     assert not hasattr(application.settings.value, "neon_border_enabled")
     application.shutdown()
 

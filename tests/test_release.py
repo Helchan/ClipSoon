@@ -62,9 +62,9 @@ def test_multi_send_contract_is_documented() -> None:
     assert "数量不超过 20" in architecture
     assert "图片批次非原子" in readme
     assert "`image_batch_interval_ms`" in readme
-    assert "默认 150 ms" in readme
+    assert "默认 100 ms" in readme
     assert "发送途中修改只影响下一批" in readme
-    assert "100–1000 ms" in product_spec
+    assert "20–1000 ms" in product_spec
     assert "`k/N`" in product_spec
     assert "混合类型必须零副作用拒绝" in product_spec
     assert "图片或文件请单项发送" not in product_spec

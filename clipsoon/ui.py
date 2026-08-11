@@ -2507,7 +2507,7 @@ class SettingsDialog(QDialog):
         self.delay = _spin(settings.paste_delay_ms, 60, 2_000, " ms")
         self.image_batch_interval = _spin(
             settings.image_batch_interval_ms,
-            100,
+            20,
             1_000,
             " ms",
         )

@@ -205,7 +205,7 @@ class AppSettings:
     max_history_items: int = 500
     retention_days: int = 90
     paste_delay_ms: int = 180
-    image_batch_interval_ms: int = 150
+    image_batch_interval_ms: int = 100
     paste_after_selection: bool = True
     hide_on_deactivate: bool = True
     capture_enabled: bool = True
@@ -225,7 +225,12 @@ class AppSettings:
             max_history_items=_clamp(self.max_history_items, 50, 10_000),
             retention_days=_clamp(self.retention_days, 0, 3_650),
             paste_delay_ms=_clamp(self.paste_delay_ms, 60, 2_000),
-            image_batch_interval_ms=_clamp(self.image_batch_interval_ms, 100, 1_000),
+            image_batch_interval_ms=_clamp_or_default(
+                self.image_batch_interval_ms,
+                20,
+                1_000,
+                default=100,
+            ),
             paste_after_selection=bool(self.paste_after_selection),
             hide_on_deactivate=bool(self.hide_on_deactivate),
             capture_enabled=bool(self.capture_enabled),
@@ -305,6 +310,20 @@ def _clamp(value: Any, minimum: int, maximum: int) -> int:
         parsed = int(value)
     except (TypeError, ValueError):
         return minimum
+    return min(maximum, max(minimum, parsed))
+
+
+def _clamp_or_default(
+    value: Any,
+    minimum: int,
+    maximum: int,
+    *,
+    default: int,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
     return min(maximum, max(minimum, parsed))
 
 

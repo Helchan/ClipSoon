@@ -800,20 +800,20 @@ def test_image_batch_interval_setting_is_immediate_and_applies_live(qtbot) -> No
     dialog.settings_changed.connect(changes.append)
 
     assert dialog.image_batch_interval.value() == 240
-    assert dialog.image_batch_interval.minimum() == 100
+    assert dialog.image_batch_interval.minimum() == 20
     assert dialog.image_batch_interval.maximum() == 1_000
     assert dialog.image_batch_interval.accessibleName() == "图片批量发送间隔"
     assert dialog.values()["image_batch_interval_ms"] == 240
 
-    dialog.image_batch_interval.setValue(360)
-    assert changes[-1]["image_batch_interval_ms"] == 360
+    dialog.image_batch_interval.setValue(20)
+    assert changes[-1]["image_batch_interval_ms"] == 20
 
     dialog.apply_settings(AppSettings(image_batch_interval_ms=180))
     assert dialog.image_batch_interval.value() == 180
     assert dialog.values()["image_batch_interval_ms"] == 180
 
     dialog.reset_button.click()
-    assert changes[-1]["image_batch_interval_ms"] == 150
+    assert changes[-1]["image_batch_interval_ms"] == 100
 
 
 def test_destructive_confirmation_uses_the_clipsoon_dialog(qtbot) -> None:
