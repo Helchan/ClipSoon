@@ -438,6 +438,7 @@ def test_windows_plain_text_compatibility_targets_are_generic_and_immediate(
         label.text() for label in dialog.findChildren(QLabel, "settingsSectionTitle")
     ]
     assert "剪贴板兼容" in section_titles
+    assert len(dialog.findChildren(QFrame, "settingsSection")) == 4
     assert any(
         label.text() == "切换到指定应用时，将当前文本剪贴板转换为纯文本；不会自动粘贴。"
         for label in dialog.findChildren(QLabel)
@@ -514,7 +515,8 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
     qtbot.waitExposed(dialog)
 
     sections = dialog.findChildren(QFrame, "settingsSection")
-    assert len(sections) == 3
+    expected_section_count = 4 if sys.platform == "win32" else 3
+    assert len(sections) == expected_section_count
     assert dialog.width() == metrics.settings_window_width
     assert dialog.height() < 720
     controls = [
