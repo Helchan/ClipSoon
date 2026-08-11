@@ -2936,6 +2936,59 @@ def test_selection_sender_sends_image_batch_in_order_and_hides_panel_once(qtbot)
     assert "图片" in finished[0][0]
 
 
+def test_selection_sender_uses_snapshotted_image_batch_interval(monkeypatch) -> None:
+    images = (
+        ClipItem("image-1", ClipKind.IMAGE, "hash-1", 1, 1, image_path="1.png"),
+        ClipItem("image-2", ClipKind.IMAGE, "hash-2", 2, 2, image_path="2.png"),
+    )
+    writer, repository, paste = DeferredWriter(), FakeRepository(), FakePaste()
+    settings = [AppSettings(paste_delay_ms=60, image_batch_interval_ms=150)]
+    scheduled: list[tuple[int, object]] = []
+
+    class CapturingTimer:
+        @staticmethod
+        def singleShot(delay_ms: int, callback) -> None:
+            scheduled.append((delay_ms, callback))
+
+    monkeypatch.setattr(system_module, "QTimer", CapturingTimer)
+    sender = SelectionSender(
+        writer,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        paste,  # type: ignore[arg-type]
+        lambda: settings[0],
+        lambda: None,
+    )
+
+    sender.send_many(images, FakeTarget())  # type: ignore[arg-type]
+    writer.write_callbacks[0](ClipboardWriteReceipt("a" * 32, ClipKind.IMAGE, 1), "")
+    delay_ms, callback = scheduled.pop(0)
+    assert delay_ms == 35
+    callback()  # type: ignore[operator]
+    delay_ms, callback = scheduled.pop(0)
+    assert delay_ms == 60
+    callback()  # type: ignore[operator]
+    writer.verify_callbacks[0][1](True, "")
+
+    delay_ms, first_settle = scheduled.pop(0)
+    assert delay_ms == 150
+    settings[0].image_batch_interval_ms = 900
+    first_settle()  # type: ignore[operator]
+    writer.verify_callbacks[1][1](True, "")
+
+    writer.write_callbacks[1](ClipboardWriteReceipt("b" * 32, ClipKind.IMAGE, 2), "")
+    delay_ms, callback = scheduled.pop(0)
+    assert delay_ms == 0
+    callback()  # type: ignore[operator]
+    writer.verify_callbacks[2][1](True, "")
+
+    delay_ms, second_settle = scheduled.pop(0)
+    assert delay_ms == 150
+    assert scheduled == []
+    second_settle()  # type: ignore[operator]
+    writer.verify_callbacks[3][1](True, "")
+    assert paste.count == 2
+
+
 def test_selection_sender_keeps_busy_until_final_image_settle_finishes(qtbot) -> None:
     images = (
         ClipItem("image-1", ClipKind.IMAGE, "hash-1", 1, 1, image_path="1.png"),

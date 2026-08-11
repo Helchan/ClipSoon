@@ -524,7 +524,6 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
         dialog.interval,
         dialog.maximum,
         dialog.retention,
-        dialog.delay,
         dialog.theme,
         dialog.selection_memory,
     ]
@@ -532,6 +531,9 @@ def test_settings_layout_is_compact_and_controls_are_aligned(qtbot) -> None:
         controls.insert(0, dialog.hotkey_mode)
     visible_controls = [control for control in controls if not control.isHidden()]
     assert len({control.width() for control in visible_controls}) == 1
+    assert dialog.delay.width() == dialog.image_batch_interval.width()
+    assert dialog.delay.width() < dialog.maximum.width()
+    assert dialog.findChild(QLabel, "settingsInlineLabel").text() == "图片批量间隔"
     assert dialog.windowFlags() & Qt.WindowType.FramelessWindowHint
     assert dialog.findChild(QLabel, "settingsWindowTitle").text() == "ClipSoon 设置"
     assert dialog.close_button.geometry().top() == dialog.reset_button.geometry().top()
@@ -563,6 +565,7 @@ def test_settings_typography_and_component_scale_matches_main_panel(qtbot) -> No
         dialog.maximum,
         dialog.retention,
         dialog.delay,
+        dialog.image_batch_interval,
         dialog.theme,
         dialog.selection_memory,
     )
@@ -785,6 +788,32 @@ def test_settings_changes_and_reset_are_emitted_immediately(qtbot) -> None:
     assert changes[-1]["max_history_items"] == 500
     assert changes[-1]["capture_enabled"] is True
     assert "neon_border_enabled" not in changes[-1]
+
+
+def test_image_batch_interval_setting_is_immediate_and_applies_live(qtbot) -> None:
+    dialog = SettingsDialog(
+        AppSettings(image_batch_interval_ms=240),
+        accessibility_granted=True,
+    )
+    qtbot.addWidget(dialog)
+    changes: list[dict[str, object]] = []
+    dialog.settings_changed.connect(changes.append)
+
+    assert dialog.image_batch_interval.value() == 240
+    assert dialog.image_batch_interval.minimum() == 100
+    assert dialog.image_batch_interval.maximum() == 1_000
+    assert dialog.image_batch_interval.accessibleName() == "图片批量发送间隔"
+    assert dialog.values()["image_batch_interval_ms"] == 240
+
+    dialog.image_batch_interval.setValue(360)
+    assert changes[-1]["image_batch_interval_ms"] == 360
+
+    dialog.apply_settings(AppSettings(image_batch_interval_ms=180))
+    assert dialog.image_batch_interval.value() == 180
+    assert dialog.values()["image_batch_interval_ms"] == 180
+
+    dialog.reset_button.click()
+    assert changes[-1]["image_batch_interval_ms"] == 150
 
 
 def test_destructive_confirmation_uses_the_clipsoon_dialog(qtbot) -> None:
@@ -3622,6 +3651,7 @@ def test_settings_text_editors_use_the_same_app_owned_blinking_caret(qtbot, them
         dialog.maximum.lineEdit(),
         dialog.retention.lineEdit(),
         dialog.delay.lineEdit(),
+        dialog.image_batch_interval.lineEdit(),
         dialog.selection_memory.lineEdit(),
     )
     assert all(editor is not None for editor in editors)

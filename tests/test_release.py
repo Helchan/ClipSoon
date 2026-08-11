@@ -14,7 +14,7 @@ def test_release_version_is_consistent() -> None:
     product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
     acceptance = (PROJECT_ROOT / "docs/验收报告.md").read_text(encoding="utf-8")
 
-    assert __version__ == "1.1.10"
+    assert __version__ == "1.1.11"
     assert project["project"]["version"] == __version__
     assert f"当前发布版本：`v{__version__}`" in readme
     assert f'git tag -a v{__version__} -m "ClipSoon {__version__}"' in readme
@@ -61,6 +61,10 @@ def test_multi_send_contract_is_documented() -> None:
     assert "write/ACK/activate/verify/paste" in product_spec
     assert "数量不超过 20" in architecture
     assert "图片批次非原子" in readme
+    assert "`image_batch_interval_ms`" in readme
+    assert "默认 150 ms" in readme
+    assert "发送途中修改只影响下一批" in readme
+    assert "100–1000 ms" in product_spec
     assert "`k/N`" in product_spec
     assert "混合类型必须零副作用拒绝" in product_spec
     assert "图片或文件请单项发送" not in product_spec

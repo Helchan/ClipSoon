@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PySide6.QtCore import QBuffer, QIODevice, QMimeData, QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal
@@ -62,7 +62,6 @@ _WINDOWS_FOCUS_RETRY_DELAYS_MS = (40, 80, 120)
 _FILE_VALIDATION_TIMEOUT_MS = 3_000
 _FILE_BATCH_VALIDATION_DEADLINE_MS = 10_000
 _MAX_CONCURRENT_FILE_VALIDATIONS = 2
-_IMAGE_BATCH_SETTLE_MS = 500
 _IMAGE_BATCH_DEADLINE_MS = 60_000
 _MAX_IMAGE_BATCH_ITEMS = 20
 _MAX_FILE_BATCH_PATHS = 1_000
@@ -2920,7 +2919,7 @@ class SelectionSender(QObject):
         *,
         file_validation_timeout_ms: int = _FILE_VALIDATION_TIMEOUT_MS,
         file_batch_validation_deadline_ms: int = _FILE_BATCH_VALIDATION_DEADLINE_MS,
-        image_batch_settle_ms: int = _IMAGE_BATCH_SETTLE_MS,
+        image_batch_settle_ms: int | None = None,
         image_batch_deadline_ms: int = _IMAGE_BATCH_DEADLINE_MS,
     ) -> None:
         super().__init__()
@@ -2939,7 +2938,11 @@ class SelectionSender(QObject):
             50,
             int(file_batch_validation_deadline_ms),
         )
-        self._image_batch_settle_ms = max(0, int(image_batch_settle_ms))
+        self._image_batch_settle_ms_override = (
+            None
+            if image_batch_settle_ms is None
+            else max(0, int(image_batch_settle_ms))
+        )
         self._image_batch_deadline_ms = max(50, int(image_batch_deadline_ms))
         self._batch_mode = "single"
         self._batch_item_ids: tuple[str, ...] = ()
@@ -3036,7 +3039,7 @@ class SelectionSender(QObject):
         self._batch_validation_restarts = 0
         # An in-flight batch is one user transaction. Settings changed while
         # it is running apply only to the next request.
-        self._batch_settings = settings if len(batch) > 1 else None
+        self._batch_settings = replace(settings) if len(batch) > 1 else None
 
     def _send_next_batch_image(self) -> None:
         if (
@@ -3674,7 +3677,7 @@ class SelectionSender(QObject):
         continuation_generation = self._send_generation
         self._batch_completed += 1
         QTimer.singleShot(
-            self._image_batch_settle_ms,
+            self._image_batch_interval_ms(),
             lambda: self._image_settle_finished(
                 item,
                 target,
@@ -3682,6 +3685,16 @@ class SelectionSender(QObject):
                 continuation_generation,
             ),
         )
+
+    def _image_batch_interval_ms(self) -> int:
+        if self._image_batch_settle_ms_override is not None:
+            return self._image_batch_settle_ms_override
+        settings = self._batch_settings or self._settings()
+        try:
+            interval_ms = int(settings.image_batch_interval_ms)
+        except (TypeError, ValueError):
+            interval_ms = 150
+        return min(1_000, max(100, interval_ms))
 
     def _image_settle_finished(
         self,

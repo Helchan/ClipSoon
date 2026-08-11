@@ -2505,11 +2505,35 @@ class SettingsDialog(QDialog):
         self.maximum = _spin(settings.max_history_items, 50, 10_000, " 条")
         self.retention = _spin(settings.retention_days, 0, 3_650, " 天（0 = 永久）")
         self.delay = _spin(settings.paste_delay_ms, 60, 2_000, " ms")
-        for spin_box in (self.maximum, self.retention, self.delay):
+        self.image_batch_interval = _spin(
+            settings.image_batch_interval_ms,
+            100,
+            1_000,
+            " ms",
+        )
+        self.image_batch_interval.setAccessibleName("图片批量发送间隔")
+        self.image_batch_interval.setToolTip(
+            "连续发送多张图片时，每张粘贴触发后的等待时间"
+        )
+        for spin_box in (
+            self.maximum,
+            self.retention,
+            self.delay,
+            self.image_batch_interval,
+        ):
             spin_box.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         add_row(history_form, 0, "历史容量", self.maximum)
         add_row(history_form, 1, "保留时间", self.retention)
-        add_row(history_form, 2, "恢复等待", self.delay)
+        paste_timing_row = QWidget()
+        paste_timing_layout = QHBoxLayout(paste_timing_row)
+        paste_timing_layout.setContentsMargins(0, 0, 0, 0)
+        paste_timing_layout.setSpacing(8)
+        paste_timing_layout.addWidget(self.delay, 1)
+        image_batch_interval_label = QLabel("图片批量间隔")
+        image_batch_interval_label.setObjectName("settingsInlineLabel")
+        paste_timing_layout.addWidget(image_batch_interval_label)
+        paste_timing_layout.addWidget(self.image_batch_interval, 1)
+        add_row(history_form, 2, "恢复等待", paste_timing_row)
 
         self.theme = QComboBox()
         for label, value in _SETTINGS_THEME_OPTIONS:
@@ -2709,6 +2733,7 @@ class SettingsDialog(QDialog):
                 self.maximum,
                 self.retention,
                 self.delay,
+                self.image_batch_interval,
                 self.selection_memory,
             )
         )
@@ -2826,6 +2851,7 @@ class SettingsDialog(QDialog):
             "max_history_items": self.maximum.value(),
             "retention_days": self.retention.value(),
             "paste_delay_ms": self.delay.value(),
+            "image_batch_interval_ms": self.image_batch_interval.value(),
             "theme": self.theme.currentData(),
             "capture_enabled": self.capture.isChecked(),
             "paste_after_selection": self.paste.isChecked(),
@@ -2850,6 +2876,7 @@ class SettingsDialog(QDialog):
             self.maximum,
             self.retention,
             self.delay,
+            self.image_batch_interval,
             self.selection_memory,
         ):
             spin_box.valueChanged.connect(self._emit_settings_changed)
@@ -3040,6 +3067,7 @@ class SettingsDialog(QDialog):
             self.maximum.setValue(settings.max_history_items)
             self.retention.setValue(settings.retention_days)
             self.delay.setValue(settings.paste_delay_ms)
+            self.image_batch_interval.setValue(settings.image_batch_interval_ms)
             self.theme.setCurrentIndex(max(0, self.theme.findData(_settings_theme_key(settings.theme))))
             self.capture.setChecked(settings.capture_enabled)
             self.paste.setChecked(settings.paste_after_selection)
@@ -4834,7 +4862,7 @@ def _style_sheet(
         #settingsSubtitle {{ color: {colors.muted}; font-size: {metrics.settings_help_font_size_pt}pt; }}
         #settingsSection {{ background: {settings_background}; border: {settings_border}; border-radius: 12px; }}
         #settingsSectionTitle {{ font-size: {metrics.settings_section_font_size_pt}pt; font-weight: 650; }}
-        #settingsFieldLabel {{
+        #settingsFieldLabel, #settingsInlineLabel {{
             color: {colors.muted}; font-size: {metrics.settings_label_font_size_pt}pt; font-weight: 500;
         }}
         #settingsDialog QPlainTextEdit, #settingsDialog QLineEdit,

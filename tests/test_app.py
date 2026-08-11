@@ -276,6 +276,10 @@ def test_settings_dialog_applies_changes_and_reset_without_a_save_step(qtbot, tm
     dialog.maximum.setValue(800)
     assert application.settings.value.max_history_items == 800
 
+    dialog.image_batch_interval.setValue(275)
+    assert application.settings.value.image_batch_interval_ms == 275
+    assert JsonSettingsStore(tmp_path / "settings.json").load().image_batch_interval_ms == 275
+
     assert not hasattr(dialog, "neon_border")
     legacy_values = dialog.values()
     legacy_values["neon_border_enabled"] = False
@@ -286,6 +290,7 @@ def test_settings_dialog_applies_changes_and_reset_without_a_save_step(qtbot, tm
     dialog.reset_button.click()
     assert application.settings.value.theme == "frosted"
     assert application.settings.value.max_history_items == 500
+    assert application.settings.value.image_batch_interval_ms == 150
     assert not hasattr(application.settings.value, "neon_border_enabled")
     application.shutdown()
 
