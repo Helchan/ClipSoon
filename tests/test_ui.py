@@ -1718,6 +1718,31 @@ def test_windows_panel_and_settings_windows_clip_top_level_corners(qtbot, monkey
     )
 
 
+def test_windows_settings_frosted_avoids_mask_edge_border(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(ui_module.sys, "platform", "win32")
+    paint_border_flags: list[bool] = []
+    original_paint_frosted_material = ui_module._paint_frosted_material
+
+    def record_paint_frosted_material(*args, **kwargs):
+        paint_border_flags.append(bool(kwargs.get("draw_border", True)))
+        return original_paint_frosted_material(*args, **kwargs)
+
+    monkeypatch.setattr(ui_module, "_paint_frosted_material", record_paint_frosted_material)
+    dialog = SettingsDialog(AppSettings(theme="frosted"), accessibility_granted=True)
+    qtbot.addWidget(dialog)
+
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    pixmap = QPixmap(dialog.size())
+    pixmap.fill(Qt.GlobalColor.transparent)
+    dialog.render(pixmap)
+
+    assert not dialog.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert not dialog.mask().isEmpty()
+    assert paint_border_flags
+    assert all(flag is False for flag in paint_border_flags)
+
+
 def test_windows_dialogs_keep_non_layered_backing_without_qt_drop_shadows(qtbot, monkeypatch) -> None:
     monkeypatch.setattr(ui_module.sys, "platform", "win32")
     dialog = SettingsDialog(AppSettings(theme="frosted"), accessibility_granted=True)

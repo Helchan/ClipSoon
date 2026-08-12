@@ -3175,6 +3175,7 @@ class SettingsDialog(QDialog):
                 rect,
                 self._appearance,
                 radius=16.0,
+                draw_border=sys.platform != "win32",
             )
             return
         if sys.platform != "win32":

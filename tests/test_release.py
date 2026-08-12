@@ -14,7 +14,7 @@ def test_release_version_is_consistent() -> None:
     product_spec = (PROJECT_ROOT / "docs/产品规格与验收.md").read_text(encoding="utf-8")
     acceptance = (PROJECT_ROOT / "docs/验收报告.md").read_text(encoding="utf-8")
 
-    assert __version__ == "1.1.11"
+    assert __version__ == "1.1.12"
     assert project["project"]["version"] == __version__
     assert f"当前发布版本：`v{__version__}`" in readme
     assert f'git tag -a v{__version__} -m "ClipSoon {__version__}"' in readme
@@ -84,6 +84,8 @@ def test_static_panel_border_contract_is_documented() -> None:
     assert "流动霓虹边框" not in architecture
     assert "neon_border_enabled" not in architecture
     assert "主面板不得安装 `QGraphicsDropShadowEffect`" in product_spec
+    assert "设置窗口同样不得在 Windows 顶层 mask 边缘描边" in product_spec
+    assert "Windows 主面板和设置窗口都不在顶层二值 mask 边缘描边" in architecture
 
 
 def test_tag_release_workflow_builds_requested_platforms() -> None:
